@@ -15,8 +15,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -31,7 +34,8 @@ public class Main {
             OkHttpClient client = buildHttpClient(config);
 
             if (args.length > 0 && "--no-send".equals(args[0])) {
-                CurlRequest curl = CurlRequest.parse(config.curl);
+                CurlRequest curl = CurlRequest.parse(config.activeCurl());
+                curl.prepareNewConversation();
                 String prompt = joinArgs(args, 1);
                 if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
                     curl.replacePrompt(prompt);
@@ -78,19 +82,53 @@ public class Main {
     }
 
     private static void sendOnce(AppConfig config, OkHttpClient client, String prompt) throws IOException {
-        CurlRequest curl = CurlRequest.parse(config.curl);
+        CurlRequest curl = CurlRequest.parse(config.activeCurl());
+        curl.prepareNewConversation();
         if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
             curl.replacePrompt(prompt);
         }
 
         try (Response response = client.newCall(curl.toRequest()).execute()) {
-            String body = response.body() == null ? "" : response.body().string();
-            if (!response.isSuccessful()) {
-                throw new IOException("Gemini request failed, status=" + response.code()
-                        + ", body=" + preview(body));
+            if (response.body() == null) {
+                throw new IOException("Gemini 返回了空响应");
             }
-            System.out.println(parseGeminiText(body));
+            if (!response.isSuccessful()) {
+                String body = response.body().string();
+                throw new IOException("Gemini 请求失败，HTTP 状态=" + response.code()
+                        + "，响应=" + preview(body));
+            }
+            streamGeminiText(response);
         }
+    }
+
+    private static void streamGeminiText(Response response) throws IOException {
+        StringBuilder all = new StringBuilder();
+        String printed = "";
+
+        while (true) {
+            String line = response.body().source().readUtf8Line();
+            if (line == null) {
+                break;
+            }
+
+            all.append(line).append('\n');
+            String current = tryParseGeminiText(all.toString());
+            if (current == null || current.length() <= printed.length()) {
+                continue;
+            }
+
+            String delta = current.substring(printed.length());
+            System.out.print(delta);
+            System.out.flush();
+            printed = current;
+        }
+
+        if (!printed.isEmpty()) {
+            System.out.println();
+            return;
+        }
+
+        System.out.println(parseGeminiText(all.toString()));
     }
 
     private static OkHttpClient buildHttpClient(AppConfig config) {
@@ -114,7 +152,8 @@ public class Main {
         System.out.println("proxy: " + (config.proxyEnabled
                 ? config.proxyType + "://" + config.proxyHost + ":" + config.proxyPort
                 : "disabled"));
-        System.out.println("curl: set len=" + config.curl.length());
+        System.out.println("template: " + config.activeCurlName());
+        System.out.println("curl: set len=" + config.activeCurl().length());
         System.out.println("url: " + curl.url.redact());
         System.out.println("cookie: " + (curl.cookie.isBlank() ? "blank" : "set len=" + curl.cookie.length()));
         System.out.println("form: " + (curl.form.isBlank() ? "blank" : "set len=" + curl.form.length()));
@@ -124,14 +163,27 @@ public class Main {
 
     private static String parseGeminiText(String body) throws IOException {
         if (body == null || body.isBlank()) {
-            throw new IOException("Gemini returned an empty response");
+            throw new IOException("Gemini 返回了空响应");
         }
 
         String trimmed = body.stripLeading().toLowerCase();
         if (trimmed.startsWith("<!doctype") || trimmed.startsWith("<html") || trimmed.contains("<title>")) {
-            throw new IOException("Gemini returned HTML instead of RPC data: " + preview(body));
+            throw new IOException("Gemini 返回了 HTML，不是 RPC 数据：" + preview(body));
         }
 
+        String best = tryParseGeminiText(body);
+        if (best != null) {
+            return best;
+        }
+        Matcher bardError = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]").matcher(body);
+        if (bardError.find()) {
+            throw new IOException("Gemini RPC 返回 BardErrorInfo，错误码=" + bardError.group(1)
+                    + "。响应=" + preview(body));
+        }
+        throw new IOException("无法从 Gemini 响应里解析文本：" + preview(body));
+    }
+
+    private static String tryParseGeminiText(String body) {
         String best = null;
         int searchFrom = 0;
         while (true) {
@@ -152,16 +204,7 @@ public class Main {
             }
         }
 
-        if (best != null) {
-            return best;
-        }
-        Matcher bardError = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]").matcher(body);
-        if (bardError.find()) {
-            throw new IOException("Gemini RPC 返回 BardErrorInfo，错误码=" + bardError.group(1)
-                    + "。这通常表示这条 curl 里的 f.req/at/cookie 已不是同一次有效请求上下文，或者 f.req 被改动后校验失败。响应="
-                    + preview(body));
-        }
-        throw new IOException("Could not parse Gemini text from response: " + preview(body));
+        return best;
     }
 
     private static String bestTextInJsonPayload(String payload) {
@@ -391,6 +434,7 @@ public class Main {
         private String proxyHost = "127.0.0.1";
         private int proxyPort = 7890;
         private String curl;
+        private String newCurl;
 
         private static AppConfig load(Path path) throws IOException {
             if (!Files.exists(path)) {
@@ -398,7 +442,7 @@ public class Main {
                 if (Files.exists(resource)) {
                     Files.copy(resource, path);
                 }
-                throw new IOException("Generated config.yml. Paste StreamGenerate curl after curl: and rerun.");
+                throw new IOException("已生成 config.yml。把 StreamGenerate 的完整 curl 粘到 curl: 或 newCurl: 后再运行。");
             }
 
             String text = Files.readString(path);
@@ -408,18 +452,31 @@ public class Main {
             config.proxyHost = stringValue(text, "host", config.proxyHost);
             config.proxyPort = intValue(text, "port", config.proxyPort);
             config.curl = extractCurl(text);
-            if (config.curl.isBlank()) {
-                throw new IOException("config.yml missing curl content. Paste full StreamGenerate curl after curl:");
+            config.newCurl = extractNamedCurl(text, "newCurl");
+            if (config.activeCurl().isBlank()) {
+                throw new IOException("config.yml 里没有 curl 内容。把完整 StreamGenerate curl 粘到 curl: 或 newCurl: 后面。");
             }
             return config;
         }
 
+        private String activeCurl() {
+            return hasCurlText(newCurl) ? newCurl : curl;
+        }
+
+        private String activeCurlName() {
+            return hasCurlText(newCurl) ? "newCurl" : "curl";
+        }
+
         private static String extractCurl(String text) {
+            return extractNamedCurl(text, "curl");
+        }
+
+        private static String extractNamedCurl(String text, String key) {
             String[] lines = text.split("\\R", -1);
             int curlLine = -1;
             for (int i = 0; i < lines.length; i++) {
                 String trimmed = lines[i].trim();
-                if (trimmed.startsWith("curl:")) {
+                if (trimmed.startsWith(key + ":")) {
                     curlLine = i;
                     break;
                 }
@@ -432,13 +489,54 @@ public class Main {
             String first = line.substring(line.indexOf(':') + 1).trim();
             StringBuilder rest = new StringBuilder();
             for (int i = curlLine + 1; i < lines.length; i++) {
+                String trimmed = lines[i].trim();
+                if (trimmed.startsWith("curl:") || trimmed.startsWith("newCurl:") || trimmed.startsWith("continueCurl:")) {
+                    break;
+                }
                 rest.append(lines[i]).append('\n');
             }
 
             if (first.equals("|") || first.equals("|-") || first.equals(">")) {
                 return stripIndent(rest.toString()).trim();
             }
-            return (first + "\n" + rest).trim();
+            return trimConfigCurlText(first + "\n" + rest);
+        }
+
+        private static boolean hasCurlText(String value) {
+            if (value == null || value.isBlank()) {
+                return false;
+            }
+            String trimmed = trimConfigCurlText(value);
+            return trimmed.startsWith("curl ")
+                    || trimmed.startsWith("url ")
+                    || trimmed.startsWith("http://")
+                    || trimmed.startsWith("https://");
+        }
+
+        private static String trimConfigCurlText(String value) {
+            String[] lines = value.split("\\R", -1);
+            int start = 0;
+            int end = lines.length;
+            while (start < end && isIgnorableConfigLine(lines[start])) {
+                start++;
+            }
+            while (end > start && isIgnorableConfigLine(lines[end - 1])) {
+                end--;
+            }
+
+            StringBuilder out = new StringBuilder();
+            for (int i = start; i < end; i++) {
+                out.append(lines[i]);
+                if (i + 1 < end) {
+                    out.append('\n');
+                }
+            }
+            return out.toString().trim();
+        }
+
+        private static boolean isIgnorableConfigLine(String line) {
+            String trimmed = line.trim();
+            return trimmed.isEmpty() || trimmed.startsWith("#");
         }
 
         private static String stripIndent(String value) {
@@ -494,7 +592,7 @@ public class Main {
             CurlRequest request = new CurlRequest();
             for (int i = 0; i < tokens.size(); i++) {
                 String token = tokens.get(i);
-                if ("curl".equals(token)) {
+                if ("curl".equals(token) || "url".equals(token)) {
                     continue;
                 }
                 if (request.url == null && (token.startsWith("https://") || token.startsWith("http://"))) {
@@ -550,13 +648,26 @@ public class Main {
                 return;
             }
 
-            String oldPrompt = firstPrompt(fReq);
-            if (oldPrompt == null) {
+            String updated = replaceFirstPromptInFReq(fReq, prompt);
+            form = replaceFormValue(form, "f.req", updated);
+            originalPrompt = prompt;
+        }
+
+        private void prepareNewConversation() {
+            url = url.newBuilder()
+                    .setQueryParameter("_reqid", String.valueOf(ThreadLocalRandom.current().nextInt(1_000_000, 9_999_999)))
+                    .build();
+
+            refreshPerRequestHeaders();
+
+            String fReq = queryValue(form, "f.req");
+            if (fReq == null || fReq.isBlank()) {
                 return;
             }
 
-            String updated = fReq.replace(jsonQuote(oldPrompt), jsonQuote(prompt));
+            String updated = resetConversationInFReq(fReq);
             form = replaceFormValue(form, "f.req", updated);
+            originalPrompt = readPromptFromForm(form);
         }
 
         private String originalPrompt() {
@@ -590,6 +701,158 @@ public class Main {
 
             JsonString prompt = readJsonString(inner, promptQuote);
             return prompt == null ? null : prompt.value();
+        }
+
+        private static String replaceFirstPromptInFReq(String fReq, String prompt) {
+            int outerQuote = fReq.indexOf('"');
+            if (outerQuote < 0) {
+                return fReq;
+            }
+            JsonString innerJson = readJsonString(fReq, outerQuote);
+            if (innerJson == null) {
+                return fReq;
+            }
+
+            String inner = innerJson.value();
+            int promptQuote = inner.indexOf('"');
+            if (promptQuote < 0) {
+                return fReq;
+            }
+            JsonString oldPrompt = readJsonString(inner, promptQuote);
+            if (oldPrompt == null) {
+                return fReq;
+            }
+
+            String updatedInner = inner.substring(0, promptQuote)
+                    + jsonQuote(prompt)
+                    + inner.substring(oldPrompt.endIndex());
+            return fReq.substring(0, outerQuote)
+                    + jsonQuote(updatedInner)
+                    + fReq.substring(innerJson.endIndex());
+        }
+
+        private static String resetConversationInFReq(String fReq) {
+            int outerQuote = fReq.indexOf('"');
+            if (outerQuote < 0) {
+                return fReq;
+            }
+            JsonString innerJson = readJsonString(fReq, outerQuote);
+            if (innerJson == null) {
+                return fReq;
+            }
+
+            String inner = innerJson.value();
+            Range requestBounds = topLevelElementBounds(inner, 0);
+            if (requestBounds == null) {
+                return fReq;
+            }
+
+            String request = inner.substring(requestBounds.start(), requestBounds.end());
+            String updatedRequest = replaceTopLevelElement(request, 2,
+                    "[\"\",\"\",\"\",null,null,null,null,null,null,\"\"]");
+            updatedRequest = updatedRequest.replaceFirst("\\[\\[\\d+]]", "[[0]]");
+            String updatedInner = inner.substring(0, requestBounds.start())
+                    + updatedRequest
+                    + inner.substring(requestBounds.end());
+            return fReq.substring(0, outerQuote)
+                    + jsonQuote(updatedInner)
+                    + fReq.substring(innerJson.endIndex());
+        }
+
+        private void refreshPerRequestHeaders() {
+            replaceUuidHeader("x-goog-ext-525001261-jspb", "last");
+            replaceUuidHeader("x-goog-ext-525005358-jspb", "first");
+        }
+
+        private void replaceUuidHeader(String name, String position) {
+            String value = headers.get(name);
+            if (value == null || value.isBlank()) {
+                return;
+            }
+
+            Matcher matcher = Pattern.compile("\"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\"").matcher(value);
+            java.util.List<Range> ranges = new java.util.ArrayList<>();
+            while (matcher.find()) {
+                ranges.add(new Range(matcher.start(), matcher.end()));
+            }
+            if (ranges.isEmpty()) {
+                return;
+            }
+
+            Range target = "first".equals(position) ? ranges.get(0) : ranges.get(ranges.size() - 1);
+            String uuid = UUID.randomUUID().toString().toUpperCase(Locale.ROOT);
+            headers.put(name, value.substring(0, target.start())
+                    + jsonQuote(uuid)
+                    + value.substring(target.end()));
+        }
+
+        private static String replaceTopLevelElement(String jsonArray, int targetIndex, String replacement) {
+            Range bounds = topLevelElementBounds(jsonArray, targetIndex);
+            if (bounds == null) {
+                return jsonArray;
+            }
+            return jsonArray.substring(0, bounds.start())
+                    + replacement
+                    + jsonArray.substring(bounds.end());
+        }
+
+        private static Range topLevelElementBounds(String jsonArray, int targetIndex) {
+            int arrayStart = 0;
+            while (arrayStart < jsonArray.length() && Character.isWhitespace(jsonArray.charAt(arrayStart))) {
+                arrayStart++;
+            }
+            if (arrayStart >= jsonArray.length() || jsonArray.charAt(arrayStart) != '[') {
+                return null;
+            }
+
+            int level = 0;
+            int elementIndex = 0;
+            int elementStart = arrayStart + 1;
+            for (int i = arrayStart; i < jsonArray.length(); i++) {
+                char c = jsonArray.charAt(i);
+                if (c == '"') {
+                    JsonString skipped = readJsonString(jsonArray, i);
+                    if (skipped == null) {
+                        return null;
+                    }
+                    i = skipped.endIndex() - 1;
+                    continue;
+                }
+                if (c == '[' || c == '{') {
+                    level++;
+                    continue;
+                }
+                if (c == ',' && level == 1) {
+                    if (elementIndex == targetIndex) {
+                        return trimmedRange(jsonArray, elementStart, i);
+                    }
+                    elementIndex++;
+                    elementStart = i + 1;
+                    continue;
+                }
+                if (c == ']' || c == '}') {
+                    if (level == 1 && c == ']') {
+                        return elementIndex == targetIndex
+                                ? trimmedRange(jsonArray, elementStart, i)
+                                : null;
+                    }
+                    level--;
+                }
+            }
+            return null;
+        }
+
+        private static Range trimmedRange(String value, int start, int end) {
+            while (start < end && Character.isWhitespace(value.charAt(start))) {
+                start++;
+            }
+            while (end > start && Character.isWhitespace(value.charAt(end - 1))) {
+                end--;
+            }
+            return new Range(start, end);
+        }
+
+        private record Range(int start, int end) {
         }
 
         private static String queryValue(String form, String key) {
@@ -631,7 +894,7 @@ public class Main {
 
         private static String required(String value, String name) throws IOException {
             if (value == null || value.isBlank()) {
-                throw new IOException("Missing " + name + " in curl");
+                throw new IOException("curl 里缺少 " + name);
             }
             return value;
         }
