@@ -2,6 +2,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -39,10 +40,13 @@ final class OpenAiApiServer {
         server = HttpServer.create(new InetSocketAddress(host, port), 0);
         server.createContext("/v1/chat/completions", this::handleChatCompletions);
         server.createContext("/v1/models", this::handleModels);
+        server.createContext("/debug/openai-logs", this::handleOpenAiLogs);
+        server.createContext("/", this::handleStatic);
         executor = Executors.newCachedThreadPool();
         server.setExecutor(executor);
         server.start();
         System.out.println("OpenAI API 已启动：http://" + host + ":" + port);
+        System.out.println("前端页面：http://" + host + ":" + port + "/");
         System.out.println("POST /v1/chat/completions");
     }
 
@@ -71,6 +75,61 @@ final class OpenAiApiServer {
         }
         json.append("]}");
         sendJson(exchange, 200, json.toString());
+    }
+
+    private void handleOpenAiLogs(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, "{\"error\":{\"message\":\"只支持 GET\"}}");
+            return;
+        }
+
+        int limit = queryInt(exchange.getRequestURI().getRawQuery(), "limit", 80, 1, 500);
+        Path path = Path.of("logs", "openai-requests.jsonl");
+        if (!Files.exists(path)) {
+            sendJson(exchange, 200, "{\"path\":\"logs/openai-requests.jsonl\",\"lines\":[]}");
+            return;
+        }
+
+        List<String> all = Files.readAllLines(path, StandardCharsets.UTF_8);
+        int from = Math.max(0, all.size() - limit);
+        StringBuilder json = new StringBuilder("{\"path\":\"logs/openai-requests.jsonl\",\"lines\":[");
+        for (int i = from; i < all.size(); i++) {
+            if (i > from) {
+                json.append(',');
+            }
+            json.append(SimpleJson.quote(all.get(i)));
+        }
+        json.append("]}");
+        sendJson(exchange, 200, json.toString());
+    }
+
+    private void handleStatic(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())
+                && !"HEAD".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendJson(exchange, 405, "{\"error\":{\"message\":\"只支持 GET\"}}");
+            return;
+        }
+
+        String path = exchange.getRequestURI().getPath();
+        if (!"/".equals(path) && !"/index.html".equals(path)) {
+            sendText(exchange, 404, "Not Found", "text/plain; charset=utf-8");
+            return;
+        }
+
+        try (InputStream in = OpenAiApiServer.class.getResourceAsStream("/web/index.html")) {
+            if (in == null) {
+                sendText(exchange, 500, "前端资源缺失：/web/index.html", "text/plain; charset=utf-8");
+                return;
+            }
+            byte[] bytes = in.readAllBytes();
+            exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+            exchange.sendResponseHeaders(200, "HEAD".equalsIgnoreCase(exchange.getRequestMethod()) ? -1 : bytes.length);
+            if (!"HEAD".equalsIgnoreCase(exchange.getRequestMethod())) {
+                try (OutputStream out = exchange.getResponseBody()) {
+                    out.write(bytes);
+                }
+            }
+        }
     }
 
     private void handleChatCompletions(HttpExchange exchange) throws IOException {
@@ -645,6 +704,27 @@ final class OpenAiApiServer {
         return false;
     }
 
+    private static int queryInt(String rawQuery, String name, int fallback, int min, int max) {
+        if (rawQuery == null || rawQuery.isBlank()) {
+            return fallback;
+        }
+        for (String pair : rawQuery.split("&")) {
+            int equals = pair.indexOf('=');
+            String key = equals < 0 ? pair : pair.substring(0, equals);
+            if (!name.equals(key)) {
+                continue;
+            }
+            String value = equals < 0 ? "" : pair.substring(equals + 1);
+            try {
+                int parsed = Integer.parseInt(value);
+                return Math.max(min, Math.min(max, parsed));
+            } catch (NumberFormatException ignored) {
+                return fallback;
+            }
+        }
+        return fallback;
+    }
+
     private static String contentText(Object content) {
         if (content instanceof String text) {
             return text;
@@ -817,6 +897,15 @@ final class OpenAiApiServer {
     private static void sendJson(HttpExchange exchange, int status, String json) throws IOException {
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        exchange.sendResponseHeaders(status, bytes.length);
+        try (OutputStream out = exchange.getResponseBody()) {
+            out.write(bytes);
+        }
+    }
+
+    private static void sendText(HttpExchange exchange, int status, String text, String contentType) throws IOException {
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", contentType);
         exchange.sendResponseHeaders(status, bytes.length);
         try (OutputStream out = exchange.getResponseBody()) {
             out.write(bytes);
