@@ -29,6 +29,8 @@ public class Main {
 
     private static final MediaType FORM_MEDIA_TYPE =
             MediaType.get("application/x-www-form-urlencoded;charset=UTF-8");
+    private static final String DEFAULT_MODEL = "gemini-3.5-Flash";
+    private static final Map<String, ModelProfile> MODEL_PROFILES = modelProfiles();
 
     public static void main(String[] args) {
         try {
@@ -45,8 +47,9 @@ public class Main {
             }
 
             if (args.length > 0 && "--no-send".equals(args[0])) {
-                CurlRequest curl = CurlRequest.parse(config.curlFor(config.defaultModel));
+                CurlRequest curl = CurlRequest.parse(config.curl);
                 curl.prepareForConversation(new ConversationState());
+                curl.applyModel(modelProfile(DEFAULT_MODEL));
                 String prompt = joinArgs(args, 1);
                 if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
                     curl.replacePrompt(prompt);
@@ -56,7 +59,7 @@ public class Main {
             }
 
             if (args.length > 0) {
-                sendOnce(config, client, config.defaultModel, String.join(" ", args), new ConversationState());
+                sendOnce(config, client, DEFAULT_MODEL, String.join(" ", args), new ConversationState());
                 return;
             }
 
@@ -82,18 +85,18 @@ public class Main {
         OpenAiApiServer server = new OpenAiApiServer(
                 config.openAiHost,
                 config.openAiPort,
-                config.modelNames(),
-                config.defaultModel,
+                modelNames(),
+                DEFAULT_MODEL,
                 (model, prompt, deltaSink) -> sendForApi(config, client, model, prompt, deltaSink));
         server.start();
         return server;
     }
 
     private static void runLoop(AppConfig config, OkHttpClient client) {
-        System.out.println("已启动。当前是新对话。模型：" + config.defaultModel
+        System.out.println("模型：" + DEFAULT_MODEL
                 + "。输入 /new 开启新对话，/models 查看模型，/model 名称切换模型，/stop 退出。");
         ConversationState conversation = new ConversationState();
-        String currentModel = config.defaultModel;
+        String currentModel = DEFAULT_MODEL;
         Scanner scanner = new Scanner(System.in);
         while (true) {
             System.out.print("> ");
@@ -111,15 +114,14 @@ public class Main {
                 continue;
             }
             if ("/models".equalsIgnoreCase(prompt)) {
-                System.out.println("可用模型：" + String.join(", ", config.modelNames()));
+                System.out.println("可用模型：" + String.join(", ", modelNames()));
                 System.out.println("当前模型：" + currentModel);
                 continue;
             }
             if (prompt.startsWith("/model ")) {
                 String requestedModel = prompt.substring("/model ".length()).trim();
                 try {
-                    config.curlFor(requestedModel);
-                    currentModel = requestedModel;
+                    currentModel = modelProfile(requestedModel).name();
                     conversation.clear();
                     System.out.println("已切换模型：" + currentModel + "。已开启新对话。");
                 } catch (IllegalArgumentException e) {
@@ -160,8 +162,10 @@ public class Main {
 
     private static GeminiResult sendInternal(AppConfig config, OkHttpClient client, String model, String prompt,
                                              ConversationState conversation, Consumer<String> deltaSink) throws IOException {
-        CurlRequest curl = CurlRequest.parse(config.curlFor(model));
+        ModelProfile profile = modelProfile(model);
+        CurlRequest curl = CurlRequest.parse(config.curl);
         curl.prepareForConversation(conversation);
+        curl.applyModel(profile);
         if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
             curl.replacePrompt(prompt);
         }
@@ -176,9 +180,40 @@ public class Main {
                         + "，响应=" + preview(body));
             }
             GeminiResult result = streamGeminiText(response, deltaSink);
-            conversation.update(result.conversationId(), result.responseId(), result.choiceId());
+            conversation.completeTurn(result);
             return result;
         }
+    }
+
+    private static Map<String, ModelProfile> modelProfiles() {
+        Map<String, ModelProfile> profiles = new LinkedHashMap<>();
+        profiles.put(DEFAULT_MODEL, new ModelProfile(DEFAULT_MODEL, null, null, null, null));
+        profiles.put("gemini-3.1-Pro", new ModelProfile(
+                "gemini-3.1-Pro",
+                "9d8ca3786ebdfbea",
+                3,
+                "2cc5278d23ac6305f37b1e606442fb1e",
+                3));
+        return java.util.Collections.unmodifiableMap(profiles);
+    }
+
+    private static ModelProfile modelProfile(String model) {
+        String requested = model == null || model.isBlank() ? DEFAULT_MODEL : model;
+        ModelProfile exact = MODEL_PROFILES.get(requested);
+        if (exact != null) {
+            return exact;
+        }
+        for (ModelProfile profile : MODEL_PROFILES.values()) {
+            if (profile.name().equalsIgnoreCase(requested)) {
+                return profile;
+            }
+        }
+        throw new IllegalArgumentException("未知模型：" + requested
+                + "。可用模型：" + String.join(", ", modelNames()));
+    }
+
+    private static java.util.List<String> modelNames() {
+        return new java.util.ArrayList<>(MODEL_PROFILES.keySet());
     }
 
     private static GeminiResult streamGeminiText(Response response, Consumer<String> deltaSink) throws IOException {
@@ -248,9 +283,9 @@ public class Main {
         System.out.println("proxy: " + (config.proxyEnabled
                 ? config.proxyType + "://" + config.proxyHost + ":" + config.proxyPort
                 : "disabled"));
-        System.out.println("model: " + config.defaultModel);
-        System.out.println("models: " + String.join(", ", config.modelNames()));
-        System.out.println("curl: set len=" + config.curlFor(config.defaultModel).length());
+        System.out.println("model: " + DEFAULT_MODEL);
+        System.out.println("models: " + String.join(", ", modelNames()));
+        System.out.println("curl: set len=" + config.curl.length());
         System.out.println("url: " + curl.url.redact());
         System.out.println("cookie: " + (curl.cookie.isBlank() ? "blank" : "set len=" + curl.cookie.length()));
         System.out.println("form: " + (curl.form.isBlank() ? "blank" : "set len=" + curl.form.length()));
@@ -677,10 +712,7 @@ public class Main {
         private boolean openAiEnabled = true;
         private String openAiHost = "127.0.0.1";
         private int openAiPort = 8080;
-        private String defaultModel = "gemini-3.5-Flash";
-        private final Map<String, String> modelCurls = new LinkedHashMap<>();
         private String curl;
-        private String newCurl;
 
         private static AppConfig load(Path path) throws IOException {
             if (!Files.exists(path)) {
@@ -688,7 +720,7 @@ public class Main {
                 if (Files.exists(resource)) {
                     Files.copy(resource, path);
                 }
-                throw new IOException("已生成 config.yml。把 StreamGenerate 的完整 curl 粘到 curl: 或 newCurl: 后再运行。");
+                throw new IOException("已生成 config.yml。把 StreamGenerate 的完整 curl 粘到 curl: 后再运行。");
             }
 
             String text = Files.readString(path);
@@ -700,55 +732,11 @@ public class Main {
             config.openAiEnabled = booleanValue(sectionValue(text, "openai", "enabled"), config.openAiEnabled);
             config.openAiHost = stringValue(sectionValue(text, "openai", "host"), config.openAiHost);
             config.openAiPort = intValue(sectionValue(text, "openai", "port"), config.openAiPort);
-            config.defaultModel = stringValue(sectionValue(text, "models", "default"), config.defaultModel);
             config.curl = extractCurl(text);
-            config.newCurl = extractNamedCurl(text, "newCurl");
-            Map<String, String> configuredModelCurls = extractModelCurls(text);
-            String proCurl = extractNamedCurl(text, "proCurl");
-            if (hasCurlText(config.newCurl) || hasCurlText(config.curl)) {
-                config.modelCurls.put(config.defaultModel, config.activeCurl());
-            }
-            config.modelCurls.putAll(configuredModelCurls);
-            if (hasCurlText(proCurl)) {
-                config.modelCurls.putIfAbsent("gemini-3.1-Pro", proCurl);
-            }
-            if (hasCurlText(config.newCurl) || hasCurlText(config.curl)) {
-                config.modelCurls.putIfAbsent(config.defaultModel, config.activeCurl());
-            }
-            if (config.modelCurls.isEmpty()) {
-                throw new IOException("config.yml 里没有 curl 内容。把完整 StreamGenerate curl 粘到 curl:、newCurl: 或 modelCurls 下面。");
+            if (!hasCurlText(config.curl)) {
+                throw new IOException("config.yml 里没有 curl 内容。把完整 StreamGenerate curl 粘到 curl: 后面。");
             }
             return config;
-        }
-
-        private String activeCurl() {
-            return hasCurlText(newCurl) ? newCurl : curl;
-        }
-
-        private String activeCurlName() {
-            return hasCurlText(newCurl) ? "newCurl" : "curl";
-        }
-
-        private String curlFor(String model) {
-            String requested = model == null || model.isBlank() ? defaultModel : model;
-            String value = modelCurls.get(requested);
-            if (hasCurlText(value)) {
-                return value;
-            }
-            for (Map.Entry<String, String> entry : modelCurls.entrySet()) {
-                if (entry.getKey().equalsIgnoreCase(requested) && hasCurlText(entry.getValue())) {
-                    return entry.getValue();
-                }
-            }
-            throw new IllegalArgumentException("未知或未配置 curl 的模型：" + requested
-                    + "。可用模型：" + String.join(", ", modelNames()));
-        }
-
-        private java.util.List<String> modelNames() {
-            if (modelCurls.isEmpty()) {
-                return java.util.List.of(defaultModel);
-            }
-            return new java.util.ArrayList<>(modelCurls.keySet());
         }
 
         private static String extractCurl(String text) {
@@ -773,10 +761,7 @@ public class Main {
             String first = line.substring(line.indexOf(':') + 1).trim();
             StringBuilder rest = new StringBuilder();
             for (int i = curlLine + 1; i < lines.length; i++) {
-                String trimmed = lines[i].trim();
-                if (trimmed.startsWith("curl:") || trimmed.startsWith("newCurl:")
-                        || trimmed.startsWith("continueCurl:") || trimmed.startsWith("proCurl:")
-                        || trimmed.equals("modelCurls:")) {
+                if (isTopLevelConfigKey(lines[i])) {
                     break;
                 }
                 rest.append(lines[i]).append('\n');
@@ -788,62 +773,12 @@ public class Main {
             return trimConfigCurlText(first + "\n" + rest);
         }
 
-        private static Map<String, String> extractModelCurls(String text) {
-            Map<String, String> values = new LinkedHashMap<>();
-            String[] lines = text.split("\\R", -1);
-            for (int i = 0; i < lines.length; i++) {
-                String trimmed = lines[i].trim();
-                if (!trimmed.equals("modelCurls:")) {
-                    continue;
-                }
-
-                i++;
-                while (i < lines.length) {
-                    String line = lines[i];
-                    String lineTrimmed = line.trim();
-                    if (lineTrimmed.isEmpty() || lineTrimmed.startsWith("#")) {
-                        i++;
-                        continue;
-                    }
-                    if (!line.startsWith(" ")) {
-                        break;
-                    }
-
-                    Matcher matcher = Pattern.compile("^\\s{2}([^:#]+):\\s*(.*)$").matcher(line);
-                    if (!matcher.matches()) {
-                        i++;
-                        continue;
-                    }
-
-                    String model = matcher.group(1).trim();
-                    String first = matcher.group(2).trim();
-                    StringBuilder rest = new StringBuilder();
-                    i++;
-                    while (i < lines.length) {
-                        String next = lines[i];
-                        String nextTrimmed = next.trim();
-                        if (!next.startsWith("    ")
-                                && (Pattern.compile("^\\s{2}[^:#]+:\\s*.*$").matcher(next).matches()
-                                || (!next.startsWith(" ") && !nextTrimmed.isEmpty()))) {
-                            break;
-                        }
-                        rest.append(next).append('\n');
-                        i++;
-                    }
-
-                    String curlText;
-                    if (first.equals("|") || first.equals("|-") || first.equals(">")) {
-                        curlText = stripIndent(stripIndent(rest.toString())).trim();
-                    } else {
-                        curlText = trimConfigCurlText(first + "\n" + stripIndent(stripIndent(rest.toString())));
-                    }
-                    if (hasCurlText(curlText)) {
-                        values.put(model, curlText);
-                    }
-                }
-                break;
-            }
-            return values;
+        private static boolean isTopLevelConfigKey(String line) {
+            String trimmed = line.trim();
+            return !trimmed.isEmpty()
+                    && !trimmed.startsWith("#")
+                    && !line.startsWith(" ")
+                    && Pattern.compile("^[A-Za-z0-9_-]+:\\s*.*$").matcher(trimmed).matches();
         }
 
         private static boolean hasCurlText(String value) {
@@ -1002,6 +937,41 @@ public class Main {
             originalPrompt = prompt;
         }
 
+        private void applyModel(ModelProfile profile) {
+            if (profile == null) {
+                return;
+            }
+            applyHeaderModelPatch(profile);
+            applyFormModelPatch(profile);
+        }
+
+        private void applyHeaderModelPatch(ModelProfile profile) {
+            String value = headers.get("x-goog-ext-525001261-jspb");
+            if (value == null || value.isBlank()) {
+                return;
+            }
+
+            String updated = value;
+            if (profile.headerToken() != null) {
+                updated = replaceTopLevelElement(updated, 4, jsonQuote(profile.headerToken()));
+            }
+            if (profile.headerMode() != null) {
+                updated = replaceTopLevelElement(updated, 14, String.valueOf(profile.headerMode()));
+            }
+            headers.put("x-goog-ext-525001261-jspb", updated);
+        }
+
+        private void applyFormModelPatch(ModelProfile profile) {
+            String fReq = queryValue(form, "f.req");
+            if (fReq == null || fReq.isBlank()) {
+                return;
+            }
+
+            String updated = applyModelToFReq(fReq, profile);
+            form = replaceFormValue(form, "f.req", updated);
+            originalPrompt = readPromptFromForm(form);
+        }
+
         private void prepareForConversation(ConversationState conversation) {
             url = url.newBuilder()
                     .setQueryParameter("_reqid", String.valueOf(ThreadLocalRandom.current().nextInt(1_000_000, 9_999_999)))
@@ -1095,8 +1065,29 @@ public class Main {
                     ? jsonConversationArray(conversation.conversationId(), conversation.responseId(), conversation.choiceId())
                     : "[\"\",\"\",\"\",null,null,null,null,null,null,\"\"]";
             String updatedInner = replaceTopLevelElement(inner, 2, stateArray);
-            if (!conversation.isActive()) {
-                updatedInner = updatedInner.replaceFirst("\\[\\[\\d+]]", "[[0]]");
+            updatedInner = replaceTopLevelElement(updatedInner, 17, "[[" + conversation.nextTurnIndex() + "]]");
+            return fReq.substring(0, outerQuote)
+                    + jsonQuote(updatedInner)
+                    + fReq.substring(innerJson.endIndex());
+        }
+
+        private static String applyModelToFReq(String fReq, ModelProfile profile) {
+            int outerQuote = fReq.indexOf('"');
+            if (outerQuote < 0) {
+                return fReq;
+            }
+            JsonString innerJson = readJsonString(fReq, outerQuote);
+            if (innerJson == null) {
+                return fReq;
+            }
+
+            String inner = innerJson.value();
+            String updatedInner = inner;
+            if (profile.requestHash() != null) {
+                updatedInner = replaceTopLevelElement(updatedInner, 4, jsonQuote(profile.requestHash()));
+            }
+            if (profile.tailMode() != null) {
+                updatedInner = replaceTopLevelElement(updatedInner, 79, String.valueOf(profile.tailMode()));
             }
             return fReq.substring(0, outerQuote)
                     + jsonQuote(updatedInner)
@@ -1358,6 +1349,7 @@ public class Main {
         private String conversationId = "";
         private String responseId = "";
         private String choiceId = "";
+        private int completedTurns;
 
         private boolean isActive() {
             return !conversationId.isBlank() && !responseId.isBlank() && !choiceId.isBlank();
@@ -1367,17 +1359,26 @@ public class Main {
             conversationId = "";
             responseId = "";
             choiceId = "";
+            completedTurns = 0;
         }
 
-        private void update(String conversationId, String responseId, String choiceId) {
-            if (conversationId != null && conversationId.startsWith("c_")) {
-                this.conversationId = conversationId;
+        private void completeTurn(GeminiResult result) {
+            String oldConversationId = conversationId;
+            String oldResponseId = responseId;
+            String oldChoiceId = choiceId;
+            if (result.conversationId() != null && result.conversationId().startsWith("c_")) {
+                this.conversationId = result.conversationId();
             }
-            if (responseId != null && responseId.startsWith("r_")) {
-                this.responseId = responseId;
+            if (result.responseId() != null && result.responseId().startsWith("r_")) {
+                this.responseId = result.responseId();
             }
-            if (choiceId != null && choiceId.startsWith("rc_")) {
-                this.choiceId = choiceId;
+            if (result.choiceId() != null && result.choiceId().startsWith("rc_")) {
+                this.choiceId = result.choiceId();
+            }
+            if (isActive() && (!conversationId.equals(oldConversationId)
+                    || !responseId.equals(oldResponseId)
+                    || !choiceId.equals(oldChoiceId))) {
+                completedTurns++;
             }
         }
 
@@ -1392,6 +1393,13 @@ public class Main {
         private String choiceId() {
             return choiceId;
         }
+
+        private int nextTurnIndex() {
+            return completedTurns;
+        }
+    }
+
+    private record ModelProfile(String name, String headerToken, Integer headerMode, String requestHash, Integer tailMode) {
     }
 
     private record GeminiResult(String text, String conversationId, String responseId, String choiceId) {

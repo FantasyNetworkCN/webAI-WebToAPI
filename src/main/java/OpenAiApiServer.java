@@ -25,7 +25,7 @@ final class OpenAiApiServer {
     OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend) {
         this.host = host;
         this.port = port;
-        this.defaultModel = defaultModel == null || defaultModel.isBlank() ? "gemini-web" : defaultModel;
+        this.defaultModel = defaultModel == null || defaultModel.isBlank() ? "Gemini-web" : defaultModel;
         this.models = models == null || models.isEmpty() ? List.of(this.defaultModel) : List.copyOf(models);
         this.backend = backend;
     }
