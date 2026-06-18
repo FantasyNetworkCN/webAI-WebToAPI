@@ -5,6 +5,9 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
@@ -94,6 +97,7 @@ final class OpenAiApiServer {
             String model = resolveModel(request.get("model"));
             SessionKey sessionKey = sessionKey(request, exchange, prompt);
             String toolsText = toolsText(request.get("tools"), request.get("tool_choice"));
+            logRequest(exchange, body, request, model, stream, sessionKey, prompt, toolsText);
             ChatRequest chatRequest = new ChatRequest(
                     model,
                     sessionKey.value(),
@@ -226,29 +230,10 @@ final class OpenAiApiServer {
     }
 
     private static SessionKey sessionKey(Map<?, ?> request, HttpExchange exchange, PromptData prompt) {
-        String explicit = firstNonBlank(
-                stringValue(request.get("conversation_id"), ""),
-                stringValue(request.get("session_id"), ""),
-                stringValue(request.get("chat_id"), ""),
-                stringValue(request.get("thread_id"), ""),
-                stringValue(request.get("channel_id"), ""),
-                stringValue(request.get("room_id"), ""),
-                stringValue(request.get("dialogue_id"), ""),
-                nestedString(request.get("metadata"), "conversation_id"),
-                nestedString(request.get("metadata"), "session_id"),
-                nestedString(request.get("metadata"), "chat_id"),
-                nestedString(request.get("metadata"), "thread_id"),
-                nestedString(request.get("metadata"), "channel_id"),
-                nestedString(request.get("metadata"), "room_id"),
-                nestedString(request.get("metadata"), "dialogue_id"),
-                exchange.getRequestHeaders().getFirst("x-conversation-id"),
-                exchange.getRequestHeaders().getFirst("x-session-id"),
-                exchange.getRequestHeaders().getFirst("x-chat-id"),
-                exchange.getRequestHeaders().getFirst("x-thread-id"),
-                exchange.getRequestHeaders().getFirst("x-openwebui-chat-id"),
-                exchange.getRequestHeaders().getFirst("x-astrbot-session-id"));
-        if (explicit != null && !explicit.isBlank()) {
-            return new SessionKey("explicit:" + cleanKey(explicit), true);
+        List<SessionCandidate> candidates = sessionCandidates(request, exchange);
+        if (!candidates.isEmpty()) {
+            SessionCandidate explicit = candidates.get(0);
+            return new SessionKey("explicit:" + cleanKey(explicit.value()), true, explicit.source(), candidates);
         }
 
         String origin = firstNonBlank(
@@ -257,7 +242,201 @@ final class OpenAiApiServer {
                 exchange.getRemoteAddress() == null ? "" : exchange.getRemoteAddress().getAddress().getHostAddress());
         String user = stringValue(request.get("user"), "");
         String seed = firstNonBlank(prompt.firstUser(), prompt.latest(), prompt.full());
-        return new SessionKey("auto:" + shortHash(origin + "\n" + user + "\n" + seed), false);
+        return new SessionKey("auto:" + shortHash(origin + "\n" + user + "\n" + seed),
+                false,
+                "auto:origin+user+first_user",
+                candidates);
+    }
+
+    private static List<SessionCandidate> sessionCandidates(Map<?, ?> request, HttpExchange exchange) {
+        java.util.ArrayList<SessionCandidate> candidates = new java.util.ArrayList<>();
+        addCandidate(candidates, "body.conversation_id", request.get("conversation_id"));
+        addCandidate(candidates, "body.session_id", request.get("session_id"));
+        addCandidate(candidates, "body.chat_id", request.get("chat_id"));
+        addCandidate(candidates, "body.thread_id", request.get("thread_id"));
+        addCandidate(candidates, "body.channel_id", request.get("channel_id"));
+        addCandidate(candidates, "body.room_id", request.get("room_id"));
+        addCandidate(candidates, "body.dialogue_id", request.get("dialogue_id"));
+        addCandidate(candidates, "body.dialog_id", request.get("dialog_id"));
+        addCandidate(candidates, "body.context_id", request.get("context_id"));
+
+        Object metadata = request.get("metadata");
+        addCandidate(candidates, "metadata.conversation_id", nestedString(metadata, "conversation_id"));
+        addCandidate(candidates, "metadata.session_id", nestedString(metadata, "session_id"));
+        addCandidate(candidates, "metadata.chat_id", nestedString(metadata, "chat_id"));
+        addCandidate(candidates, "metadata.thread_id", nestedString(metadata, "thread_id"));
+        addCandidate(candidates, "metadata.channel_id", nestedString(metadata, "channel_id"));
+        addCandidate(candidates, "metadata.room_id", nestedString(metadata, "room_id"));
+        addCandidate(candidates, "metadata.dialogue_id", nestedString(metadata, "dialogue_id"));
+        addCandidate(candidates, "metadata.dialog_id", nestedString(metadata, "dialog_id"));
+        addCandidate(candidates, "metadata.context_id", nestedString(metadata, "context_id"));
+
+        addHeaderCandidate(candidates, exchange, "x-conversation-id");
+        addHeaderCandidate(candidates, exchange, "x-session-id");
+        addHeaderCandidate(candidates, exchange, "x-chat-id");
+        addHeaderCandidate(candidates, exchange, "x-thread-id");
+        addHeaderCandidate(candidates, exchange, "x-openwebui-chat-id");
+        addHeaderCandidate(candidates, exchange, "x-astrbot-session-id");
+
+        collectNestedSessionCandidates(candidates, request, "body", 0);
+        addCompoundAstrBotCandidate(candidates, request, exchange);
+        return dedupeCandidates(candidates);
+    }
+
+    private static void addHeaderCandidate(List<SessionCandidate> candidates, HttpExchange exchange, String name) {
+        addCandidate(candidates, "header." + name, exchange.getRequestHeaders().getFirst(name));
+    }
+
+    private static void addCompoundAstrBotCandidate(List<SessionCandidate> candidates,
+                                                    Map<?, ?> request,
+                                                    HttpExchange exchange) {
+        String platform = firstNonBlank(
+                findNestedString(request, "platform"),
+                findNestedString(request, "adapter"),
+                findNestedString(request, "provider"),
+                exchange.getRequestHeaders().getFirst("x-astrbot-platform"),
+                exchange.getRequestHeaders().getFirst("x-platform"));
+        String space = firstNonBlank(
+                findNestedString(request, "group_id"),
+                findNestedString(request, "guild_id"),
+                findNestedString(request, "channel_id"),
+                findNestedString(request, "room_id"),
+                findNestedString(request, "chat_id"),
+                findNestedString(request, "thread_id"),
+                exchange.getRequestHeaders().getFirst("x-astrbot-group-id"),
+                exchange.getRequestHeaders().getFirst("x-astrbot-channel-id"),
+                exchange.getRequestHeaders().getFirst("x-group-id"),
+                exchange.getRequestHeaders().getFirst("x-channel-id"));
+        String user = firstNonBlank(
+                findNestedString(request, "user_id"),
+                findNestedString(request, "sender_id"),
+                findNestedString(request, "author_id"),
+                findNestedString(request, "from_id"),
+                exchange.getRequestHeaders().getFirst("x-astrbot-user-id"),
+                exchange.getRequestHeaders().getFirst("x-user-id"));
+
+        if (!platform.isBlank() && !space.isBlank()) {
+            addCandidate(candidates, "compound.platform+space+user",
+                    platform + ":" + space + (user.isBlank() ? "" : ":" + user));
+        } else if (!platform.isBlank() && !user.isBlank()) {
+            addCandidate(candidates, "compound.platform+user", platform + ":" + user);
+        }
+    }
+
+    private static void collectNestedSessionCandidates(List<SessionCandidate> candidates,
+                                                       Object value,
+                                                       String path,
+                                                       int depth) {
+        if (value == null || depth > 6) {
+            return;
+        }
+        if (value instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                String key = String.valueOf(entry.getKey());
+                String childPath = path + "." + key;
+                if (isStableSessionField(key)) {
+                    addCandidate(candidates, childPath, entry.getValue());
+                }
+                collectNestedSessionCandidates(candidates, entry.getValue(), childPath, depth + 1);
+            }
+            return;
+        }
+        if (value instanceof List<?> list) {
+            int limit = Math.min(list.size(), 20);
+            for (int i = 0; i < limit; i++) {
+                collectNestedSessionCandidates(candidates, list.get(i), path + "[" + i + "]", depth + 1);
+            }
+        }
+    }
+
+    private static String findNestedString(Object value, String key) {
+        return findNestedString(value, key, 0);
+    }
+
+    private static String findNestedString(Object value, String key, int depth) {
+        if (value == null || depth > 6) {
+            return "";
+        }
+        if (value instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                if (key.equalsIgnoreCase(String.valueOf(entry.getKey()))) {
+                    String text = stringValue(entry.getValue(), "");
+                    if (!text.isBlank()) {
+                        return text;
+                    }
+                    if (entry.getValue() instanceof Number || entry.getValue() instanceof Boolean) {
+                        return String.valueOf(entry.getValue());
+                    }
+                }
+            }
+            for (Object child : map.values()) {
+                String found = findNestedString(child, key, depth + 1);
+                if (!found.isBlank()) {
+                    return found;
+                }
+            }
+            return "";
+        }
+        if (value instanceof List<?> list) {
+            for (Object child : list) {
+                String found = findNestedString(child, key, depth + 1);
+                if (!found.isBlank()) {
+                    return found;
+                }
+            }
+        }
+        return "";
+    }
+
+    private static boolean isStableSessionField(String key) {
+        String lower = key == null ? "" : key.toLowerCase();
+        return lower.equals("conversation_id")
+                || lower.equals("conversationid")
+                || lower.equals("session_id")
+                || lower.equals("sessionid")
+                || lower.equals("chat_id")
+                || lower.equals("chatid")
+                || lower.equals("thread_id")
+                || lower.equals("threadid")
+                || lower.equals("channel_id")
+                || lower.equals("channelid")
+                || lower.equals("room_id")
+                || lower.equals("roomid")
+                || lower.equals("dialogue_id")
+                || lower.equals("dialogueid")
+                || lower.equals("dialog_id")
+                || lower.equals("dialogid")
+                || lower.equals("context_id")
+                || lower.equals("contextid");
+    }
+
+    private static void addCandidate(List<SessionCandidate> candidates, String source, Object value) {
+        String text = scalarString(value);
+        if (!text.isBlank()) {
+            candidates.add(new SessionCandidate(source, text));
+        }
+    }
+
+    private static String scalarString(Object value) {
+        if (value instanceof String text) {
+            return text.trim();
+        }
+        if (value instanceof Number || value instanceof Boolean) {
+            return String.valueOf(value);
+        }
+        return "";
+    }
+
+    private static List<SessionCandidate> dedupeCandidates(List<SessionCandidate> candidates) {
+        java.util.ArrayList<SessionCandidate> out = new java.util.ArrayList<>();
+        java.util.HashSet<String> seen = new java.util.HashSet<>();
+        for (SessionCandidate candidate : candidates) {
+            String key = candidate.source() + "\n" + candidate.value();
+            if (seen.add(key)) {
+                out.add(candidate);
+            }
+        }
+        return List.copyOf(out);
     }
 
     private static boolean wantsNewConversation(Map<?, ?> request, PromptData prompt, SessionKey sessionKey) {
@@ -265,6 +444,160 @@ final class OpenAiApiServer {
                 || booleanValue(request.get("new"))
                 || "/new".equalsIgnoreCase(prompt.latest().trim())
                 || (!sessionKey.explicit() && prompt.messageCount() <= 1);
+    }
+
+    private static void logRequest(HttpExchange exchange, String rawBody, Map<?, ?> request, String model,
+                                   boolean stream, SessionKey sessionKey, PromptData prompt, String toolsText) {
+        try {
+            Path dir = Path.of("logs");
+            Files.createDirectories(dir);
+            String line = "{"
+                    + "\"time\":" + SimpleJson.quote(Instant.now().toString()) + ","
+                    + "\"remote\":" + SimpleJson.quote(exchange.getRemoteAddress() == null ? "" : exchange.getRemoteAddress().toString()) + ","
+                    + "\"method\":" + SimpleJson.quote(exchange.getRequestMethod()) + ","
+                    + "\"path\":" + SimpleJson.quote(exchange.getRequestURI().toString()) + ","
+                    + "\"model\":" + SimpleJson.quote(model) + ","
+                    + "\"stream\":" + stream + ","
+                    + "\"session_key_hash\":" + SimpleJson.quote(shortHash(sessionKey.value())) + ","
+                    + "\"session_source\":" + SimpleJson.quote(sessionKey.source()) + ","
+                    + "\"session_explicit\":" + sessionKey.explicit() + ","
+                    + "\"session_candidates\":" + sessionCandidatesJson(sessionKey.candidates()) + ","
+                    + "\"new_conversation\":" + wantsNewConversation(request, prompt, sessionKey) + ","
+                    + "\"message_count\":" + prompt.messageCount() + ","
+                    + "\"latest\":" + SimpleJson.quote(prompt.latest()) + ","
+                    + "\"first_user\":" + SimpleJson.quote(prompt.firstUser()) + ","
+                    + "\"has_tools\":" + !toolsText.isBlank() + ","
+                    + "\"headers\":" + requestHeadersJson(exchange) + ","
+                    + "\"body_hash\":" + SimpleJson.quote(shortHash(rawBody)) + ","
+                    + "\"body\":" + toJson(sanitizeForLog(request, "body"))
+                    + "}\n";
+            Files.writeString(dir.resolve("openai-requests.jsonl"), line, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException ignored) {
+        }
+    }
+
+    private static String requestHeadersJson(HttpExchange exchange) {
+        StringBuilder out = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, List<String>> entry : exchange.getRequestHeaders().entrySet()) {
+            if (!isInterestingHeader(entry.getKey())) {
+                continue;
+            }
+            if (!first) {
+                out.append(',');
+            }
+            first = false;
+            String key = entry.getKey().toLowerCase();
+            out.append(SimpleJson.quote(key))
+                    .append(':')
+                    .append(toJson(logHeaderValues(key, entry.getValue())));
+        }
+        return out.append('}').toString();
+    }
+
+    private static boolean isInterestingHeader(String name) {
+        String lower = name == null ? "" : name.toLowerCase();
+        return lower.equals("user-agent")
+                || lower.equals("origin")
+                || lower.equals("referer")
+                || lower.equals("x-conversation-id")
+                || lower.equals("x-session-id")
+                || lower.equals("x-chat-id")
+                || lower.equals("x-thread-id")
+                || lower.equals("x-openwebui-chat-id")
+                || lower.equals("x-astrbot-session-id")
+                || lower.equals("x-astrbot-platform")
+                || lower.equals("x-astrbot-user-id")
+                || lower.equals("x-astrbot-group-id")
+                || lower.equals("x-astrbot-channel-id")
+                || lower.equals("x-platform")
+                || lower.equals("x-user-id")
+                || lower.equals("x-group-id")
+                || lower.equals("x-channel-id");
+    }
+
+    private static List<String> logHeaderValues(String key, List<String> values) {
+        if (values == null) {
+            return List.of();
+        }
+        java.util.ArrayList<String> out = new java.util.ArrayList<>();
+        for (String value : values) {
+            out.add(isSensitiveLogKey(key) ? fingerprint(value) : value);
+        }
+        return out;
+    }
+
+    private static String sessionCandidatesJson(List<SessionCandidate> candidates) {
+        StringBuilder out = new StringBuilder("[");
+        for (int i = 0; i < candidates.size(); i++) {
+            if (i > 0) {
+                out.append(',');
+            }
+            SessionCandidate candidate = candidates.get(i);
+            out.append("{\"source\":")
+                    .append(SimpleJson.quote(candidate.source()))
+                    .append(",\"value\":")
+                    .append(SimpleJson.quote(fingerprint(candidate.value())))
+                    .append('}');
+        }
+        return out.append(']').toString();
+    }
+
+    private static Object sanitizeForLog(Object value, String key) {
+        if (value == null) {
+            return null;
+        }
+        if (isSensitiveLogKey(key)) {
+            return fingerprint(String.valueOf(value));
+        }
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> out = new java.util.LinkedHashMap<>();
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                String childKey = String.valueOf(entry.getKey());
+                out.put(childKey, sanitizeForLog(entry.getValue(), childKey));
+            }
+            return out;
+        }
+        if (value instanceof List<?> list) {
+            java.util.ArrayList<Object> out = new java.util.ArrayList<>();
+            for (Object item : list) {
+                out.add(sanitizeForLog(item, key));
+            }
+            return out;
+        }
+        return value;
+    }
+
+    private static boolean isSensitiveLogKey(String key) {
+        String lower = key == null ? "" : key.toLowerCase();
+        return lower.equals("authorization")
+                || lower.equals("cookie")
+                || lower.contains("token")
+                || lower.contains("secret")
+                || lower.contains("password")
+                || lower.contains("apikey")
+                || lower.contains("api_key")
+                || lower.equals("user")
+                || lower.equals("id")
+                || lower.endsWith("_id")
+                || lower.endsWith("-id")
+                || lower.contains("session")
+                || lower.contains("conversation")
+                || lower.contains("thread")
+                || lower.contains("channel")
+                || lower.contains("room")
+                || lower.contains("dialog")
+                || lower.contains("guild")
+                || lower.contains("group")
+                || lower.contains("sender")
+                || lower.contains("author")
+                || lower.equals("from");
+    }
+
+    private static String fingerprint(String value) {
+        String text = value == null ? "" : value;
+        return "sha256:" + shortHash(text) + ":len=" + text.length();
     }
 
     private static String firstNonBlank(String... values) {
@@ -570,7 +903,10 @@ final class OpenAiApiServer {
         }
     }
 
-    private record SessionKey(String value, boolean explicit) {
+    private record SessionKey(String value, boolean explicit, String source, List<SessionCandidate> candidates) {
+    }
+
+    private record SessionCandidate(String source, String value) {
     }
 
     private record PromptData(String full, String latest, String firstUser, int messageCount) {
