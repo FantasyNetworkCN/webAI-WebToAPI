@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Scanner;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -26,29 +27,69 @@ public class Main {
 
     public static void main(String[] args) {
         try {
-            boolean noSend = args.length > 0 && "--no-send".equals(args[0]);
-            String prompt = noSend ? joinArgs(args, 1) : String.join(" ", args);
             AppConfig config = AppConfig.load(Path.of("config.yml"));
-            CurlRequest curl = CurlRequest.parse(config.curl);
-            if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
-                curl.replacePrompt(prompt);
-            }
+            OkHttpClient client = buildHttpClient(config);
 
-            printStatus(config, curl);
-            if (noSend) {
+            if (args.length > 0 && "--no-send".equals(args[0])) {
+                CurlRequest curl = CurlRequest.parse(config.curl);
+                String prompt = joinArgs(args, 1);
+                if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
+                    curl.replacePrompt(prompt);
+                }
+                printStatus(config, curl);
                 return;
             }
 
-            try (Response response = buildHttpClient(config).newCall(curl.toRequest()).execute()) {
-                String body = response.body() == null ? "" : response.body().string();
-                if (!response.isSuccessful()) {
-                    throw new IOException("Gemini request failed, status=" + response.code()
-                            + ", body=" + preview(body));
-                }
-                System.out.println(parseGeminiText(body));
+            if (args.length > 0) {
+                sendOnce(config, client, String.join(" ", args));
+                return;
             }
+
+            runLoop(config, client);
         } catch (Exception e) {
             e.printStackTrace();
+        }
+    }
+
+    private static void runLoop(AppConfig config, OkHttpClient client) {
+        System.out.println("已启动。输入 stop 退出。");
+        Scanner scanner = new Scanner(System.in);
+        while (true) {
+            System.out.print("> ");
+            if (!scanner.hasNextLine()) {
+                break;
+            }
+
+            String prompt = scanner.nextLine().trim();
+            if ("stop".equalsIgnoreCase(prompt)) {
+                break;
+            }
+            if (prompt.isBlank()) {
+                continue;
+            }
+
+            try {
+                sendOnce(config, client, prompt);
+            } catch (Exception e) {
+                System.err.println("请求失败：" + e.getMessage());
+            }
+        }
+        System.out.println("已退出。");
+    }
+
+    private static void sendOnce(AppConfig config, OkHttpClient client, String prompt) throws IOException {
+        CurlRequest curl = CurlRequest.parse(config.curl);
+        if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
+            curl.replacePrompt(prompt);
+        }
+
+        try (Response response = client.newCall(curl.toRequest()).execute()) {
+            String body = response.body() == null ? "" : response.body().string();
+            if (!response.isSuccessful()) {
+                throw new IOException("Gemini request failed, status=" + response.code()
+                        + ", body=" + preview(body));
+            }
+            System.out.println(parseGeminiText(body));
         }
     }
 
