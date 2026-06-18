@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Scanner;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
@@ -33,9 +34,18 @@ public class Main {
             AppConfig config = AppConfig.load(Path.of("config.yml"));
             OkHttpClient client = buildHttpClient(config);
 
+            if (args.length > 1 && "--parse-file".equals(args[0])) {
+                GeminiResult result = parseGeminiResultOrThrow(Files.readString(Path.of(args[1])));
+                System.out.println("text: " + result.text());
+                System.out.println("conversation: " + result.conversationId());
+                System.out.println("response: " + result.responseId());
+                System.out.println("choice: " + result.choiceId());
+                return;
+            }
+
             if (args.length > 0 && "--no-send".equals(args[0])) {
                 CurlRequest curl = CurlRequest.parse(config.activeCurl());
-                curl.prepareNewConversation();
+                curl.prepareForConversation(new ConversationState());
                 String prompt = joinArgs(args, 1);
                 if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
                     curl.replacePrompt(prompt);
@@ -45,7 +55,7 @@ public class Main {
             }
 
             if (args.length > 0) {
-                sendOnce(config, client, String.join(" ", args));
+                sendOnce(config, client, String.join(" ", args), new ConversationState());
                 return;
             }
 
@@ -56,7 +66,8 @@ public class Main {
     }
 
     private static void runLoop(AppConfig config, OkHttpClient client) {
-        System.out.println("已启动。输入 stop 退出。");
+        System.out.println("已启动。当前是新对话。输入 /new 开启新对话，输入 stop 退出。");
+        ConversationState conversation = new ConversationState();
         Scanner scanner = new Scanner(System.in);
         while (true) {
             System.out.print("> ");
@@ -68,12 +79,17 @@ public class Main {
             if ("stop".equalsIgnoreCase(prompt)) {
                 break;
             }
+            if ("/new".equalsIgnoreCase(prompt)) {
+                conversation.clear();
+                System.out.println("已开启新对话。");
+                continue;
+            }
             if (prompt.isBlank()) {
                 continue;
             }
 
             try {
-                sendOnce(config, client, prompt);
+                sendOnce(config, client, prompt, conversation);
             } catch (Exception e) {
                 System.err.println("请求失败：" + e.getMessage());
             }
@@ -81,9 +97,9 @@ public class Main {
         System.out.println("已退出。");
     }
 
-    private static void sendOnce(AppConfig config, OkHttpClient client, String prompt) throws IOException {
+    private static void sendOnce(AppConfig config, OkHttpClient client, String prompt, ConversationState conversation) throws IOException {
         CurlRequest curl = CurlRequest.parse(config.activeCurl());
-        curl.prepareNewConversation();
+        curl.prepareForConversation(conversation);
         if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
             curl.replacePrompt(prompt);
         }
@@ -97,13 +113,15 @@ public class Main {
                 throw new IOException("Gemini 请求失败，HTTP 状态=" + response.code()
                         + "，响应=" + preview(body));
             }
-            streamGeminiText(response);
+            GeminiResult result = streamGeminiText(response);
+            conversation.update(result.conversationId(), result.responseId(), result.choiceId());
         }
     }
 
-    private static void streamGeminiText(Response response) throws IOException {
+    private static GeminiResult streamGeminiText(Response response) throws IOException {
         StringBuilder all = new StringBuilder();
         String printed = "";
+        GeminiResult latest = GeminiResult.empty();
 
         while (true) {
             String line = response.body().source().readUtf8Line();
@@ -112,8 +130,13 @@ public class Main {
             }
 
             all.append(line).append('\n');
-            String current = tryParseGeminiText(all.toString());
+            GeminiResult currentResult = parseGeminiResult(all.toString());
+            latest = latest.merge(currentResult);
+            String current = currentResult.text();
             if (current == null || current.length() <= printed.length()) {
+                continue;
+            }
+            if (!printed.isEmpty() && !current.startsWith(printed)) {
                 continue;
             }
 
@@ -124,11 +147,23 @@ public class Main {
         }
 
         if (!printed.isEmpty()) {
+            dumpRawResponseIfRequested(all.toString());
             System.out.println();
-            return;
+            return latest.merge(parseGeminiResult(all.toString()));
         }
 
-        System.out.println(parseGeminiText(all.toString()));
+        dumpRawResponseIfRequested(all.toString());
+        GeminiResult result = parseGeminiResultOrThrow(all.toString());
+        System.out.println(result.text());
+        return result;
+    }
+
+    private static void dumpRawResponseIfRequested(String body) throws IOException {
+        String path = System.getProperty("dumpRaw");
+        if (path == null || path.isBlank()) {
+            return;
+        }
+        Files.writeString(Path.of(path), body, StandardCharsets.UTF_8);
     }
 
     private static OkHttpClient buildHttpClient(AppConfig config) {
@@ -171,9 +206,9 @@ public class Main {
             throw new IOException("Gemini 返回了 HTML，不是 RPC 数据：" + preview(body));
         }
 
-        String best = tryParseGeminiText(body);
-        if (best != null) {
-            return best;
+        GeminiResult result = parseGeminiResult(body);
+        if (!result.text().isBlank()) {
+            return result.text();
         }
         Matcher bardError = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]").matcher(body);
         if (bardError.find()) {
@@ -184,7 +219,18 @@ public class Main {
     }
 
     private static String tryParseGeminiText(String body) {
-        String best = null;
+        String text = parseGeminiResult(body).text();
+        return text.isBlank() ? null : text;
+    }
+
+    private static GeminiResult parseGeminiResultOrThrow(String body) throws IOException {
+        String text = parseGeminiText(body);
+        GeminiResult result = parseGeminiResult(body);
+        return new GeminiResult(text, result.conversationId(), result.responseId(), result.choiceId());
+    }
+
+    private static GeminiResult parseGeminiResult(String body) {
+        GeminiResult result = GeminiResult.empty();
         int searchFrom = 0;
         while (true) {
             int marker = body.indexOf("\"wrb.fr\"", searchFrom);
@@ -198,13 +244,115 @@ public class Main {
                 continue;
             }
 
-            String candidate = bestTextInJsonPayload(payload);
-            if (candidate != null && (best == null || scoreText(candidate) > scoreText(best))) {
-                best = candidate;
+            result = result.merge(parseGeminiPayload(payload));
+        }
+
+        return result;
+    }
+
+    private static GeminiResult parseGeminiPayload(String payload) {
+        Object parsed = MiniJson.parse(payload);
+        if (!(parsed instanceof java.util.List<?> root)) {
+            return GeminiResult.empty();
+        }
+
+        GeminiResult result = GeminiResult.empty();
+        ConversationIds ids = conversationIdsFromPayload(root);
+        if (ids != null) {
+            result = result.merge(new GeminiResult("", ids.conversationId(), ids.responseId(), ""));
+        }
+
+        Object choices = listValue(root, 4);
+        if (choices instanceof java.util.List<?> choiceList) {
+            for (Object choiceObject : choiceList) {
+                if (!(choiceObject instanceof java.util.List<?> choice)) {
+                    continue;
+                }
+                String choiceId = stringValue(listValue(choice, 0));
+                String text = textFromChoice(choice);
+                if (!text.isBlank()) {
+                    result = result.merge(new GeminiResult(text, "", "", choiceId));
+                } else if (isChoiceId(choiceId)) {
+                    result = result.merge(new GeminiResult("", "", "", choiceId));
+                }
             }
         }
 
+        return result;
+    }
+
+    private static ConversationIds conversationIdsFromPayload(java.util.List<?> root) {
+        Object ids = listValue(root, 1);
+        if (!(ids instanceof java.util.List<?> list)) {
+            return null;
+        }
+
+        String conversationId = stringValue(listValue(list, 0));
+        String responseId = stringValue(listValue(list, 1));
+        if (conversationId.startsWith("c_") && responseId.startsWith("r_")) {
+            return new ConversationIds(conversationId, responseId);
+        }
+        return null;
+    }
+
+    private static String textFromChoice(java.util.List<?> choice) {
+        String direct = joinedStringArray(listValue(choice, 1));
+        if (isAnswerText(direct)) {
+            return direct;
+        }
+
+        String nested = deepestUsefulText(listValue(choice, 43));
+        if (isAnswerText(nested)) {
+            return nested;
+        }
+
+        return "";
+    }
+
+    private static String joinedStringArray(Object value) {
+        if (!(value instanceof java.util.List<?> list)) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder();
+        for (Object item : list) {
+            if (item instanceof String text) {
+                out.append(text);
+            }
+        }
+        return normalizeCandidateText(out.toString());
+    }
+
+    private static String deepestUsefulText(Object value) {
+        String best = "";
+        if (value instanceof String text) {
+            text = normalizeCandidateText(text);
+            return isAnswerText(text) ? text : "";
+        }
+        if (value instanceof java.util.List<?> list) {
+            for (Object item : list) {
+                String candidate = deepestUsefulText(item);
+                if (candidate.length() > best.length()) {
+                    best = candidate;
+                }
+            }
+        }
         return best;
+    }
+
+    private static Object listValue(java.util.List<?> list, int index) {
+        return index >= 0 && index < list.size() ? list.get(index) : null;
+    }
+
+    private static String stringValue(Object value) {
+        return value instanceof String text ? text : "";
+    }
+
+    private static boolean isChoiceId(String value) {
+        return value != null && value.startsWith("rc_");
+    }
+
+    private static boolean isAnswerText(String value) {
+        return value != null && !value.isBlank() && isUsefulText(value);
     }
 
     private static String bestTextInJsonPayload(String payload) {
@@ -222,7 +370,11 @@ public class Main {
             }
             index = jsonString.endIndex();
 
-            String value = jsonString.value().trim();
+            if (nextNonWhitespace(payload, jsonString.endIndex()) == ':') {
+                continue;
+            }
+
+            String value = normalizeCandidateText(jsonString.value());
             if (!isUsefulText(value)) {
                 continue;
             }
@@ -231,6 +383,26 @@ public class Main {
             }
         }
         return best;
+    }
+
+    private static char nextNonWhitespace(String value, int index) {
+        while (index < value.length()) {
+            char c = value.charAt(index);
+            if (!Character.isWhitespace(c)) {
+                return c;
+            }
+            index++;
+        }
+        return '\0';
+    }
+
+    private static String normalizeCandidateText(String value) {
+        String text = value == null ? "" : value.trim();
+        text = text.replace("\u0000", "");
+        text = text.replaceFirst("(?i)^\\d*person_cancel[，,：:\\s-]*", "");
+        text = text.replaceFirst("(?i)^\\d*rson_cancel[，,：:\\s-]*", "");
+        text = text.replaceFirst("^\\d+[A-Za-z_]{4,}[，,：:\\s-]+", "");
+        return text.trim();
     }
 
     private static String wrbPayloadAt(String body, int marker) {
@@ -269,7 +441,14 @@ public class Main {
     }
 
     private static boolean isUsefulText(String value) {
-        if (value.length() < 2) {
+        if (value.isBlank()) {
+            return false;
+        }
+        if (value.matches("\\d+")) {
+            return false;
+        }
+        if (value.toLowerCase(Locale.ROOT).contains("person_cancel")
+                || value.toLowerCase(Locale.ROOT).contains("rson_cancel")) {
             return false;
         }
         if (value.startsWith("c_") || value.startsWith("r_") || value.startsWith("rc_")) {
@@ -653,7 +832,7 @@ public class Main {
             originalPrompt = prompt;
         }
 
-        private void prepareNewConversation() {
+        private void prepareForConversation(ConversationState conversation) {
             url = url.newBuilder()
                     .setQueryParameter("_reqid", String.valueOf(ThreadLocalRandom.current().nextInt(1_000_000, 9_999_999)))
                     .build();
@@ -665,7 +844,7 @@ public class Main {
                 return;
             }
 
-            String updated = resetConversationInFReq(fReq);
+            String updated = applyConversationToFReq(fReq, conversation);
             form = replaceFormValue(form, "f.req", updated);
             originalPrompt = readPromptFromForm(form);
         }
@@ -731,7 +910,7 @@ public class Main {
                     + fReq.substring(innerJson.endIndex());
         }
 
-        private static String resetConversationInFReq(String fReq) {
+        private static String applyConversationToFReq(String fReq, ConversationState conversation) {
             int outerQuote = fReq.indexOf('"');
             if (outerQuote < 0) {
                 return fReq;
@@ -742,21 +921,22 @@ public class Main {
             }
 
             String inner = innerJson.value();
-            Range requestBounds = topLevelElementBounds(inner, 0);
-            if (requestBounds == null) {
-                return fReq;
+            String stateArray = conversation.isActive()
+                    ? jsonConversationArray(conversation.conversationId(), conversation.responseId(), conversation.choiceId())
+                    : "[\"\",\"\",\"\",null,null,null,null,null,null,\"\"]";
+            String updatedInner = replaceTopLevelElement(inner, 2, stateArray);
+            if (!conversation.isActive()) {
+                updatedInner = updatedInner.replaceFirst("\\[\\[\\d+]]", "[[0]]");
             }
-
-            String request = inner.substring(requestBounds.start(), requestBounds.end());
-            String updatedRequest = replaceTopLevelElement(request, 2,
-                    "[\"\",\"\",\"\",null,null,null,null,null,null,\"\"]");
-            updatedRequest = updatedRequest.replaceFirst("\\[\\[\\d+]]", "[[0]]");
-            String updatedInner = inner.substring(0, requestBounds.start())
-                    + updatedRequest
-                    + inner.substring(requestBounds.end());
             return fReq.substring(0, outerQuote)
                     + jsonQuote(updatedInner)
                     + fReq.substring(innerJson.endIndex());
+        }
+
+        private static String jsonConversationArray(String conversationId, String responseId, String choiceId) {
+            return "[" + jsonQuote(conversationId) + ","
+                    + jsonQuote(responseId) + ","
+                    + jsonQuote(choiceId) + ",null,null,null,null,null,null,\"\"]";
         }
 
         private void refreshPerRequestHeaders() {
@@ -1001,6 +1181,210 @@ public class Main {
                 }
             }
             return out.toString();
+        }
+    }
+
+    private static final class ConversationState {
+        private String conversationId = "";
+        private String responseId = "";
+        private String choiceId = "";
+
+        private boolean isActive() {
+            return !conversationId.isBlank() && !responseId.isBlank() && !choiceId.isBlank();
+        }
+
+        private void clear() {
+            conversationId = "";
+            responseId = "";
+            choiceId = "";
+        }
+
+        private void update(String conversationId, String responseId, String choiceId) {
+            if (conversationId != null && conversationId.startsWith("c_")) {
+                this.conversationId = conversationId;
+            }
+            if (responseId != null && responseId.startsWith("r_")) {
+                this.responseId = responseId;
+            }
+            if (choiceId != null && choiceId.startsWith("rc_")) {
+                this.choiceId = choiceId;
+            }
+        }
+
+        private String conversationId() {
+            return conversationId;
+        }
+
+        private String responseId() {
+            return responseId;
+        }
+
+        private String choiceId() {
+            return choiceId;
+        }
+    }
+
+    private record GeminiResult(String text, String conversationId, String responseId, String choiceId) {
+        private static GeminiResult empty() {
+            return new GeminiResult("", "", "", "");
+        }
+
+        private GeminiResult merge(GeminiResult other) {
+            if (other == null) {
+                return this;
+            }
+            return new GeminiResult(
+                    other.text == null || other.text.isBlank() ? this.text : other.text,
+                    other.conversationId == null || other.conversationId.isBlank() ? this.conversationId : other.conversationId,
+                    other.responseId == null || other.responseId.isBlank() ? this.responseId : other.responseId,
+                    other.choiceId == null || other.choiceId.isBlank() ? this.choiceId : other.choiceId
+            );
+        }
+    }
+
+    private record ConversationIds(String conversationId, String responseId) {
+    }
+
+    private static final class MiniJson {
+        private final String text;
+        private int index;
+
+        private MiniJson(String text) {
+            this.text = text == null ? "" : text;
+        }
+
+        private static Object parse(String text) {
+            try {
+                return new MiniJson(text).readValue();
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+
+        private Object readValue() {
+            skipWhitespace();
+            if (index >= text.length()) {
+                return null;
+            }
+
+            char c = text.charAt(index);
+            if (c == '"') {
+                JsonString value = readJsonString(text, index);
+                if (value == null) {
+                    throw new IllegalArgumentException("bad string");
+                }
+                index = value.endIndex();
+                return value.value();
+            }
+            if (c == '[') {
+                return readArray();
+            }
+            if (c == '{') {
+                return readObject();
+            }
+            if (text.startsWith("null", index)) {
+                index += 4;
+                return null;
+            }
+            if (text.startsWith("true", index)) {
+                index += 4;
+                return Boolean.TRUE;
+            }
+            if (text.startsWith("false", index)) {
+                index += 5;
+                return Boolean.FALSE;
+            }
+            return readNumberOrToken();
+        }
+
+        private java.util.List<Object> readArray() {
+            java.util.List<Object> values = new java.util.ArrayList<>();
+            index++;
+            skipWhitespace();
+            if (peek(']')) {
+                index++;
+                return values;
+            }
+
+            while (index < text.length()) {
+                values.add(readValue());
+                skipWhitespace();
+                if (peek(',')) {
+                    index++;
+                    continue;
+                }
+                if (peek(']')) {
+                    index++;
+                    break;
+                }
+                break;
+            }
+            return values;
+        }
+
+        private Map<String, Object> readObject() {
+            Map<String, Object> values = new LinkedHashMap<>();
+            index++;
+            skipWhitespace();
+            if (peek('}')) {
+                index++;
+                return values;
+            }
+
+            while (index < text.length()) {
+                Object key = readValue();
+                skipWhitespace();
+                if (peek(':')) {
+                    index++;
+                }
+                Object value = readValue();
+                values.put(Objects.toString(key, ""), value);
+                skipWhitespace();
+                if (peek(',')) {
+                    index++;
+                    continue;
+                }
+                if (peek('}')) {
+                    index++;
+                    break;
+                }
+                break;
+            }
+            return values;
+        }
+
+        private Object readNumberOrToken() {
+            int start = index;
+            while (index < text.length()) {
+                char c = text.charAt(index);
+                if (c == ',' || c == ']' || c == '}' || Character.isWhitespace(c)) {
+                    break;
+                }
+                index++;
+            }
+            String token = text.substring(start, index);
+            if (token.contains(".") || token.contains("e") || token.contains("E")) {
+                try {
+                    return Double.parseDouble(token);
+                } catch (NumberFormatException ignored) {
+                    return token;
+                }
+            }
+            try {
+                return Long.parseLong(token);
+            } catch (NumberFormatException ignored) {
+                return token;
+            }
+        }
+
+        private boolean peek(char c) {
+            return index < text.length() && text.charAt(index) == c;
+        }
+
+        private void skipWhitespace() {
+            while (index < text.length() && Character.isWhitespace(text.charAt(index))) {
+                index++;
+            }
         }
     }
 }
