@@ -8,7 +8,7 @@ proxy:
 # 是否开启openai格式api封装
 openai:
   enabled: true
-  host: 127.0.0.1
+  host: 0.0.0.0
   port: 11434
 
 # 把完整的 StreamGenerate curl 粘到下一行。
