@@ -82,20 +82,26 @@ final class OpenAiApiServer {
                 return;
             }
 
-            String prompt = promptFromMessages(request.get("messages"));
-            if (prompt.isBlank()) {
+            PromptData prompt = promptFromMessages(request.get("messages"));
+            if (prompt.latest().isBlank()) {
                 sendJson(exchange, 400, errorJson("messages 为空"));
                 return;
             }
 
             boolean stream = Boolean.TRUE.equals(request.get("stream"));
             String model = resolveModel(request.get("model"));
+            ChatRequest chatRequest = new ChatRequest(
+                    model,
+                    sessionKey(request, exchange),
+                    prompt.full(),
+                    prompt.latest(),
+                    wantsNewConversation(request, prompt));
             if (stream) {
-                handleStream(exchange, model, prompt);
+                handleStream(exchange, chatRequest);
                 return;
             }
 
-            String text = backend.complete(model, prompt, null);
+            String text = backend.complete(chatRequest, null);
             sendJson(exchange, 200, completionJson(model, text));
         } catch (IllegalArgumentException e) {
             sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
@@ -104,7 +110,7 @@ final class OpenAiApiServer {
         }
     }
 
-    private void handleStream(HttpExchange exchange, String model, String prompt) throws IOException {
+    private void handleStream(HttpExchange exchange, ChatRequest request) throws IOException {
         exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
         exchange.getResponseHeaders().set("Cache-Control", "no-cache");
         exchange.getResponseHeaders().set("Connection", "keep-alive");
@@ -113,27 +119,28 @@ final class OpenAiApiServer {
         String id = "chatcmpl-" + UUID.randomUUID();
         long created = Instant.now().getEpochSecond();
         try (OutputStream out = exchange.getResponseBody()) {
-            backend.complete(model, prompt, delta -> {
+            backend.complete(request, delta -> {
                 try {
                     if (!delta.isEmpty()) {
-                        sendSse(out, chunkJson(id, model, created, delta, false));
+                        sendSse(out, chunkJson(id, request.model(), created, delta, false));
                     }
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
             });
-            sendSse(out, chunkJson(id, model, created, "", true));
+            sendSse(out, chunkJson(id, request.model(), created, "", true));
             out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
             out.flush();
         }
     }
 
-    private static String promptFromMessages(Object messages) {
+    private static PromptData promptFromMessages(Object messages) {
         if (!(messages instanceof List<?> list)) {
-            return "";
+            return new PromptData("", "");
         }
 
-        StringBuilder out = new StringBuilder();
+        StringBuilder full = new StringBuilder();
+        String latest = "";
         for (Object item : list) {
             if (!(item instanceof Map<?, ?> message)) {
                 continue;
@@ -143,12 +150,52 @@ final class OpenAiApiServer {
             if (content.isBlank()) {
                 continue;
             }
-            if (!out.isEmpty()) {
-                out.append('\n');
+            if (!full.isEmpty()) {
+                full.append('\n');
             }
-            out.append(role).append(": ").append(content);
+            full.append(role).append(": ").append(content);
+            if ("user".equalsIgnoreCase(role)) {
+                latest = content;
+            } else if (latest.isBlank()) {
+                latest = content;
+            }
         }
-        return out.toString();
+        return new PromptData(full.toString(), latest);
+    }
+
+    private static String sessionKey(Map<?, ?> request, HttpExchange exchange) {
+        String value = firstNonBlank(
+                stringValue(request.get("conversation_id"), ""),
+                stringValue(request.get("session_id"), ""),
+                stringValue(request.get("user"), ""),
+                exchange.getRequestHeaders().getFirst("x-conversation-id"),
+                exchange.getRequestHeaders().getFirst("x-session-id"));
+        return value == null || value.isBlank() ? "default" : value.replace('\0', '_').trim();
+    }
+
+    private static boolean wantsNewConversation(Map<?, ?> request, PromptData prompt) {
+        return booleanValue(request.get("new_conversation"))
+                || booleanValue(request.get("new"))
+                || "/new".equalsIgnoreCase(prompt.latest().trim());
+    }
+
+    private static String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return "";
+    }
+
+    private static boolean booleanValue(Object value) {
+        if (value instanceof Boolean bool) {
+            return bool;
+        }
+        if (value instanceof String text) {
+            return Boolean.parseBoolean(text);
+        }
+        return false;
     }
 
     private static String contentText(Object content) {
@@ -247,6 +294,13 @@ final class OpenAiApiServer {
 
     @FunctionalInterface
     interface ChatBackend {
-        String complete(String model, String prompt, Consumer<String> deltaSink) throws IOException;
+        String complete(ChatRequest request, Consumer<String> deltaSink) throws IOException;
+    }
+
+    record ChatRequest(String model, String sessionKey, String fullPrompt, String latestPrompt,
+                       boolean newConversation) {
+    }
+
+    private record PromptData(String full, String latest) {
     }
 }

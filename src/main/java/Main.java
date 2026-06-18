@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Scanner;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
@@ -87,7 +88,7 @@ public class Main {
                 config.openAiPort,
                 modelNames(),
                 DEFAULT_MODEL,
-                (model, prompt, deltaSink) -> sendForApi(config, client, model, prompt, deltaSink));
+                new ApiChatBackend(config, client));
         server.start();
         return server;
     }
@@ -146,18 +147,6 @@ public class Main {
                                  ConversationState conversation) throws IOException {
         sendInternal(config, client, model, prompt, conversation, System.out::print);
         System.out.println();
-    }
-
-    private static String sendForApi(AppConfig config, OkHttpClient client, String model, String prompt,
-                                     Consumer<String> deltaSink) throws IOException {
-        StringBuilder text = new StringBuilder();
-        sendInternal(config, client, model, prompt, new ConversationState(), delta -> {
-            text.append(delta);
-            if (deltaSink != null) {
-                deltaSink.accept(delta);
-            }
-        });
-        return text.toString();
     }
 
     private static GeminiResult sendInternal(AppConfig config, OkHttpClient client, String model, String prompt,
@@ -1342,6 +1331,41 @@ public class Main {
                 }
             }
             return out.toString();
+        }
+    }
+
+    private static final class ApiChatBackend implements OpenAiApiServer.ChatBackend {
+        private final AppConfig config;
+        private final OkHttpClient client;
+        private final Map<String, ConversationState> conversations = new ConcurrentHashMap<>();
+
+        private ApiChatBackend(AppConfig config, OkHttpClient client) {
+            this.config = config;
+            this.client = client;
+        }
+
+        @Override
+        public String complete(OpenAiApiServer.ChatRequest request, Consumer<String> deltaSink) throws IOException {
+            String key = request.model() + ":" + request.sessionKey();
+            ConversationState conversation = conversations.computeIfAbsent(key, ignored -> new ConversationState());
+            synchronized (conversation) {
+                if (request.newConversation()) {
+                    conversation.clear();
+                    if ("/new".equalsIgnoreCase(request.latestPrompt().trim())) {
+                        return "已开启新对话。";
+                    }
+                }
+
+                String prompt = conversation.isActive() ? request.latestPrompt() : request.fullPrompt();
+                StringBuilder text = new StringBuilder();
+                sendInternal(config, client, request.model(), prompt, conversation, delta -> {
+                    text.append(delta);
+                    if (deltaSink != null) {
+                        deltaSink.accept(delta);
+                    }
+                });
+                return text.toString();
+            }
         }
     }
 
