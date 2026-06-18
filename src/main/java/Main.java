@@ -45,7 +45,7 @@ public class Main {
             }
 
             if (args.length > 0 && "--no-send".equals(args[0])) {
-                CurlRequest curl = CurlRequest.parse(config.activeCurl());
+                CurlRequest curl = CurlRequest.parse(config.curlFor(config.defaultModel));
                 curl.prepareForConversation(new ConversationState());
                 String prompt = joinArgs(args, 1);
                 if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
@@ -56,7 +56,7 @@ public class Main {
             }
 
             if (args.length > 0) {
-                sendOnce(config, client, String.join(" ", args), new ConversationState());
+                sendOnce(config, client, config.defaultModel, String.join(" ", args), new ConversationState());
                 return;
             }
 
@@ -79,15 +79,21 @@ public class Main {
             return null;
         }
 
-        OpenAiApiServer server = new OpenAiApiServer(config.openAiHost, config.openAiPort, (prompt, deltaSink) ->
-                sendForApi(config, client, prompt, deltaSink));
+        OpenAiApiServer server = new OpenAiApiServer(
+                config.openAiHost,
+                config.openAiPort,
+                config.modelNames(),
+                config.defaultModel,
+                (model, prompt, deltaSink) -> sendForApi(config, client, model, prompt, deltaSink));
         server.start();
         return server;
     }
 
     private static void runLoop(AppConfig config, OkHttpClient client) {
-        System.out.println("已启动。当前是新对话。输入 /new 开启新对话，输入 stop 退出。");
+        System.out.println("已启动。当前是新对话。模型：" + config.defaultModel
+                + "。输入 /new 开启新对话，/models 查看模型，/model 名称切换模型，/stop 退出。");
         ConversationState conversation = new ConversationState();
+        String currentModel = config.defaultModel;
         Scanner scanner = new Scanner(System.in);
         while (true) {
             System.out.print("> ");
@@ -96,7 +102,7 @@ public class Main {
             }
 
             String prompt = scanner.nextLine().trim();
-            if ("stop".equalsIgnoreCase(prompt)) {
+            if ("/stop".equalsIgnoreCase(prompt)) {
                 break;
             }
             if ("/new".equalsIgnoreCase(prompt)) {
@@ -104,12 +110,29 @@ public class Main {
                 System.out.println("已开启新对话。");
                 continue;
             }
+            if ("/models".equalsIgnoreCase(prompt)) {
+                System.out.println("可用模型：" + String.join(", ", config.modelNames()));
+                System.out.println("当前模型：" + currentModel);
+                continue;
+            }
+            if (prompt.startsWith("/model ")) {
+                String requestedModel = prompt.substring("/model ".length()).trim();
+                try {
+                    config.curlFor(requestedModel);
+                    currentModel = requestedModel;
+                    conversation.clear();
+                    System.out.println("已切换模型：" + currentModel + "。已开启新对话。");
+                } catch (IllegalArgumentException e) {
+                    System.err.println(e.getMessage());
+                }
+                continue;
+            }
             if (prompt.isBlank()) {
                 continue;
             }
 
             try {
-                sendOnce(config, client, prompt, conversation);
+                sendOnce(config, client, currentModel, prompt, conversation);
             } catch (Exception e) {
                 System.err.println("请求失败：" + e.getMessage());
             }
@@ -117,14 +140,16 @@ public class Main {
         System.out.println("已退出。");
     }
 
-    private static void sendOnce(AppConfig config, OkHttpClient client, String prompt, ConversationState conversation) throws IOException {
-        sendInternal(config, client, prompt, conversation, System.out::print);
+    private static void sendOnce(AppConfig config, OkHttpClient client, String model, String prompt,
+                                 ConversationState conversation) throws IOException {
+        sendInternal(config, client, model, prompt, conversation, System.out::print);
         System.out.println();
     }
 
-    private static String sendForApi(AppConfig config, OkHttpClient client, String prompt, Consumer<String> deltaSink) throws IOException {
+    private static String sendForApi(AppConfig config, OkHttpClient client, String model, String prompt,
+                                     Consumer<String> deltaSink) throws IOException {
         StringBuilder text = new StringBuilder();
-        sendInternal(config, client, prompt, new ConversationState(), delta -> {
+        sendInternal(config, client, model, prompt, new ConversationState(), delta -> {
             text.append(delta);
             if (deltaSink != null) {
                 deltaSink.accept(delta);
@@ -133,9 +158,9 @@ public class Main {
         return text.toString();
     }
 
-    private static GeminiResult sendInternal(AppConfig config, OkHttpClient client, String prompt,
+    private static GeminiResult sendInternal(AppConfig config, OkHttpClient client, String model, String prompt,
                                              ConversationState conversation, Consumer<String> deltaSink) throws IOException {
-        CurlRequest curl = CurlRequest.parse(config.activeCurl());
+        CurlRequest curl = CurlRequest.parse(config.curlFor(model));
         curl.prepareForConversation(conversation);
         if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
             curl.replacePrompt(prompt);
@@ -223,8 +248,9 @@ public class Main {
         System.out.println("proxy: " + (config.proxyEnabled
                 ? config.proxyType + "://" + config.proxyHost + ":" + config.proxyPort
                 : "disabled"));
-        System.out.println("template: " + config.activeCurlName());
-        System.out.println("curl: set len=" + config.activeCurl().length());
+        System.out.println("model: " + config.defaultModel);
+        System.out.println("models: " + String.join(", ", config.modelNames()));
+        System.out.println("curl: set len=" + config.curlFor(config.defaultModel).length());
         System.out.println("url: " + curl.url.redact());
         System.out.println("cookie: " + (curl.cookie.isBlank() ? "blank" : "set len=" + curl.cookie.length()));
         System.out.println("form: " + (curl.form.isBlank() ? "blank" : "set len=" + curl.form.length()));
@@ -651,6 +677,8 @@ public class Main {
         private boolean openAiEnabled = true;
         private String openAiHost = "127.0.0.1";
         private int openAiPort = 8080;
+        private String defaultModel = "gemini-3.5-Flash";
+        private final Map<String, String> modelCurls = new LinkedHashMap<>();
         private String curl;
         private String newCurl;
 
@@ -672,10 +700,23 @@ public class Main {
             config.openAiEnabled = booleanValue(sectionValue(text, "openai", "enabled"), config.openAiEnabled);
             config.openAiHost = stringValue(sectionValue(text, "openai", "host"), config.openAiHost);
             config.openAiPort = intValue(sectionValue(text, "openai", "port"), config.openAiPort);
+            config.defaultModel = stringValue(sectionValue(text, "models", "default"), config.defaultModel);
             config.curl = extractCurl(text);
             config.newCurl = extractNamedCurl(text, "newCurl");
-            if (config.activeCurl().isBlank()) {
-                throw new IOException("config.yml 里没有 curl 内容。把完整 StreamGenerate curl 粘到 curl: 或 newCurl: 后面。");
+            Map<String, String> configuredModelCurls = extractModelCurls(text);
+            String proCurl = extractNamedCurl(text, "proCurl");
+            if (hasCurlText(config.newCurl) || hasCurlText(config.curl)) {
+                config.modelCurls.put(config.defaultModel, config.activeCurl());
+            }
+            config.modelCurls.putAll(configuredModelCurls);
+            if (hasCurlText(proCurl)) {
+                config.modelCurls.putIfAbsent("gemini-3.1-Pro", proCurl);
+            }
+            if (hasCurlText(config.newCurl) || hasCurlText(config.curl)) {
+                config.modelCurls.putIfAbsent(config.defaultModel, config.activeCurl());
+            }
+            if (config.modelCurls.isEmpty()) {
+                throw new IOException("config.yml 里没有 curl 内容。把完整 StreamGenerate curl 粘到 curl:、newCurl: 或 modelCurls 下面。");
             }
             return config;
         }
@@ -686,6 +727,28 @@ public class Main {
 
         private String activeCurlName() {
             return hasCurlText(newCurl) ? "newCurl" : "curl";
+        }
+
+        private String curlFor(String model) {
+            String requested = model == null || model.isBlank() ? defaultModel : model;
+            String value = modelCurls.get(requested);
+            if (hasCurlText(value)) {
+                return value;
+            }
+            for (Map.Entry<String, String> entry : modelCurls.entrySet()) {
+                if (entry.getKey().equalsIgnoreCase(requested) && hasCurlText(entry.getValue())) {
+                    return entry.getValue();
+                }
+            }
+            throw new IllegalArgumentException("未知或未配置 curl 的模型：" + requested
+                    + "。可用模型：" + String.join(", ", modelNames()));
+        }
+
+        private java.util.List<String> modelNames() {
+            if (modelCurls.isEmpty()) {
+                return java.util.List.of(defaultModel);
+            }
+            return new java.util.ArrayList<>(modelCurls.keySet());
         }
 
         private static String extractCurl(String text) {
@@ -711,7 +774,9 @@ public class Main {
             StringBuilder rest = new StringBuilder();
             for (int i = curlLine + 1; i < lines.length; i++) {
                 String trimmed = lines[i].trim();
-                if (trimmed.startsWith("curl:") || trimmed.startsWith("newCurl:") || trimmed.startsWith("continueCurl:")) {
+                if (trimmed.startsWith("curl:") || trimmed.startsWith("newCurl:")
+                        || trimmed.startsWith("continueCurl:") || trimmed.startsWith("proCurl:")
+                        || trimmed.equals("modelCurls:")) {
                     break;
                 }
                 rest.append(lines[i]).append('\n');
@@ -721,6 +786,64 @@ public class Main {
                 return stripIndent(rest.toString()).trim();
             }
             return trimConfigCurlText(first + "\n" + rest);
+        }
+
+        private static Map<String, String> extractModelCurls(String text) {
+            Map<String, String> values = new LinkedHashMap<>();
+            String[] lines = text.split("\\R", -1);
+            for (int i = 0; i < lines.length; i++) {
+                String trimmed = lines[i].trim();
+                if (!trimmed.equals("modelCurls:")) {
+                    continue;
+                }
+
+                i++;
+                while (i < lines.length) {
+                    String line = lines[i];
+                    String lineTrimmed = line.trim();
+                    if (lineTrimmed.isEmpty() || lineTrimmed.startsWith("#")) {
+                        i++;
+                        continue;
+                    }
+                    if (!line.startsWith(" ")) {
+                        break;
+                    }
+
+                    Matcher matcher = Pattern.compile("^\\s{2}([^:#]+):\\s*(.*)$").matcher(line);
+                    if (!matcher.matches()) {
+                        i++;
+                        continue;
+                    }
+
+                    String model = matcher.group(1).trim();
+                    String first = matcher.group(2).trim();
+                    StringBuilder rest = new StringBuilder();
+                    i++;
+                    while (i < lines.length) {
+                        String next = lines[i];
+                        String nextTrimmed = next.trim();
+                        if (!next.startsWith("    ")
+                                && (Pattern.compile("^\\s{2}[^:#]+:\\s*.*$").matcher(next).matches()
+                                || (!next.startsWith(" ") && !nextTrimmed.isEmpty()))) {
+                            break;
+                        }
+                        rest.append(next).append('\n');
+                        i++;
+                    }
+
+                    String curlText;
+                    if (first.equals("|") || first.equals("|-") || first.equals(">")) {
+                        curlText = stripIndent(stripIndent(rest.toString())).trim();
+                    } else {
+                        curlText = trimConfigCurlText(first + "\n" + stripIndent(stripIndent(rest.toString())));
+                    }
+                    if (hasCurlText(curlText)) {
+                        values.put(model, curlText);
+                    }
+                }
+                break;
+            }
+            return values;
         }
 
         private static boolean hasCurlText(String value) {

@@ -16,13 +16,17 @@ import java.util.function.Consumer;
 final class OpenAiApiServer {
     private final String host;
     private final int port;
+    private final List<String> models;
+    private final String defaultModel;
     private final ChatBackend backend;
     private HttpServer server;
     private ExecutorService executor;
 
-    OpenAiApiServer(String host, int port, ChatBackend backend) {
+    OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend) {
         this.host = host;
         this.port = port;
+        this.defaultModel = defaultModel == null || defaultModel.isBlank() ? "gemini-web" : defaultModel;
+        this.models = models == null || models.isEmpty() ? List.of(this.defaultModel) : List.copyOf(models);
         this.backend = backend;
     }
 
@@ -51,7 +55,17 @@ final class OpenAiApiServer {
             sendJson(exchange, 405, "{\"error\":{\"message\":\"只支持 GET\"}}");
             return;
         }
-        sendJson(exchange, 200, "{\"object\":\"list\",\"data\":[{\"id\":\"gemini-web\",\"object\":\"model\",\"created\":0,\"owned_by\":\"local\"}]}");
+        StringBuilder json = new StringBuilder("{\"object\":\"list\",\"data\":[");
+        for (int i = 0; i < models.size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append("{\"id\":")
+                    .append(SimpleJson.quote(models.get(i)))
+                    .append(",\"object\":\"model\",\"created\":0,\"owned_by\":\"local\"}");
+        }
+        json.append("]}");
+        sendJson(exchange, 200, json.toString());
     }
 
     private void handleChatCompletions(HttpExchange exchange) throws IOException {
@@ -75,14 +89,16 @@ final class OpenAiApiServer {
             }
 
             boolean stream = Boolean.TRUE.equals(request.get("stream"));
-            String model = stringValue(request.get("model"), "gemini-web");
+            String model = resolveModel(request.get("model"));
             if (stream) {
                 handleStream(exchange, model, prompt);
                 return;
             }
 
-            String text = backend.complete(prompt, null);
+            String text = backend.complete(model, prompt, null);
             sendJson(exchange, 200, completionJson(model, text));
+        } catch (IllegalArgumentException e) {
+            sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
         } catch (Exception e) {
             sendJson(exchange, 500, errorJson(e.getMessage()));
         }
@@ -97,7 +113,7 @@ final class OpenAiApiServer {
         String id = "chatcmpl-" + UUID.randomUUID();
         long created = Instant.now().getEpochSecond();
         try (OutputStream out = exchange.getResponseBody()) {
-            backend.complete(prompt, delta -> {
+            backend.complete(model, prompt, delta -> {
                 try {
                     if (!delta.isEmpty()) {
                         sendSse(out, chunkJson(id, model, created, delta, false));
@@ -199,16 +215,38 @@ final class OpenAiApiServer {
     }
 
     private static String errorJson(String message) {
+        return errorJson(message, "server_error");
+    }
+
+    private static String errorJson(String message, String type) {
         return "{\"error\":{\"message\":" + SimpleJson.quote(message == null ? "未知错误" : message)
-                + ",\"type\":\"server_error\"}}";
+                + ",\"type\":" + SimpleJson.quote(type == null ? "server_error" : type) + "}}";
     }
 
     private static String stringValue(Object value, String fallback) {
         return value instanceof String text ? text : fallback;
     }
 
+    private String resolveModel(Object value) {
+        String requested = stringValue(value, defaultModel);
+        if (requested == null || requested.isBlank()) {
+            requested = defaultModel;
+        }
+        for (String model : models) {
+            if (model.equals(requested)) {
+                return model;
+            }
+        }
+        for (String model : models) {
+            if (model.equalsIgnoreCase(requested)) {
+                return model;
+            }
+        }
+        throw new IllegalArgumentException("未知模型：" + requested + "。可用模型：" + String.join(", ", models));
+    }
+
     @FunctionalInterface
     interface ChatBackend {
-        String complete(String prompt, Consumer<String> deltaSink) throws IOException;
+        String complete(String model, String prompt, Consumer<String> deltaSink) throws IOException;
     }
 }
