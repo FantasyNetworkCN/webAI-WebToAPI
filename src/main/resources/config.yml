@@ -1,8 +1,0 @@
-proxy:
-  enabled: true
-  type: http       # http 或 socks
-  host: 127.0.0.1
-  port: 7890
-
-# 从浏览器F12复制出来的cookie或curl格式中的-B中引号内的内容
-cookie:
