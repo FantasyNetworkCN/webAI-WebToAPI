@@ -1,0 +1,52 @@
+# 代理，国内环境必须配置
+proxy:
+  enabled: true
+  type: http
+  host: 127.0.0.1
+  port: 7890
+
+# 是否开启openai格式api封装
+openai:
+  enabled: true
+  host: 127.0.0.1
+  port: 11434
+
+# Paste the full StreamGenerate curl after this line.
+# It does not need YAML indentation.
+curl: curl 'https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=boq_assistant-bard-web-server_20260616.21_p0&f.sid=-6534691612186764417&hl=zh-CN&_reqid=11867356&rt=c' \
+  -H 'accept: */*' \
+  -H 'accept-language: zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6,ja-JP;q=0.5,ja;q=0.4' \
+  -H 'cache-control: no-cache' \
+  -H 'content-type: application/x-www-form-urlencoded;charset=UTF-8' \
+  -b 'HSID=AUJR0LjOi6mRimcbE; SSID=AAmz1W-xh81pr03SZ; APISID=wDyJMqOzJ1F772Ij/A3pr-4IC-vnOnjMa5; SAPISID=wO3BXPvIu-mPPd2-/AABbP8ceL0bXGgBVS; __Secure-1PAPISID=wO3BXPvIu-mPPd2-/AABbP8ceL0bXGgBVS; __Secure-3PAPISID=wO3BXPvIu-mPPd2-/AABbP8ceL0bXGgBVS; SOCS=CAISOAgeEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjYwNTA2LjA1X3AwGgV6aC1DTiACGgYIgPL5zwY; _ga=GA1.1.731492261.1778334432; SEARCH_SAMESITE=CgQI5qAB; __Secure-BUCKET=CIYG; _gcl_au=1.1.2044304347.1778334429.2007203472.1779628940.1779628940; S=billing-ui-v3=V8fVSzmP-D32anURuE9LS-iujnmgu7KP:billing-ui-v3-efe=V8fVSzmP-D32anURuE9LS-iujnmgu7KP; SID=g.a000-wheyk6XH60_R_oBTaoCvlOAcn4NPlgUFY8lfF1wIOjoreOaFgWEaTZJIWBUk5nVFqu65AACgYKAWkSARISFQHGX2MiQesU8IR2HBpSlSjZcudyNxoVAUF8yKrJan4OKsSl70L3IUegq_q60076; __Secure-1PSID=g.a000-wheyk6XH60_R_oBTaoCvlOAcn4NPlgUFY8lfF1wIOjoreOaXGHd4brcGjFHxYLhKK8qCwACgYKASMSARISFQHGX2MiRrNe8pL5GG9LfqQ7gvkvUxoVAUF8yKpzJqfee2-xBMEYYTwMvRqN0076; __Secure-3PSID=g.a000-wheyk6XH60_R_oBTaoCvlOAcn4NPlgUFY8lfF1wIOjoreOaQx5Vr2yyUNm2b3IUj65sLAACgYKAQoSARISFQHGX2Miv3C6mtIIHYb05_oImVeMMhoVAUF8yKqbYL6A2RJlj9eoyoXteO2z0076; AEC=AaJma5uqs5vgV2TsgSvZZgQpcTxnWIC0DV3zLZRdo4PM3GVqcfw4Px3jdi8; COMPASS=gemini-pd=CjwACWuJV93jFYb_b6k1ZbZc5AVi75OXfwVJx6huPFdJgLZgT-iphNSBtyIyTho-2Gurv4U86El7hPmdVFUQwcTP0QYaZQAJa4lX28V9VH307SDILiXD86fSjzx9utzT3y_oQhPrETMydoihWEGKk5iMAENwODcDwXj649Pt0nVyB1m0mhIV_BMSuH3OYZNe_LrwnA1LhoVLc5db-sioZWjAYngrrazkdw36IAEwAQ:gemini-hl=CkkACWuJV4Jq7gXnYGXm-CCWRGf1MNczIJ0yMsen8R98zb0fdd_v1HDcw_-Y0Gxw7WZu_GGVl89NUAGecp6EG6tM_DjudIlkdiK-EMSw1NEGGnIACWuJV046Dzi42KOoyILTcQ4BnhSPecYdRBeKViTZNEuhtQg5G-nk3PRRrYupybAxkPdnQXE2w4Pj2ptXK0BAyYi9JqHm_JnxzoO-EOZs4QozP5ouCbsmmJ9_R21SnMUASxHZ8XTaUOh5SVLCa0WaXTsgATAB; NID=532=QhGBxjOt3iOox8osk-TYqRtVJVh7bXgZrnuAHWE0e5l_uahofnHmyd0a2ms5DVvaP1P1vnlmGcRli4K4oProebVUJvvz_dAtxT_95bsisgwQExR3qzsvavW8sD-oTDjwsgzFECrg-vz7BhEgwbVkkG9hSGjT1ANK002TyPW7N0Kw7kONLOTnPjWqYCHO5VDvelyzT8njq8hVsK2X8nqBGRdjzh-r6qlhrzcW42-Q6egaWAyNx2FlWqlKN3b1p6aPVdqHsSMZgk13Yf_dyT0vkCwuP_OzcI9DfAak8rEJzQaBNdkNI34zMhlap4fGuEFdtDja6g994CjCJBObbA8PKiAddXBO0x4tzjBkrFLFNvLhbeEMurPcbOYH1nj_eet20KeUXwe42wvPW_0aEdtSsjwyNV8c9krmT7eozJljqxM2rE8bMUW0aFOuJ3uWB-ynkXT93Xmv8O_4DQJmqKn4; __Secure-1PSIDTS=sidts-CjEByojQU4VRE4Xh7NRQ4QVPUcfGomZ148XGFgl6TyCwKhQSF0zZFIXXmkFuc5doRE4gEAA; __Secure-3PSIDTS=sidts-CjEByojQU4VRE4Xh7NRQ4QVPUcfGomZ148XGFgl6TyCwKhQSF0zZFIXXmkFuc5doRE4gEAA; _ga_BF8Q35BMLM=GS2.1.s1781781948$o120$g1$t1781784011$j60$l0$h0; _ga_WC57KJ50ZZ=GS2.1.s1781781948$o153$g1$t1781784012$j59$l0$h0; SIDCC=AKEyXzXqESzuRHYhZSzcpzXsG8zR77H0El-Bq3ic5fZnOlS-yKMusKaWODzOgOVfN6vEoJG55w; __Secure-1PSIDCC=AKEyXzX45HWSFjTW-M_GHvtX4FRtb8nrUnsGCWaG6foKZpw2-62_Z2HP0y3eOUgfXG6Umgn0FNfS; __Secure-3PSIDCC=AKEyXzVk4Q__RCvEE_LuFGwQ9z9-d3Lcq5c8G2ft1xbY9CYqoOvOaO2JF43l1KzeOYvhTKbqMg60' \
+  -H 'origin: https://gemini.google.com' \
+  -H 'pragma: no-cache' \
+  -H 'priority: u=1, i' \
+  -H 'referer: https://gemini.google.com/' \
+  -H 'sec-ch-ua: "Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"' \
+  -H 'sec-ch-ua-arch: "x86"' \
+  -H 'sec-ch-ua-bitness: "64"' \
+  -H 'sec-ch-ua-form-factors: "Desktop"' \
+  -H 'sec-ch-ua-full-version: "147.0.7727.116"' \
+  -H 'sec-ch-ua-full-version-list: "Google Chrome";v="147.0.7727.116", "Not.A/Brand";v="8.0.0.0", "Chromium";v="147.0.7727.116"' \
+  -H 'sec-ch-ua-mobile: ?0' \
+  -H 'sec-ch-ua-model: ""' \
+  -H 'sec-ch-ua-platform: "Linux"' \
+  -H 'sec-ch-ua-platform-version: ""' \
+  -H 'sec-ch-ua-wow64: ?0' \
+  -H 'sec-fetch-dest: empty' \
+  -H 'sec-fetch-mode: cors' \
+  -H 'sec-fetch-site: same-origin' \
+  -H 'user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36' \
+  -H 'x-browser-channel: stable' \
+  -H 'x-browser-copyright: Copyright 2026 Google LLC. All Rights Reserved.' \
+  -H 'x-browser-validation: 33YoWkRIMizETIg4BCNAmEalt0w=' \
+  -H 'x-browser-year: 2026' \
+  -H 'x-client-data: CL3sygE=' \
+  -H 'x-goog-ext-525001261-jspb: [1,null,null,null,"fbb127bbb056c959",null,null,0,[4,5,6,8],null,null,1,null,null,1,1,"9F119378-99FA-4ACF-BB4D-F0AE8636F417"]' \
+  -H 'x-goog-ext-525005358-jspb: ["CFE49483-6281-4F68-B515-B6F07C0487B6",1]' \
+  -H 'x-goog-ext-73010989-jspb: [0]' \
+  -H 'x-goog-ext-73010990-jspb: [0,0,0]' \
+  -H 'x-same-domain: 1' \
+  --data-raw $'f.req=%5Bnull%2C%22%5B%5B%5C%22%E4%BD%A0%E5%A5%BD%5C%22%2C0%2Cnull%2Cnull%2Cnull%2Cnull%2C0%5D%2C%5B%5C%22zh-CN%5C%22%5D%2C%5B%5C%22c_9eea2b6054a3df05%5C%22%2C%5C%22r_f6f2546b6cde1924%5C%22%2C%5C%22rc_37a39516adb3cb10%5C%22%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C%5C%22AwAAAAAAAAAQANM7mBjXKZT5ebyo7Rk%5C%22%5D%2C%5C%22\u0021Pj2lPVnNAAaRP0elsT9CHP6EkT9CFMo7AEABEArZ1HyfBTOChsjG-G6eaNeHjVblNo92f-XcG5HEIt1Jt90VZk1Ji3LoG7wgxCfpvQPT-v0eCY2sBPU9szT2AgAAALFSAAAABmgBB34ARAOLK6C7Ue5L9RjBhk4KgmkdAGOjtPrtslEkIpF5Z4uAjWl74_idAUK17Br9oyA8WTyGyH51s-jXBKCMg5z3bQ5mvLvdmQcFwWP6iGyQBHQvuZuVGSj9B8arCblLTmFPThRqcM39VxHRnm1a1npoF6gOabWhRdYru1aGdrl4CMhSiJWEPmG46LFzyesiauGZGHWrroH72Rp0Gm9Z_yBpL8uDBi5Mvrf_eyh5-UsU99iEhebXXICNPAwk3FM0rARqszNWLGRc4dMKOSASMAIkm3vTUMmCNpn1IONLDux8m0hHC9VWbxjccnuPXfT06Pie3RBM62c4YeIge5XJdbmZAYDm--q8LBFhAiKcV1bghV4MWo4B-pW722j5K6mvbBVr7MG4ohi7_31I1xe0TzxsXQIdVHp4QRK7mH-FqYM81HQfxesBp6TabY2BXx6jtPlR3YWOraFm8E2aeokQDmBYFvKpZjDMa46MJVnH7ggdwGDV0s7ZM7b0Nf93WhO7Aune4G6BCqHa4I0jrLmvujTG0ErakugNrQub86H_h-9lwgec7TeX_teYERnL19hLaMneALYMoBUxFo22WVtSdlwrtcAOEUBs6lQG0pNO6mpl1F2gk-QaF7HGg_B06dmkY4TqY0SKyzQB9CB__ZUmzwOQkCalwGPgg5oumZO1rARMHCLSMoz0DWoGOsY0ZHRZwZHqKWAHqgDBN4cEomiPC46Fev_QeVxStTaffs_M8Fp3TjQot8JAGLK3r7NzXM4SbnTlez_xg54wdG_ZDJcW-tlPgA40Ou-HB2kijGvW7W5UIX5TEdUjXO58kvjLedKlChqzvvf_8OJpv-hQh4FRCf1Ng6fbYJInqe6nAIm6PJmhzNJ6vDH_hgtXo2Up_CRJK3m6fhZ64CnFcp-E1uNmmZumK5BSpMBJaXMmoAgs4zdINOviXh3fH0Dl8JEkMw1k5JqypU2a0oAZ0Rul6NGrN-kjc7zc-LXxXU2J3chXqN8Xp31b5q9-rsrQvSMkV9rLfD7nG78tLP4BDki-67gEs2-hbXcj62F4dqMHfJpB97TdanRPodOlj2JcSNclA88gbXUmz2-SJjC8C5cIvweQ6nrDtRZpLPY3Be73UkVvgMWWUAUkjIlU4QtHFZfkO6a-_9TVcC2FvnL9PfgJYxOD3CH74V7AYf8hHGGc0z-RrnGXDhmNdzYV9j00lmOF6OxKV-ioelBUvxlSn6VCvquRsnMc-LU_uY19mGWbpc5MGhUTnl6lZdSMz3W2_qqEj-J3tdgqFvv1G2gHocTZHxzj-_q02RXdPcdg_U3Zu6Uj2GfVRWkQ2K1vfNgZ3npB2FzA6f2r9b9FyxABaW7Ir1GBJM59cxKdscgEFa0iAtb9xOHWd41Q0OZOr3F2MNQ0bDYi_UlQKw2S2YoWPM2KHi-zgXg9ETIoa7q4FN8zieAnHmfkWzXCl_YeBl5PPur4iKUo4ux0lbqm13Vt8wmw78fN7gWgaoacMhjGOY2j6AIjZLdgcN6hBOiXLF9drYdjgQwMs0XD3ApUydGiE7bnJBEzXKML36AAzHODbGP2WPNbKNixMdhN27rVag9qRIAABlCjw_HsAPHmCGWRcNyv9ZYgKfRXEaQZlGk-vZYxc9oDvGO8FliYOrjdyvIr_CPT6n8Xuq0jWttFSKbag22u5pUBDrbGfBvZLgs4z1ncHnqJ5ruqOBFTGlJrD_mvYI7oShngtGT10mf3V5Y9DWHDaMRHkEuZNEtA0RUb8rstxNksEyDQwJN6ySz2lmv2YqbFjR0kLjy77DKadE2rQ6HU7yWWn83DjMfFa_m-QlIVGEoYupT7frLeqFaBQUdSk20uyLwK5z3_u7_BeLmJau8WhBXzyFW-XyURMfZH7lmqkbHaO0LXG_9-C4E1e0tFAAlHRNWlvZX7okilQE0hzn6aq_Soip8HZP1uxh-rj-KkDWHLSnhLmyFIV0mQyUyavYZGwHbRVzJX5qyaHy8WDrXD--yTAbemtV8-hKLrRN5fb4SQVGE2XZxpL2aIRSnRVPES6OlayQI2eQHl713YeDDnTVO9EDR76nRdMV9ft38hNfDOaNtBV5xYFk27MdwzuI-ivOADunBdiHeSW--pk-OqVoohGODdt7cCsLgT_kdeY5sm1RIy-lkPju0BcrXgYD9izkzkWYrCNd-gMnFmUmnkiD7rrxpin8yYjSR5OW1U-TcxyZOb40fUzEOasL_k4S-vqcO8eQvDJpM3TfO5Xt7raD_AUycQ7ygyWSbkhtnoyoU9EZnlOkAVIaZAHJ7JPCeS54_OURfTFjjnQHcwWXFbm_48Fx36_5IehdssSdWShvqKloPCDluh75X7dtpan2FrswxQFNfM6hSHbr-beaXXt9O57hgjsy7Ct68eHOd4A_mEia1mX4cByGb16Lt2013H-mcyuMtWRhbfG-yXdOj2xDVTnOQQl-IKxHPaHXq5lk2kt7rVnKt3hqoEMwMggnPMHIa8%5C%22%2C%5C%22cae8f807c39ed9b453084ac1f097f977%5C%22%2Cnull%2C%5B1%5D%2C1%2Cnull%2Cnull%2C1%2C0%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C%5B%5B6%5D%5D%2C0%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C1%2Cnull%2Cnull%2C%5B4%5D%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C%5B1%5D%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C0%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C%5C%22CFE49483-6281-4F68-B515-B6F07C0487B6%5C%22%2Cnull%2C%5B%5D%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C0%2C2%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C1%2C1%5D%22%5D&at=AD1_LW4s1w86Sma-J6IwMI1mHhND%3A1781779354257&'
+

@@ -21,6 +21,7 @@ import java.util.Objects;
 import java.util.Scanner;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -59,10 +60,29 @@ public class Main {
                 return;
             }
 
-            runLoop(config, client);
+            OpenAiApiServer server = startApiServer(config, client);
+            try {
+                runLoop(config, client);
+            } finally {
+                if (server != null) {
+                    server.stop();
+                }
+            }
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    private static OpenAiApiServer startApiServer(AppConfig config, OkHttpClient client) throws IOException {
+        if (!config.openAiEnabled) {
+            System.out.println("OpenAI API 未启用。");
+            return null;
+        }
+
+        OpenAiApiServer server = new OpenAiApiServer(config.openAiHost, config.openAiPort, (prompt, deltaSink) ->
+                sendForApi(config, client, prompt, deltaSink));
+        server.start();
+        return server;
     }
 
     private static void runLoop(AppConfig config, OkHttpClient client) {
@@ -98,6 +118,23 @@ public class Main {
     }
 
     private static void sendOnce(AppConfig config, OkHttpClient client, String prompt, ConversationState conversation) throws IOException {
+        sendInternal(config, client, prompt, conversation, System.out::print);
+        System.out.println();
+    }
+
+    private static String sendForApi(AppConfig config, OkHttpClient client, String prompt, Consumer<String> deltaSink) throws IOException {
+        StringBuilder text = new StringBuilder();
+        sendInternal(config, client, prompt, new ConversationState(), delta -> {
+            text.append(delta);
+            if (deltaSink != null) {
+                deltaSink.accept(delta);
+            }
+        });
+        return text.toString();
+    }
+
+    private static GeminiResult sendInternal(AppConfig config, OkHttpClient client, String prompt,
+                                             ConversationState conversation, Consumer<String> deltaSink) throws IOException {
         CurlRequest curl = CurlRequest.parse(config.activeCurl());
         curl.prepareForConversation(conversation);
         if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
@@ -113,12 +150,13 @@ public class Main {
                 throw new IOException("Gemini 请求失败，HTTP 状态=" + response.code()
                         + "，响应=" + preview(body));
             }
-            GeminiResult result = streamGeminiText(response);
+            GeminiResult result = streamGeminiText(response, deltaSink);
             conversation.update(result.conversationId(), result.responseId(), result.choiceId());
+            return result;
         }
     }
 
-    private static GeminiResult streamGeminiText(Response response) throws IOException {
+    private static GeminiResult streamGeminiText(Response response, Consumer<String> deltaSink) throws IOException {
         StringBuilder all = new StringBuilder();
         String printed = "";
         GeminiResult latest = GeminiResult.empty();
@@ -141,20 +179,18 @@ public class Main {
             }
 
             String delta = current.substring(printed.length());
-            System.out.print(delta);
-            System.out.flush();
+            deltaSink.accept(delta);
             printed = current;
         }
 
         if (!printed.isEmpty()) {
             dumpRawResponseIfRequested(all.toString());
-            System.out.println();
             return latest.merge(parseGeminiResult(all.toString()));
         }
 
         dumpRawResponseIfRequested(all.toString());
         GeminiResult result = parseGeminiResultOrThrow(all.toString());
-        System.out.println(result.text());
+        deltaSink.accept(result.text());
         return result;
     }
 
@@ -612,6 +648,9 @@ public class Main {
         private String proxyType = "http";
         private String proxyHost = "127.0.0.1";
         private int proxyPort = 7890;
+        private boolean openAiEnabled = true;
+        private String openAiHost = "127.0.0.1";
+        private int openAiPort = 8080;
         private String curl;
         private String newCurl;
 
@@ -626,10 +665,13 @@ public class Main {
 
             String text = Files.readString(path);
             AppConfig config = new AppConfig();
-            config.proxyEnabled = booleanValue(text, "enabled", false);
-            config.proxyType = stringValue(text, "type", config.proxyType);
-            config.proxyHost = stringValue(text, "host", config.proxyHost);
-            config.proxyPort = intValue(text, "port", config.proxyPort);
+            config.proxyEnabled = booleanValue(sectionValue(text, "proxy", "enabled"), false);
+            config.proxyType = stringValue(sectionValue(text, "proxy", "type"), config.proxyType);
+            config.proxyHost = stringValue(sectionValue(text, "proxy", "host"), config.proxyHost);
+            config.proxyPort = intValue(sectionValue(text, "proxy", "port"), config.proxyPort);
+            config.openAiEnabled = booleanValue(sectionValue(text, "openai", "enabled"), config.openAiEnabled);
+            config.openAiHost = stringValue(sectionValue(text, "openai", "host"), config.openAiHost);
+            config.openAiPort = intValue(sectionValue(text, "openai", "port"), config.openAiPort);
             config.curl = extractCurl(text);
             config.newCurl = extractNamedCurl(text, "newCurl");
             if (config.activeCurl().isBlank()) {
@@ -727,25 +769,30 @@ public class Main {
             return out.toString();
         }
 
-        private static boolean booleanValue(String text, String key, boolean fallback) {
-            String value = lineValue(text, key);
+        private static boolean booleanValue(String value, boolean fallback) {
             return value == null ? fallback : Boolean.parseBoolean(value);
         }
 
-        private static String stringValue(String text, String key, String fallback) {
-            String value = lineValue(text, key);
+        private static String stringValue(String value, String fallback) {
             return value == null || value.isBlank() ? fallback : value;
         }
 
-        private static int intValue(String text, String key, int fallback) {
-            String value = lineValue(text, key);
+        private static int intValue(String value, int fallback) {
             return value == null || value.isBlank() ? fallback : Integer.parseInt(value);
         }
 
-        private static String lineValue(String text, String key) {
+        private static String sectionValue(String text, String section, String key) {
+            boolean inSection = false;
             for (String line : text.split("\\R")) {
                 String trimmed = line.trim();
-                if (!trimmed.startsWith(key + ":")) {
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+                    continue;
+                }
+                if (!line.startsWith(" ") && trimmed.endsWith(":")) {
+                    inSection = trimmed.equals(section + ":");
+                    continue;
+                }
+                if (!inSection || !trimmed.startsWith(key + ":")) {
                     continue;
                 }
                 String value = trimmed.substring(key.length() + 1).trim();
