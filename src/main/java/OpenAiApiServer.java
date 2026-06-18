@@ -5,6 +5,8 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -90,12 +92,13 @@ final class OpenAiApiServer {
 
             boolean stream = Boolean.TRUE.equals(request.get("stream"));
             String model = resolveModel(request.get("model"));
+            SessionKey sessionKey = sessionKey(request, exchange, prompt);
             ChatRequest chatRequest = new ChatRequest(
                     model,
-                    sessionKey(request, exchange),
+                    sessionKey.value(),
                     prompt.full(),
                     prompt.latest(),
-                    wantsNewConversation(request, prompt));
+                    wantsNewConversation(request, prompt, sessionKey));
             if (stream) {
                 handleStream(exchange, chatRequest);
                 return;
@@ -136,11 +139,13 @@ final class OpenAiApiServer {
 
     private static PromptData promptFromMessages(Object messages) {
         if (!(messages instanceof List<?> list)) {
-            return new PromptData("", "");
+            return new PromptData("", "", "", 0);
         }
 
         StringBuilder full = new StringBuilder();
+        String firstUser = "";
         String latest = "";
+        int messageCount = 0;
         for (Object item : list) {
             if (!(item instanceof Map<?, ?> message)) {
                 continue;
@@ -154,29 +159,54 @@ final class OpenAiApiServer {
                 full.append('\n');
             }
             full.append(role).append(": ").append(content);
+            messageCount++;
             if ("user".equalsIgnoreCase(role)) {
+                if (firstUser.isBlank()) {
+                    firstUser = content;
+                }
                 latest = content;
             } else if (latest.isBlank()) {
                 latest = content;
             }
         }
-        return new PromptData(full.toString(), latest);
+        return new PromptData(full.toString(), latest, firstUser.isBlank() ? latest : firstUser, messageCount);
     }
 
-    private static String sessionKey(Map<?, ?> request, HttpExchange exchange) {
-        String value = firstNonBlank(
+    private static SessionKey sessionKey(Map<?, ?> request, HttpExchange exchange, PromptData prompt) {
+        String explicit = firstNonBlank(
                 stringValue(request.get("conversation_id"), ""),
                 stringValue(request.get("session_id"), ""),
+                stringValue(request.get("chat_id"), ""),
+                stringValue(request.get("thread_id"), ""),
+                stringValue(request.get("channel_id"), ""),
+                stringValue(request.get("room_id"), ""),
+                stringValue(request.get("dialogue_id"), ""),
                 stringValue(request.get("user"), ""),
+                nestedString(request.get("metadata"), "conversation_id"),
+                nestedString(request.get("metadata"), "session_id"),
+                nestedString(request.get("metadata"), "chat_id"),
+                nestedString(request.get("metadata"), "thread_id"),
                 exchange.getRequestHeaders().getFirst("x-conversation-id"),
-                exchange.getRequestHeaders().getFirst("x-session-id"));
-        return value == null || value.isBlank() ? "default" : value.replace('\0', '_').trim();
+                exchange.getRequestHeaders().getFirst("x-session-id"),
+                exchange.getRequestHeaders().getFirst("x-chat-id"),
+                exchange.getRequestHeaders().getFirst("x-thread-id"));
+        if (explicit != null && !explicit.isBlank()) {
+            return new SessionKey("explicit:" + cleanKey(explicit), true);
+        }
+
+        String origin = firstNonBlank(
+                exchange.getRequestHeaders().getFirst("origin"),
+                exchange.getRequestHeaders().getFirst("referer"),
+                exchange.getRemoteAddress() == null ? "" : exchange.getRemoteAddress().getAddress().getHostAddress());
+        String seed = firstNonBlank(prompt.firstUser(), prompt.latest(), prompt.full());
+        return new SessionKey("auto:" + shortHash(origin + "\n" + seed), false);
     }
 
-    private static boolean wantsNewConversation(Map<?, ?> request, PromptData prompt) {
+    private static boolean wantsNewConversation(Map<?, ?> request, PromptData prompt, SessionKey sessionKey) {
         return booleanValue(request.get("new_conversation"))
                 || booleanValue(request.get("new"))
-                || "/new".equalsIgnoreCase(prompt.latest().trim());
+                || "/new".equalsIgnoreCase(prompt.latest().trim())
+                || (!sessionKey.explicit() && prompt.messageCount() <= 1);
     }
 
     private static String firstNonBlank(String... values) {
@@ -186,6 +216,32 @@ final class OpenAiApiServer {
             }
         }
         return "";
+    }
+
+    private static String nestedString(Object value, String key) {
+        if (!(value instanceof Map<?, ?> map)) {
+            return "";
+        }
+        return stringValue(map.get(key), "");
+    }
+
+    private static String cleanKey(String value) {
+        String cleaned = value == null ? "" : value.replace('\0', '_').trim();
+        return cleaned.isBlank() ? "default" : cleaned;
+    }
+
+    private static String shortHash(String value) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] bytes = digest.digest(value.getBytes(StandardCharsets.UTF_8));
+            StringBuilder out = new StringBuilder();
+            for (int i = 0; i < 12 && i < bytes.length; i++) {
+                out.append(String.format("%02x", bytes[i] & 0xff));
+            }
+            return out.toString();
+        } catch (NoSuchAlgorithmException e) {
+            return Integer.toHexString(value.hashCode());
+        }
     }
 
     private static boolean booleanValue(Object value) {
@@ -301,6 +357,9 @@ final class OpenAiApiServer {
                        boolean newConversation) {
     }
 
-    private record PromptData(String full, String latest) {
+    private record SessionKey(String value, boolean explicit) {
+    }
+
+    private record PromptData(String full, String latest, String firstUser, int messageCount) {
     }
 }

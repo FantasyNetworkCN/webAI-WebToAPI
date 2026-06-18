@@ -1349,14 +1349,16 @@ public class Main {
             String key = request.model() + ":" + request.sessionKey();
             ConversationState conversation = conversations.computeIfAbsent(key, ignored -> new ConversationState());
             synchronized (conversation) {
+                boolean wasReset = false;
                 if (request.newConversation()) {
                     conversation.clear();
+                    wasReset = true;
                     if ("/new".equalsIgnoreCase(request.latestPrompt().trim())) {
                         return "已开启新对话。";
                     }
                 }
 
-                String prompt = conversation.isActive() ? request.latestPrompt() : request.fullPrompt();
+                String prompt = conversation.isActive() && !wasReset ? request.latestPrompt() : request.fullPrompt();
                 StringBuilder text = new StringBuilder();
                 sendInternal(config, client, request.model(), prompt, conversation, delta -> {
                     text.append(delta);
