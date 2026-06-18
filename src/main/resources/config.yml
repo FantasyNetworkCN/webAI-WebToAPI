@@ -4,8 +4,5 @@ proxy:
   host: 127.0.0.1
   port: 7890
 
-cookie: |
-  HSID=xxx;
-  SSID=xxx;
-  APISID=xxx;
-  SAPISID=xxx;
+# 从浏览器F12复制出来的cookie或curl格式中的-B中引号内的内容
+cookie:
