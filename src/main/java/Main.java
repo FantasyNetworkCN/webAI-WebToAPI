@@ -1054,6 +1054,10 @@ public class Main {
                     ? jsonConversationArray(conversation.conversationId(), conversation.responseId(), conversation.choiceId())
                     : "[\"\",\"\",\"\",null,null,null,null,null,null,\"\"]";
             String updatedInner = replaceTopLevelElement(inner, 2, stateArray);
+            if (conversation.isStateless()) {
+                updatedInner = replaceTopLevelElement(updatedInner, 3, "\"\"");
+                updatedInner = replaceTopLevelElement(updatedInner, 4, "\"\"");
+            }
             updatedInner = replaceTopLevelElement(updatedInner, 17, "[[" + conversation.nextTurnIndex() + "]]");
             return fReq.substring(0, outerQuote)
                     + jsonQuote(updatedInner)
@@ -1337,7 +1341,7 @@ public class Main {
     private static final class ApiChatBackend implements OpenAiApiServer.ChatBackend {
         private final AppConfig config;
         private final OkHttpClient client;
-        private final Map<String, ConversationState> conversations = new ConcurrentHashMap<>();
+        private final Map<String, ApiConversation> conversations = new ConcurrentHashMap<>();
 
         private ApiChatBackend(AppConfig config, OkHttpClient client) {
             this.config = config;
@@ -1347,27 +1351,101 @@ public class Main {
         @Override
         public String complete(OpenAiApiServer.ChatRequest request, Consumer<String> deltaSink) throws IOException {
             String key = request.model() + ":" + request.sessionKey();
-            ConversationState conversation = conversations.computeIfAbsent(key, ignored -> new ConversationState());
+            ApiConversation conversation = conversations.computeIfAbsent(key, ignored -> new ApiConversation());
             synchronized (conversation) {
-                boolean wasReset = false;
                 if (request.newConversation()) {
                     conversation.clear();
-                    wasReset = true;
                     if ("/new".equalsIgnoreCase(request.latestPrompt().trim())) {
                         return "已开启新对话。";
                     }
                 }
 
-                String prompt = conversation.isActive() && !wasReset ? request.latestPrompt() : request.fullPrompt();
+                String prompt = apiPrompt(request, conversation);
                 StringBuilder text = new StringBuilder();
-                sendInternal(config, client, request.model(), prompt, conversation, delta -> {
+                sendInternal(config, client, request.model(), prompt, ConversationState.stateless(), delta -> {
                     text.append(delta);
                     if (deltaSink != null) {
                         deltaSink.accept(delta);
                     }
                 });
-                return text.toString();
+                String answer = text.toString();
+                if (request.explicitSession() && request.messageCount() <= 1) {
+                    conversation.appendUser(request.latestPrompt());
+                    conversation.appendAssistant(answer);
+                } else {
+                    conversation.replaceTranscript(request.fullPrompt(), answer);
+                }
+                return answer;
             }
+        }
+
+        private static String apiPrompt(OpenAiApiServer.ChatRequest request, ApiConversation conversation) {
+            String transcript;
+            if (request.explicitSession() && request.messageCount() <= 1 && !conversation.transcript().isBlank()) {
+                transcript = conversation.transcript()
+                        + "\nuser: " + request.latestPrompt();
+            } else {
+                transcript = request.fullPrompt();
+            }
+            return isolatedPrompt(request, transcript);
+        }
+
+        private static String isolatedPrompt(String transcript) {
+            return "你正在通过本地 OpenAI 兼容网关回答。\n"
+                    + "下面的“当前会话上下文”是唯一允许使用的上下文。\n"
+                    + "不要引用或延续 Gemini 网页端、浏览器账号、其他应用、其他用户、其他请求里的旧对话。\n"
+                    + "不要使用账号记忆、跨对话记忆、浏览器历史或其他聊天里的信息。\n"
+                    + "如果当前会话上下文里没有相关信息，就按不知道处理。\n\n"
+                    + "当前会话上下文：\n"
+                    + transcript;
+        }
+
+        private static String isolatedPrompt(OpenAiApiServer.ChatRequest request, String transcript) {
+            String prompt = isolatedPrompt(transcript);
+            if (!request.hasTools()) {
+                return prompt;
+            }
+            return prompt + "\n\n可用工具如下：\n"
+                    + request.toolsText()
+                    + "\n\n如果需要调用工具，必须只输出一个 JSON 对象，不要输出其他文字。格式：\n"
+                    + "{\"tool_calls\":[{\"function\":{\"name\":\"工具名\",\"arguments\":{\"参数名\":\"参数值\"}}}]}\n"
+                    + "如果不需要调用工具，就正常回答。";
+        }
+    }
+
+    private static final class ApiConversation {
+        private final StringBuilder transcript = new StringBuilder();
+
+        private void clear() {
+            transcript.setLength(0);
+        }
+
+        private String transcript() {
+            return transcript.toString();
+        }
+
+        private void appendUser(String text) {
+            append("user", text);
+        }
+
+        private void appendAssistant(String text) {
+            append("assistant", text);
+        }
+
+        private void replaceTranscript(String fullPrompt, String assistantText) {
+            transcript.setLength(0);
+            transcript.append(fullPrompt);
+            appendAssistant(assistantText);
+        }
+
+        private void append(String role, String text) {
+            if (text == null || text.isBlank()) {
+                return;
+            }
+            if (!transcript.isEmpty()) {
+                transcript.append('\n');
+            }
+            transcript.append(role).append(": ").append(text);
         }
     }
 
@@ -1376,9 +1454,26 @@ public class Main {
         private String responseId = "";
         private String choiceId = "";
         private int completedTurns;
+        private final boolean stateless;
+
+        private ConversationState() {
+            this(false);
+        }
+
+        private ConversationState(boolean stateless) {
+            this.stateless = stateless;
+        }
+
+        private static ConversationState stateless() {
+            return new ConversationState(true);
+        }
 
         private boolean isActive() {
             return !conversationId.isBlank() && !responseId.isBlank() && !choiceId.isBlank();
+        }
+
+        private boolean isStateless() {
+            return stateless;
         }
 
         private void clear() {

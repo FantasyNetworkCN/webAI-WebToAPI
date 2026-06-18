@@ -93,11 +93,15 @@ final class OpenAiApiServer {
             boolean stream = Boolean.TRUE.equals(request.get("stream"));
             String model = resolveModel(request.get("model"));
             SessionKey sessionKey = sessionKey(request, exchange, prompt);
+            String toolsText = toolsText(request.get("tools"), request.get("tool_choice"));
             ChatRequest chatRequest = new ChatRequest(
                     model,
                     sessionKey.value(),
+                    sessionKey.explicit(),
                     prompt.full(),
                     prompt.latest(),
+                    prompt.messageCount(),
+                    toolsText,
                     wantsNewConversation(request, prompt, sessionKey));
             if (stream) {
                 handleStream(exchange, chatRequest);
@@ -105,7 +109,10 @@ final class OpenAiApiServer {
             }
 
             String text = backend.complete(chatRequest, null);
-            sendJson(exchange, 200, completionJson(model, text));
+            ToolCallResult toolCall = parseToolCallResult(text);
+            sendJson(exchange, 200, toolCall == null
+                    ? completionJson(model, text)
+                    : toolCompletionJson(model, toolCall));
         } catch (IllegalArgumentException e) {
             sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
         } catch (Exception e) {
@@ -122,6 +129,23 @@ final class OpenAiApiServer {
         String id = "chatcmpl-" + UUID.randomUUID();
         long created = Instant.now().getEpochSecond();
         try (OutputStream out = exchange.getResponseBody()) {
+            if (request.hasTools()) {
+                String text = backend.complete(request, null);
+                ToolCallResult toolCall = parseToolCallResult(text);
+                if (toolCall == null) {
+                    if (!text.isEmpty()) {
+                        sendSse(out, chunkJson(id, request.model(), created, text, false));
+                    }
+                    sendSse(out, chunkJson(id, request.model(), created, "", true));
+                } else {
+                    sendSse(out, toolChunkJson(id, request.model(), created, toolCall, false));
+                    sendSse(out, toolChunkJson(id, request.model(), created, toolCall, true));
+                }
+                out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                return;
+            }
+
             backend.complete(request, delta -> {
                 try {
                     if (!delta.isEmpty()) {
@@ -152,13 +176,17 @@ final class OpenAiApiServer {
             }
             String role = stringValue(message.get("role"), "user");
             String content = contentText(message.get("content"));
+            if (content.isBlank() && "assistant".equalsIgnoreCase(role)) {
+                content = toolCallsText(message.get("tool_calls"));
+            }
             if (content.isBlank()) {
                 continue;
             }
+            String label = roleLabel(role, message);
             if (!full.isEmpty()) {
                 full.append('\n');
             }
-            full.append(role).append(": ").append(content);
+            full.append(label).append(": ").append(content);
             messageCount++;
             if ("user".equalsIgnoreCase(role)) {
                 if (firstUser.isBlank()) {
@@ -172,6 +200,31 @@ final class OpenAiApiServer {
         return new PromptData(full.toString(), latest, firstUser.isBlank() ? latest : firstUser, messageCount);
     }
 
+    private static String roleLabel(String role, Map<?, ?> message) {
+        if (!"tool".equalsIgnoreCase(role)) {
+            return role;
+        }
+        String name = firstNonBlank(
+                stringValue(message.get("name"), ""),
+                stringValue(message.get("tool_call_id"), ""));
+        return name.isBlank() ? "tool" : "tool " + name;
+    }
+
+    private static String toolsText(Object tools, Object toolChoice) {
+        if (!(tools instanceof List<?> list) || list.isEmpty()) {
+            return "";
+        }
+        return "tool_choice: " + toJson(toolChoice == null ? "auto" : toolChoice)
+                + "\ntools: " + toJson(list);
+    }
+
+    private static String toolCallsText(Object value) {
+        if (!(value instanceof List<?> list) || list.isEmpty()) {
+            return "";
+        }
+        return "tool_calls: " + toJson(list);
+    }
+
     private static SessionKey sessionKey(Map<?, ?> request, HttpExchange exchange, PromptData prompt) {
         String explicit = firstNonBlank(
                 stringValue(request.get("conversation_id"), ""),
@@ -181,15 +234,19 @@ final class OpenAiApiServer {
                 stringValue(request.get("channel_id"), ""),
                 stringValue(request.get("room_id"), ""),
                 stringValue(request.get("dialogue_id"), ""),
-                stringValue(request.get("user"), ""),
                 nestedString(request.get("metadata"), "conversation_id"),
                 nestedString(request.get("metadata"), "session_id"),
                 nestedString(request.get("metadata"), "chat_id"),
                 nestedString(request.get("metadata"), "thread_id"),
+                nestedString(request.get("metadata"), "channel_id"),
+                nestedString(request.get("metadata"), "room_id"),
+                nestedString(request.get("metadata"), "dialogue_id"),
                 exchange.getRequestHeaders().getFirst("x-conversation-id"),
                 exchange.getRequestHeaders().getFirst("x-session-id"),
                 exchange.getRequestHeaders().getFirst("x-chat-id"),
-                exchange.getRequestHeaders().getFirst("x-thread-id"));
+                exchange.getRequestHeaders().getFirst("x-thread-id"),
+                exchange.getRequestHeaders().getFirst("x-openwebui-chat-id"),
+                exchange.getRequestHeaders().getFirst("x-astrbot-session-id"));
         if (explicit != null && !explicit.isBlank()) {
             return new SessionKey("explicit:" + cleanKey(explicit), true);
         }
@@ -198,8 +255,9 @@ final class OpenAiApiServer {
                 exchange.getRequestHeaders().getFirst("origin"),
                 exchange.getRequestHeaders().getFirst("referer"),
                 exchange.getRemoteAddress() == null ? "" : exchange.getRemoteAddress().getAddress().getHostAddress());
+        String user = stringValue(request.get("user"), "");
         String seed = firstNonBlank(prompt.firstUser(), prompt.latest(), prompt.full());
-        return new SessionKey("auto:" + shortHash(origin + "\n" + seed), false);
+        return new SessionKey("auto:" + shortHash(origin + "\n" + user + "\n" + seed), false);
     }
 
     private static boolean wantsNewConversation(Map<?, ?> request, PromptData prompt, SessionKey sessionKey) {
@@ -277,6 +335,84 @@ final class OpenAiApiServer {
         return out.toString();
     }
 
+    private static ToolCallResult parseToolCallResult(String text) {
+        String json = extractJsonObject(text);
+        if (json.isBlank()) {
+            return null;
+        }
+        Object parsed = SimpleJson.parse(json);
+        if (!(parsed instanceof Map<?, ?> root)) {
+            return null;
+        }
+
+        Object callObject = root.get("tool_calls");
+        if (callObject instanceof List<?> calls && !calls.isEmpty()) {
+            return toolCallFromObject(calls.get(0));
+        }
+        return toolCallFromObject(root);
+    }
+
+    private static ToolCallResult toolCallFromObject(Object value) {
+        if (!(value instanceof Map<?, ?> map)) {
+            return null;
+        }
+        Object function = map.get("function");
+        if (function instanceof Map<?, ?> fn) {
+            String name = stringValue(fn.get("name"), "");
+            Object arguments = fn.get("arguments");
+            if (!name.isBlank()) {
+                return new ToolCallResult(name, argumentsJson(arguments));
+            }
+        }
+
+        String name = firstNonBlank(
+                stringValue(map.get("name"), ""),
+                stringValue(map.get("tool"), ""),
+                stringValue(map.get("function"), ""));
+        Object arguments = firstNonNull(map.get("arguments"), map.get("args"), map.get("parameters"));
+        if (name.isBlank()) {
+            return null;
+        }
+        return new ToolCallResult(name, argumentsJson(arguments));
+    }
+
+    private static Object firstNonNull(Object... values) {
+        for (Object value : values) {
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private static String argumentsJson(Object value) {
+        if (value instanceof String text) {
+            String trimmed = text.trim();
+            if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                return trimmed;
+            }
+        }
+        return value == null ? "{}" : toJson(value);
+    }
+
+    private static String extractJsonObject(String text) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
+        String trimmed = text.trim();
+        if (trimmed.startsWith("```")) {
+            trimmed = trimmed.replaceFirst("^```(?:json)?\\s*", "")
+                    .replaceFirst("\\s*```$", "")
+                    .trim();
+        }
+        int start = trimmed.indexOf('{');
+        int end = trimmed.lastIndexOf('}');
+        if (start < 0 || end <= start) {
+            return "";
+        }
+        return trimmed.substring(start, end + 1);
+    }
+
     private static String completionJson(String model, String text) {
         String id = "chatcmpl-" + UUID.randomUUID();
         long created = Instant.now().getEpochSecond();
@@ -291,6 +427,21 @@ final class OpenAiApiServer {
                 + "}";
     }
 
+    private static String toolCompletionJson(String model, ToolCallResult call) {
+        String id = "chatcmpl-" + UUID.randomUUID();
+        long created = Instant.now().getEpochSecond();
+        return "{"
+                + "\"id\":" + SimpleJson.quote(id) + ","
+                + "\"object\":\"chat.completion\","
+                + "\"created\":" + created + ","
+                + "\"model\":" + SimpleJson.quote(model) + ","
+                + "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["
+                + toolCallJson(call, 0)
+                + "]},\"finish_reason\":\"tool_calls\"}],"
+                + "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}"
+                + "}";
+    }
+
     private static String chunkJson(String id, String model, long created, String delta, boolean done) {
         return "{"
                 + "\"id\":" + SimpleJson.quote(id) + ","
@@ -300,6 +451,28 @@ final class OpenAiApiServer {
                 + "\"choices\":[{\"index\":0,\"delta\":"
                 + (done ? "{}" : "{\"content\":" + SimpleJson.quote(delta) + "}")
                 + ",\"finish_reason\":" + (done ? "\"stop\"" : "null") + "}]"
+                + "}";
+    }
+
+    private static String toolChunkJson(String id, String model, long created, ToolCallResult call, boolean done) {
+        return "{"
+                + "\"id\":" + SimpleJson.quote(id) + ","
+                + "\"object\":\"chat.completion.chunk\","
+                + "\"created\":" + created + ","
+                + "\"model\":" + SimpleJson.quote(model) + ","
+                + "\"choices\":[{\"index\":0,\"delta\":"
+                + (done ? "{}" : "{\"tool_calls\":[" + toolCallJson(call, 0) + "]}")
+                + ",\"finish_reason\":" + (done ? "\"tool_calls\"" : "null") + "}]"
+                + "}";
+    }
+
+    private static String toolCallJson(ToolCallResult call, int index) {
+        return "{"
+                + "\"index\":" + index + ","
+                + "\"id\":" + SimpleJson.quote("call_" + UUID.randomUUID().toString().replace("-", "")) + ","
+                + "\"type\":\"function\","
+                + "\"function\":{\"name\":" + SimpleJson.quote(call.name())
+                + ",\"arguments\":" + SimpleJson.quote(call.argumentsJson()) + "}"
                 + "}";
     }
 
@@ -330,6 +503,43 @@ final class OpenAiApiServer {
         return value instanceof String text ? text : fallback;
     }
 
+    private static String toJson(Object value) {
+        if (value == null) {
+            return "null";
+        }
+        if (value instanceof String text) {
+            return SimpleJson.quote(text);
+        }
+        if (value instanceof Number || value instanceof Boolean) {
+            return String.valueOf(value);
+        }
+        if (value instanceof Map<?, ?> map) {
+            StringBuilder out = new StringBuilder("{");
+            boolean first = true;
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                if (!first) {
+                    out.append(',');
+                }
+                first = false;
+                out.append(SimpleJson.quote(String.valueOf(entry.getKey())))
+                        .append(':')
+                        .append(toJson(entry.getValue()));
+            }
+            return out.append('}').toString();
+        }
+        if (value instanceof List<?> list) {
+            StringBuilder out = new StringBuilder("[");
+            for (int i = 0; i < list.size(); i++) {
+                if (i > 0) {
+                    out.append(',');
+                }
+                out.append(toJson(list.get(i)));
+            }
+            return out.append(']').toString();
+        }
+        return SimpleJson.quote(String.valueOf(value));
+    }
+
     private String resolveModel(Object value) {
         String requested = stringValue(value, defaultModel);
         if (requested == null || requested.isBlank()) {
@@ -353,13 +563,19 @@ final class OpenAiApiServer {
         String complete(ChatRequest request, Consumer<String> deltaSink) throws IOException;
     }
 
-    record ChatRequest(String model, String sessionKey, String fullPrompt, String latestPrompt,
-                       boolean newConversation) {
+    record ChatRequest(String model, String sessionKey, boolean explicitSession, String fullPrompt,
+                       String latestPrompt, int messageCount, String toolsText, boolean newConversation) {
+        boolean hasTools() {
+            return toolsText != null && !toolsText.isBlank();
+        }
     }
 
     private record SessionKey(String value, boolean explicit) {
     }
 
     private record PromptData(String full, String latest, String firstUser, int messageCount) {
+    }
+
+    private record ToolCallResult(String name, String argumentsJson) {
     }
 }
