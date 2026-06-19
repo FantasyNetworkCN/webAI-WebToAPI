@@ -206,7 +206,7 @@ public class Main {
     }
 
     private static boolean isRetryableBardError(BardRpcException e) {
-        return "1152".equals(e.code());
+        return e != null && e.code() != null && !e.code().isBlank();
     }
 
     private static void sleepBeforeRetry(int failedAttempt) throws IOException {
@@ -1653,12 +1653,9 @@ public class Main {
                         if (deltaSink != null) {
                             deltaSink.accept(delta);
                         }
-                    });
+                });
                 } catch (BardRpcException e) {
-                    if (!isRetryableBardError(e)) {
-                        throw e;
-                    }
-                    String fallback = "Gemini 返回临时 RPC 错误，网关已自动重试但仍未成功，请稍后再试。";
+                    String fallback = "Gemini 返回临时 RPC 错误，网关已自动重试但仍未成功，请稍后再试。错误码：" + e.code();
                     if (deltaSink != null) {
                         deltaSink.accept(fallback);
                     }
