@@ -18,6 +18,8 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 final class OpenAiApiServer {
     private final String host;
@@ -170,7 +172,7 @@ final class OpenAiApiServer {
             }
 
             PromptData prompt = promptFromMessages(request.get("messages"));
-            if (prompt.latest().isBlank()) {
+            if (prompt.latest().isBlank() && prompt.images().isEmpty()) {
                 sendJson(exchange, 400, errorJson("messages 为空"));
                 return;
             }
@@ -187,6 +189,7 @@ final class OpenAiApiServer {
                     prompt.full(),
                     prompt.latest(),
                     prompt.messageCount(),
+                    prompt.images(),
                     toolsText,
                     wantsNewConversation(request, prompt, sessionKey));
             if (stream) {
@@ -225,7 +228,7 @@ final class OpenAiApiServer {
             }
 
             PromptData prompt = promptFromResponsesRequest(request);
-            if (prompt.latest().isBlank()) {
+            if (prompt.latest().isBlank() && prompt.images().isEmpty()) {
                 sendJson(exchange, 400, errorJson("input 为空", "invalid_request_error"));
                 return;
             }
@@ -242,6 +245,7 @@ final class OpenAiApiServer {
                     prompt.full(),
                     prompt.latest(),
                     prompt.messageCount(),
+                    prompt.images(),
                     toolsText,
                     wantsNewConversation(request, prompt, sessionKey));
             if (stream) {
@@ -349,23 +353,26 @@ final class OpenAiApiServer {
 
     private static PromptData promptFromMessages(Object messages) {
         if (!(messages instanceof List<?> list)) {
-            return new PromptData("", "", "", 0);
+            return new PromptData("", "", "", 0, List.of());
         }
 
         StringBuilder full = new StringBuilder();
         String firstUser = "";
         String latest = "";
         int messageCount = 0;
+        java.util.ArrayList<ImageInput> allImages = new java.util.ArrayList<>();
+        java.util.ArrayList<ImageInput> latestUserImages = new java.util.ArrayList<>();
         for (Object item : list) {
             if (!(item instanceof Map<?, ?> message)) {
                 continue;
             }
             String role = stringValue(message.get("role"), "user");
-            String content = contentText(message.get("content"));
+            ContentParts parts = contentParts(message.get("content"));
+            String content = parts.text();
             if (content.isBlank() && "assistant".equalsIgnoreCase(role)) {
                 content = toolCallsText(message.get("tool_calls"));
             }
-            if (content.isBlank()) {
+            if (content.isBlank() && parts.images().isEmpty()) {
                 continue;
             }
             String label = roleLabel(role, message);
@@ -373,17 +380,27 @@ final class OpenAiApiServer {
                 full.append('\n');
             }
             full.append(label).append(": ").append(content);
+            if (!parts.images().isEmpty()) {
+                if (!content.isBlank()) {
+                    full.append('\n');
+                }
+                full.append("[images: ").append(parts.images().size()).append(']');
+            }
             messageCount++;
+            allImages.addAll(parts.images());
             if ("user".equalsIgnoreCase(role)) {
                 if (firstUser.isBlank()) {
                     firstUser = content;
                 }
                 latest = content;
+                latestUserImages.clear();
+                latestUserImages.addAll(parts.images());
             } else if (latest.isBlank()) {
                 latest = content;
             }
         }
-        return new PromptData(full.toString(), latest, firstUser.isBlank() ? latest : firstUser, messageCount);
+        List<ImageInput> images = latestUserImages.isEmpty() ? List.copyOf(allImages) : List.copyOf(latestUserImages);
+        return new PromptData(full.toString(), latest, firstUser.isBlank() ? latest : firstUser, messageCount, images);
     }
 
     private static PromptData promptFromResponsesRequest(Map<?, ?> request) {
@@ -397,14 +414,14 @@ final class OpenAiApiServer {
             String body = text.trim();
             String full = withInstructions(instructions, body.isBlank() ? "" : "user: " + body);
             String latest = body.isBlank() ? instructions : body;
-            return new PromptData(full, latest, body.isBlank() ? latest : body, latest.isBlank() ? 0 : 1);
+            return new PromptData(full, latest, body.isBlank() ? latest : body, latest.isBlank() ? 0 : 1, List.of());
         }
 
         if (!(input instanceof List<?> list)) {
             String text = scalarString(input);
             String full = withInstructions(instructions, text.isBlank() ? "" : "user: " + text);
             String latest = text.isBlank() ? instructions : text;
-            return new PromptData(full, latest, text.isBlank() ? latest : text, latest.isBlank() ? 0 : 1);
+            return new PromptData(full, latest, text.isBlank() ? latest : text, latest.isBlank() ? 0 : 1, List.of());
         }
 
         StringBuilder full = new StringBuilder();
@@ -414,21 +431,32 @@ final class OpenAiApiServer {
         String firstUser = "";
         String latest = "";
         int messageCount = instructions.isBlank() ? 0 : 1;
+        java.util.ArrayList<ImageInput> allImages = new java.util.ArrayList<>();
+        java.util.ArrayList<ImageInput> latestUserImages = new java.util.ArrayList<>();
         for (Object item : list) {
             InputMessage message = responseInputMessage(item);
-            if (message.text().isBlank()) {
+            if (message.text().isBlank() && message.images().isEmpty()) {
                 continue;
             }
             if (!full.isEmpty()) {
                 full.append('\n');
             }
             full.append(message.role()).append(": ").append(message.text());
+            if (!message.images().isEmpty()) {
+                if (!message.text().isBlank()) {
+                    full.append('\n');
+                }
+                full.append("[images: ").append(message.images().size()).append(']');
+            }
             messageCount++;
+            allImages.addAll(message.images());
             if ("user".equalsIgnoreCase(message.role())) {
                 if (firstUser.isBlank()) {
                     firstUser = message.text();
                 }
                 latest = message.text();
+                latestUserImages.clear();
+                latestUserImages.addAll(message.images());
             } else if (latest.isBlank()) {
                 latest = message.text();
             }
@@ -436,7 +464,8 @@ final class OpenAiApiServer {
         if (latest.isBlank()) {
             latest = instructions;
         }
-        return new PromptData(full.toString(), latest, firstUser.isBlank() ? latest : firstUser, messageCount);
+        List<ImageInput> images = latestUserImages.isEmpty() ? List.copyOf(allImages) : List.copyOf(latestUserImages);
+        return new PromptData(full.toString(), latest, firstUser.isBlank() ? latest : firstUser, messageCount, images);
     }
 
     private static String withInstructions(String instructions, String body) {
@@ -451,10 +480,12 @@ final class OpenAiApiServer {
 
     private static InputMessage responseInputMessage(Object item) {
         if (item instanceof String text) {
-            return new InputMessage("user", text);
+            ContentParts parts = textWithInlineImages(text);
+            return new InputMessage("user", parts.text(), parts.images());
         }
         if (!(item instanceof Map<?, ?> map)) {
-            return new InputMessage("user", scalarString(item));
+            ContentParts parts = textWithInlineImages(scalarString(item));
+            return new InputMessage("user", parts.text(), parts.images());
         }
 
         String role = firstNonBlank(
@@ -462,11 +493,12 @@ final class OpenAiApiServer {
                 responseRoleFromType(stringValue(map.get("type"), "")),
                 "user");
         Object content = firstNonNull(map.get("content"), map.get("text"), map.get("input"), map.get("output"));
-        String text = responseContentText(content);
+        ContentParts parts = responseContentParts(content);
+        String text = parts.text();
         if (text.isBlank()) {
             text = responseContentText(map.get("arguments"));
         }
-        return new InputMessage(role, text);
+        return new InputMessage(role, text, parts.images());
     }
 
     private static String responseRoleFromType(String type) {
@@ -486,14 +518,23 @@ final class OpenAiApiServer {
     }
 
     private static String responseContentText(Object content) {
+        return responseContentParts(content).text();
+    }
+
+    private static ContentParts responseContentParts(Object content) {
         if (content instanceof String text) {
-            return text;
+            return textWithInlineImages(text);
         }
         if (content instanceof Number || content instanceof Boolean) {
-            return String.valueOf(content);
+            return new ContentParts(String.valueOf(content), List.of());
         }
         if (content instanceof Map<?, ?> map) {
-            return responseContentText(firstNonNull(
+            String type = stringValue(map.get("type"), "");
+            if (isImagePartType(type)) {
+                ImageInput image = imageInputFromPart(map);
+                return new ContentParts("", image == null ? List.of() : List.of(image));
+            }
+            return responseContentParts(firstNonNull(
                     map.get("text"),
                     map.get("content"),
                     map.get("input_text"),
@@ -501,21 +542,22 @@ final class OpenAiApiServer {
                     map.get("arguments")));
         }
         if (!(content instanceof List<?> parts)) {
-            return "";
+            return new ContentParts("", List.of());
         }
 
         StringBuilder out = new StringBuilder();
+        java.util.ArrayList<ImageInput> images = new java.util.ArrayList<>();
         for (Object part : parts) {
-            String text = responseContentText(part);
-            if (text.isBlank()) {
-                continue;
+            ContentParts child = responseContentParts(part);
+            if (!child.text().isBlank()) {
+                if (!out.isEmpty()) {
+                    out.append('\n');
+                }
+                out.append(child.text());
             }
-            if (!out.isEmpty()) {
-                out.append('\n');
-            }
-            out.append(text);
+            images.addAll(child.images());
         }
-        return out.toString();
+        return new ContentParts(out.toString(), List.copyOf(images));
     }
 
     private static String roleLabel(String role, Map<?, ?> message) {
@@ -988,27 +1030,141 @@ final class OpenAiApiServer {
         return fallback;
     }
 
-    private static String contentText(Object content) {
+    private static ContentParts contentParts(Object content) {
         if (content instanceof String text) {
-            return text;
+            return textWithInlineImages(text);
         }
         if (!(content instanceof List<?> parts)) {
-            return "";
+            return new ContentParts("", List.of());
         }
 
         StringBuilder out = new StringBuilder();
+        java.util.ArrayList<ImageInput> images = new java.util.ArrayList<>();
         for (Object part : parts) {
             if (part instanceof Map<?, ?> map) {
                 String type = stringValue(map.get("type"), "");
                 if ("text".equals(type)) {
+                    ContentParts text = textWithInlineImages(stringValue(map.get("text"), ""));
                     if (!out.isEmpty()) {
                         out.append('\n');
                     }
-                    out.append(stringValue(map.get("text"), ""));
+                    out.append(text.text());
+                    images.addAll(text.images());
+                } else if (isImagePartType(type)) {
+                    ImageInput image = imageInputFromPart(map);
+                    if (image != null) {
+                        images.add(image);
+                    }
                 }
             }
         }
-        return out.toString();
+        return new ContentParts(out.toString(), List.copyOf(images));
+    }
+
+    private static String contentText(Object content) {
+        return contentParts(content).text();
+    }
+
+    private static ContentParts textWithInlineImages(String text) {
+        if (text == null || text.isBlank()) {
+            return new ContentParts(text == null ? "" : text, List.of());
+        }
+        Matcher matcher = Pattern.compile("\\[Image Attachment:\\s*path\\s+([^\\]]+)]").matcher(text);
+        java.util.ArrayList<ImageInput> images = new java.util.ArrayList<>();
+        StringBuilder cleaned = new StringBuilder();
+        while (matcher.find()) {
+            String path = matcher.group(1).trim();
+            images.add(new ImageInput(path, mimeFromFilename(path), filenameFromPath(path)));
+            matcher.appendReplacement(cleaned, Matcher.quoteReplacement("[image]"));
+        }
+        matcher.appendTail(cleaned);
+        return new ContentParts(cleaned.toString(), List.copyOf(images));
+    }
+
+    private static boolean isImagePartType(String type) {
+        String lower = type == null ? "" : type.toLowerCase();
+        return lower.equals("image_url")
+                || lower.equals("input_image")
+                || lower.equals("image")
+                || lower.equals("file");
+    }
+
+    private static ImageInput imageInputFromPart(Map<?, ?> map) {
+        Object imageUrl = firstNonNull(map.get("image_url"), map.get("input_image"), map.get("image"), map.get("file"));
+        String url = "";
+        if (imageUrl instanceof Map<?, ?> nested) {
+            url = firstNonBlank(
+                    stringValue(nested.get("url"), ""),
+                    stringValue(nested.get("data"), ""),
+                    stringValue(nested.get("base64"), ""),
+                    stringValue(nested.get("image_url"), ""));
+        } else {
+            url = stringValue(imageUrl, "");
+        }
+        if (url.isBlank()) {
+            url = firstNonBlank(
+                    stringValue(map.get("url"), ""),
+                    stringValue(map.get("data"), ""),
+                    stringValue(map.get("base64"), ""));
+        }
+        if (url.isBlank()) {
+            return null;
+        }
+        String mime = firstNonBlank(
+                stringValue(map.get("mime_type"), ""),
+                stringValue(map.get("mimeType"), ""),
+                mimeFromDataUrl(url),
+                mimeFromFilename(url));
+        String filename = firstNonBlank(
+                stringValue(map.get("filename"), ""),
+                stringValue(map.get("name"), ""),
+                "image_" + shortHash(url) + extensionForMime(mime));
+        return new ImageInput(url, mime, filename);
+    }
+
+    private static String mimeFromDataUrl(String value) {
+        if (value == null || !value.startsWith("data:")) {
+            return "";
+        }
+        int semi = value.indexOf(';');
+        return semi > 5 ? value.substring(5, semi) : "";
+    }
+
+    private static String mimeFromFilename(String filename) {
+        String lower = filename == null ? "" : filename.toLowerCase();
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+            return "image/jpeg";
+        }
+        if (lower.endsWith(".webp")) {
+            return "image/webp";
+        }
+        if (lower.endsWith(".gif")) {
+            return "image/gif";
+        }
+        return "image/png";
+    }
+
+    private static String extensionForMime(String mime) {
+        String lower = mime == null ? "" : mime.toLowerCase();
+        if (lower.contains("jpeg") || lower.contains("jpg")) {
+            return ".jpg";
+        }
+        if (lower.contains("webp")) {
+            return ".webp";
+        }
+        if (lower.contains("gif")) {
+            return ".gif";
+        }
+        return ".png";
+    }
+
+    private static String filenameFromPath(String path) {
+        if (path == null || path.isBlank()) {
+            return "image.png";
+        }
+        int slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+        String name = slash >= 0 ? path.substring(slash + 1) : path;
+        return name.isBlank() ? "image.png" : name;
     }
 
     private static ToolCallResult parseToolCallResult(String text) {
@@ -1368,7 +1524,8 @@ final class OpenAiApiServer {
     }
 
     record ChatRequest(String model, String sessionKey, boolean explicitSession, String fullPrompt,
-                       String latestPrompt, int messageCount, String toolsText, boolean newConversation) {
+                       String latestPrompt, int messageCount, List<ImageInput> images,
+                       String toolsText, boolean newConversation) {
         boolean hasTools() {
             return toolsText != null && !toolsText.isBlank();
         }
@@ -1380,10 +1537,16 @@ final class OpenAiApiServer {
     private record SessionCandidate(String source, String value) {
     }
 
-    private record PromptData(String full, String latest, String firstUser, int messageCount) {
+    private record PromptData(String full, String latest, String firstUser, int messageCount, List<ImageInput> images) {
     }
 
-    private record InputMessage(String role, String text) {
+    record ImageInput(String url, String mimeType, String filename) {
+    }
+
+    private record ContentParts(String text, List<ImageInput> images) {
+    }
+
+    private record InputMessage(String role, String text, List<ImageInput> images) {
     }
 
     private record ToolCallResult(String name, String argumentsJson) {

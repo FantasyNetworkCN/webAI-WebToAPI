@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -145,11 +146,12 @@ public class Main {
 
     private static void sendOnce(AppConfig config, OkHttpClient client, String model, String prompt,
                                  ConversationState conversation) throws IOException {
-        sendInternal(config, client, model, prompt, conversation, System.out::print);
+        sendInternal(config, client, model, prompt, java.util.List.of(), conversation, System.out::print);
         System.out.println();
     }
 
     private static GeminiResult sendInternal(AppConfig config, OkHttpClient client, String model, String prompt,
+                                             java.util.List<OpenAiApiServer.ImageInput> images,
                                              ConversationState conversation, Consumer<String> deltaSink) throws IOException {
         ModelProfile profile = modelProfile(model);
         CurlRequest curl = CurlRequest.parse(config.curl);
@@ -157,6 +159,9 @@ public class Main {
         curl.applyModel(profile);
         if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
             curl.replacePrompt(prompt);
+        }
+        if (images != null && !images.isEmpty()) {
+            curl.replaceImages(uploadImages(client, curl, images));
         }
 
         try (Response response = client.newCall(curl.toRequest()).execute()) {
@@ -266,6 +271,81 @@ public class Main {
         }
 
         return builder.build();
+    }
+
+    private static java.util.List<GeminiAttachment> uploadImages(OkHttpClient client,
+                                                                 CurlRequest curl,
+                                                                 java.util.List<OpenAiApiServer.ImageInput> images) throws IOException {
+        java.util.ArrayList<GeminiAttachment> attachments = new java.util.ArrayList<>();
+        for (OpenAiApiServer.ImageInput image : images) {
+            byte[] bytes = imageBytes(client, image);
+            String path = uploadGeminiImage(client, curl, bytes, image.filename());
+            attachments.add(new GeminiAttachment(path, image.mimeType(), image.filename()));
+        }
+        return java.util.List.copyOf(attachments);
+    }
+
+    private static byte[] imageBytes(OkHttpClient client, OpenAiApiServer.ImageInput image) throws IOException {
+        String value = image.url() == null ? "" : image.url().trim();
+        if (value.startsWith("data:")) {
+            int comma = value.indexOf(',');
+            if (comma < 0) {
+                throw new IOException("图片 data URL 缺少 base64 内容");
+            }
+            return Base64.getDecoder().decode(value.substring(comma + 1));
+        }
+        if (value.startsWith("http://") || value.startsWith("https://")) {
+            Request request = new Request.Builder()
+                    .url(value)
+                    .header("User-Agent", "Gemini-WebToAPI/1.0")
+                    .build();
+            try (Response response = client.newCall(request).execute()) {
+                if (!response.isSuccessful() || response.body() == null) {
+                    throw new IOException("下载图片失败，HTTP 状态=" + response.code());
+                }
+                return response.body().bytes();
+            }
+        }
+        Path path = Path.of(value);
+        if (Files.exists(path) && Files.isRegularFile(path)) {
+            return Files.readAllBytes(path);
+        }
+        return Base64.getDecoder().decode(value);
+    }
+
+    private static String uploadGeminiImage(OkHttpClient client, CurlRequest curl, byte[] bytes, String filename) throws IOException {
+        Request start = new Request.Builder()
+                .url("https://push.clients6.google.com/upload/?upload_protocol=resumable")
+                .headers(curl.uploadStartHeaders(bytes.length))
+                .post(RequestBody.create("File name: " + filename, FORM_MEDIA_TYPE))
+                .build();
+        String uploadUrl;
+        try (Response response = client.newCall(start).execute()) {
+            if (!response.isSuccessful()) {
+                throw new IOException("创建图片上传会话失败，HTTP 状态=" + response.code()
+                        + "，响应=" + preview(response.body() == null ? "" : response.body().string()));
+            }
+            uploadUrl = response.header("X-Goog-Upload-Url");
+        }
+        if (uploadUrl == null || uploadUrl.isBlank()) {
+            throw new IOException("图片上传响应缺少 X-Goog-Upload-Url");
+        }
+
+        Request upload = new Request.Builder()
+                .url(uploadUrl)
+                .headers(curl.uploadFinalizeHeaders())
+                .post(RequestBody.create(bytes, MediaType.get("application/x-www-form-urlencoded;charset=utf-8")))
+                .build();
+        try (Response response = client.newCall(upload).execute()) {
+            if (!response.isSuccessful() || response.body() == null) {
+                throw new IOException("上传图片失败，HTTP 状态=" + response.code());
+            }
+            String path = response.body().string().trim();
+            if (path.isBlank()) {
+                throw new IOException("图片上传返回了空路径");
+            }
+            return path;
+        }
     }
 
     private static void printStatus(AppConfig config, CurlRequest curl) {
@@ -926,6 +1006,68 @@ public class Main {
             originalPrompt = prompt;
         }
 
+        private void replaceImages(java.util.List<GeminiAttachment> attachments) {
+            String fReq = queryValue(form, "f.req");
+            if (fReq == null || fReq.isBlank()) {
+                return;
+            }
+
+            form = replaceFormValue(form, "f.req", replaceImagesInFReq(fReq, attachments));
+        }
+
+        private okhttp3.Headers uploadStartHeaders(int size) {
+            okhttp3.Headers.Builder out = baseUploadHeaders(size)
+                    .add("x-goog-upload-command", "start");
+            return out.build();
+        }
+
+        private okhttp3.Headers uploadFinalizeHeaders() {
+            okhttp3.Headers.Builder out = baseUploadHeaders(-1)
+                    .add("x-goog-upload-command", "upload, finalize")
+                    .add("x-goog-upload-offset", "0");
+            return out.build();
+        }
+
+        private okhttp3.Headers.Builder baseUploadHeaders(int size) {
+            okhttp3.Headers.Builder out = new okhttp3.Headers.Builder()
+                    .add("accept", firstNonBlank(headers.get("accept"), "*/*"))
+                    .add("accept-language", firstNonBlank(headers.get("accept-language"), "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"))
+                    .add("cache-control", "no-cache")
+                    .add("content-type", "application/x-www-form-urlencoded;charset=utf-8")
+                    .add("cookie", cookie)
+                    .add("origin", "https://gemini.google.com")
+                    .add("pragma", "no-cache")
+                    .add("push-id", "feeds/mcudyrk2a4khkz")
+                    .add("referer", "https://gemini.google.com/")
+                    .add("sec-fetch-dest", "empty")
+                    .add("sec-fetch-mode", "cors")
+                    .add("sec-fetch-site", "same-site")
+                    .add("user-agent", firstNonBlank(headers.get("user-agent"), "Mozilla/5.0"))
+                    .add("x-tenant-id", "bard-storage");
+            copyHeader(out, "x-browser-channel");
+            copyHeader(out, "x-browser-copyright");
+            copyHeader(out, "x-browser-validation");
+            copyHeader(out, "x-browser-year");
+            copyHeader(out, "x-client-data");
+            copyHeader(out, "x-client-pctx");
+            if (size >= 0) {
+                out.add("x-goog-upload-header-content-length", String.valueOf(size));
+                out.add("x-goog-upload-protocol", "resumable");
+            }
+            return out;
+        }
+
+        private void copyHeader(okhttp3.Headers.Builder out, String name) {
+            String value = headers.get(name);
+            if (value != null && !value.isBlank()) {
+                out.add(name, value);
+            }
+        }
+
+        private static String firstNonBlank(String value, String fallback) {
+            return value == null || value.isBlank() ? fallback : value;
+        }
+
         private void applyModel(ModelProfile profile) {
             if (profile == null) {
                 return;
@@ -1037,6 +1179,51 @@ public class Main {
             return fReq.substring(0, outerQuote)
                     + jsonQuote(updatedInner)
                     + fReq.substring(innerJson.endIndex());
+        }
+
+        private static String replaceImagesInFReq(String fReq, java.util.List<GeminiAttachment> attachments) {
+            int outerQuote = fReq.indexOf('"');
+            if (outerQuote < 0) {
+                return fReq;
+            }
+            JsonString innerJson = readJsonString(fReq, outerQuote);
+            if (innerJson == null) {
+                return fReq;
+            }
+
+            String inner = innerJson.value();
+            Range message = topLevelElementBounds(inner, 0);
+            if (message == null) {
+                return fReq;
+            }
+            String updatedMessage = replaceTopLevelElement(
+                    inner.substring(message.start(), message.end()),
+                    3,
+                    attachmentsJson(attachments));
+            String updatedInner = inner.substring(0, message.start())
+                    + updatedMessage
+                    + inner.substring(message.end());
+            return fReq.substring(0, outerQuote)
+                    + jsonQuote(updatedInner)
+                    + fReq.substring(innerJson.endIndex());
+        }
+
+        private static String attachmentsJson(java.util.List<GeminiAttachment> attachments) {
+            StringBuilder out = new StringBuilder("[");
+            for (int i = 0; i < attachments.size(); i++) {
+                GeminiAttachment attachment = attachments.get(i);
+                if (i > 0) {
+                    out.append(',');
+                }
+                out.append("[[")
+                        .append(jsonQuote(attachment.path()))
+                        .append(",1,null,")
+                        .append(jsonQuote(attachment.mimeType()))
+                        .append("],")
+                        .append(jsonQuote(attachment.filename()))
+                        .append("]");
+            }
+            return out.append(']').toString();
         }
 
         private static String applyConversationToFReq(String fReq, ConversationState conversation) {
@@ -1362,7 +1549,7 @@ public class Main {
 
                 String prompt = apiPrompt(request, conversation);
                 StringBuilder text = new StringBuilder();
-                sendInternal(config, client, request.model(), prompt, ConversationState.stateless(), delta -> {
+                sendInternal(config, client, request.model(), prompt, request.images(), ConversationState.stateless(), delta -> {
                     text.append(delta);
                     if (deltaSink != null) {
                         deltaSink.accept(delta);
@@ -1521,6 +1708,9 @@ public class Main {
     }
 
     private record ModelProfile(String name, String headerToken, Integer headerMode, String requestHash, Integer tailMode) {
+    }
+
+    private record GeminiAttachment(String path, String mimeType, String filename) {
     }
 
     private record GeminiResult(String text, String conversationId, String responseId, String choiceId) {
