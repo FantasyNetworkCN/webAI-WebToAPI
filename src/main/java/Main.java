@@ -32,6 +32,8 @@ public class Main {
     private static final MediaType FORM_MEDIA_TYPE =
             MediaType.get("application/x-www-form-urlencoded;charset=UTF-8");
     private static final String DEFAULT_MODEL = "gemini-3.5-Flash";
+    private static final int GEMINI_RPC_MAX_ATTEMPTS = 3;
+    private static final Pattern BARD_ERROR_PATTERN = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]");
     private static final Map<String, ModelProfile> MODEL_PROFILES = modelProfiles();
 
     public static void main(String[] args) {
@@ -153,6 +155,26 @@ public class Main {
     private static GeminiResult sendInternal(AppConfig config, OkHttpClient client, String model, String prompt,
                                              java.util.List<OpenAiApiServer.ImageInput> images,
                                              ConversationState conversation, Consumer<String> deltaSink) throws IOException {
+        BardRpcException lastRetryableError = null;
+        for (int attempt = 1; attempt <= GEMINI_RPC_MAX_ATTEMPTS; attempt++) {
+            try {
+                return sendInternalOnce(config, client, model, prompt, images, conversation, deltaSink);
+            } catch (BardRpcException e) {
+                if (!isRetryableBardError(e) || attempt == GEMINI_RPC_MAX_ATTEMPTS) {
+                    throw e;
+                }
+                lastRetryableError = e;
+                System.err.println("Gemini RPC 返回 BardErrorInfo，错误码=" + e.code()
+                        + "，自动重试 " + (attempt + 1) + "/" + GEMINI_RPC_MAX_ATTEMPTS);
+                sleepBeforeRetry(attempt);
+            }
+        }
+        throw lastRetryableError == null ? new IOException("Gemini 请求重试失败") : lastRetryableError;
+    }
+
+    private static GeminiResult sendInternalOnce(AppConfig config, OkHttpClient client, String model, String prompt,
+                                                 java.util.List<OpenAiApiServer.ImageInput> images,
+                                                 ConversationState conversation, Consumer<String> deltaSink) throws IOException {
         ModelProfile profile = modelProfile(model);
         CurlRequest curl = CurlRequest.parse(config.curl);
         curl.prepareForConversation(conversation);
@@ -170,12 +192,29 @@ public class Main {
             }
             if (!response.isSuccessful()) {
                 String body = response.body().string();
+                String code = bardErrorCode(body);
+                if (code != null) {
+                    throw new BardRpcException(code, body);
+                }
                 throw new IOException("Gemini 请求失败，HTTP 状态=" + response.code()
                         + "，响应=" + preview(body));
             }
             GeminiResult result = streamGeminiText(response, deltaSink);
             conversation.completeTurn(result);
             return result;
+        }
+    }
+
+    private static boolean isRetryableBardError(BardRpcException e) {
+        return "1152".equals(e.code());
+    }
+
+    private static void sleepBeforeRetry(int failedAttempt) throws IOException {
+        try {
+            Thread.sleep(Math.min(2_000L, 500L * failedAttempt));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Gemini 请求重试被中断", e);
         }
     }
 
@@ -382,12 +421,19 @@ public class Main {
         if (!result.text().isBlank()) {
             return result.text();
         }
-        Matcher bardError = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]").matcher(body);
-        if (bardError.find()) {
-            throw new IOException("Gemini RPC 返回 BardErrorInfo，错误码=" + bardError.group(1)
-                    + "。响应=" + preview(body));
+        String code = bardErrorCode(body);
+        if (code != null) {
+            throw new BardRpcException(code, body);
         }
         throw new IOException("无法从 Gemini 响应里解析文本：" + preview(body));
+    }
+
+    private static String bardErrorCode(String body) {
+        if (body == null || body.isBlank()) {
+            return null;
+        }
+        Matcher bardError = BARD_ERROR_PATTERN.matcher(body);
+        return bardError.find() ? bardError.group(1) : null;
     }
 
     private static String tryParseGeminiText(String body) {
@@ -1601,12 +1647,23 @@ public class Main {
 
                 String prompt = apiPrompt(request, conversation);
                 StringBuilder text = new StringBuilder();
-                sendInternal(config, client, request.model(), prompt, request.images(), ConversationState.stateless(), delta -> {
-                    text.append(delta);
-                    if (deltaSink != null) {
-                        deltaSink.accept(delta);
+                try {
+                    sendInternal(config, client, request.model(), prompt, request.images(), ConversationState.stateless(), delta -> {
+                        text.append(delta);
+                        if (deltaSink != null) {
+                            deltaSink.accept(delta);
+                        }
+                    });
+                } catch (BardRpcException e) {
+                    if (!isRetryableBardError(e)) {
+                        throw e;
                     }
-                });
+                    String fallback = "Gemini 返回临时 RPC 错误，网关已自动重试但仍未成功，请稍后再试。";
+                    if (deltaSink != null) {
+                        deltaSink.accept(fallback);
+                    }
+                    text.append(fallback);
+                }
                 String answer = text.toString();
                 if (request.explicitSession() && request.messageCount() <= 1) {
                     conversation.appendUser(request.latestPrompt());
@@ -1756,6 +1813,19 @@ public class Main {
 
         private int nextTurnIndex() {
             return completedTurns;
+        }
+    }
+
+    private static final class BardRpcException extends IOException {
+        private final String code;
+
+        private BardRpcException(String code, String body) {
+            super("Gemini RPC 返回 BardErrorInfo，错误码=" + code + "。响应=" + preview(body));
+            this.code = code;
+        }
+
+        private String code() {
+            return code;
         }
     }
 
