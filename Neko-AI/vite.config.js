@@ -10,6 +10,13 @@ export default defineConfig({
     vue(),
     vueDevTools(),
   ],
+  server: {
+    port: 5173,
+    proxy: {
+      '/v1': 'http://127.0.0.1:11434',
+      '/debug': 'http://127.0.0.1:11434',
+    },
+  },
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
