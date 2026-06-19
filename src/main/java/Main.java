@@ -1578,7 +1578,7 @@ public class Main {
         }
 
         private static String isolatedPrompt(String transcript) {
-            return "当前对话正在通过 OpenAI 兼容网关回答。\n"
+            return "当前对话正在通过 OpenAI 兼容网关回答。如果用户让你生成图片请你正常生成。图片生成请不要使用任何工具\n"
                     + "下面的“当前会话上下文”是唯一允许使用的上下文。\n"
                     + "不要引用或延续 Gemini 网页端、浏览器账号、其他应用、其他用户、其他请求里的旧对话。\n"
                     + "不要使用账号记忆、跨对话记忆、浏览器历史或其他聊天里的信息。\n"
