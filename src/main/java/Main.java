@@ -188,6 +188,12 @@ public class Main {
                 3,
                 "2cc5278d23ac6305f37b1e606442fb1e",
                 3));
+        profiles.put("gemini-3.1-Flash-Lite", new ModelProfile(
+                "gemini-3.1-Flash-Lite",
+                "cf41b0e0dd7d53e5",
+                6,
+                "afe4fdb4dcc64484a436c7456c034885",
+                6));
         return java.util.Collections.unmodifiableMap(profiles);
     }
 
