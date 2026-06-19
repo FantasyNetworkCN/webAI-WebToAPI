@@ -38,6 +38,7 @@ final class OpenAiApiServer {
 
     void start() throws IOException {
         server = HttpServer.create(new InetSocketAddress(host, port), 0);
+        server.createContext("/v1/responses", this::handleResponses);
         server.createContext("/v1/chat/completions", this::handleChatCompletions);
         server.createContext("/v1/models", this::handleModels);
         server.createContext("/debug/openai-logs", this::handleOpenAiLogs);
@@ -47,6 +48,7 @@ final class OpenAiApiServer {
         server.start();
         System.out.println("OpenAI API 已启动：http://" + host + ":" + port);
         System.out.println("前端页面：http://" + host + ":" + port + "/");
+        System.out.println("POST /v1/responses");
         System.out.println("POST /v1/chat/completions");
     }
 
@@ -60,8 +62,12 @@ final class OpenAiApiServer {
     }
 
     private void handleModels(HttpExchange exchange) throws IOException {
-        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-            sendJson(exchange, 405, "{\"error\":{\"message\":\"只支持 GET\"}}");
+        addCorsHeaders(exchange, "GET, POST, OPTIONS");
+        if (handleCorsPreflight(exchange)) {
+            return;
+        }
+        if (!isMethod(exchange, "GET") && !isMethod(exchange, "POST")) {
+            sendMethodNotAllowed(exchange, "GET, POST, OPTIONS");
             return;
         }
         StringBuilder json = new StringBuilder("{\"object\":\"list\",\"data\":[");
@@ -78,8 +84,12 @@ final class OpenAiApiServer {
     }
 
     private void handleOpenAiLogs(HttpExchange exchange) throws IOException {
-        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-            sendJson(exchange, 405, "{\"error\":{\"message\":\"只支持 GET\"}}");
+        addCorsHeaders(exchange, "GET, POST, OPTIONS");
+        if (handleCorsPreflight(exchange)) {
+            return;
+        }
+        if (!isMethod(exchange, "GET") && !isMethod(exchange, "POST")) {
+            sendMethodNotAllowed(exchange, "GET, POST, OPTIONS");
             return;
         }
 
@@ -104,13 +114,22 @@ final class OpenAiApiServer {
     }
 
     private void handleStatic(HttpExchange exchange) throws IOException {
-        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())
-                && !"HEAD".equalsIgnoreCase(exchange.getRequestMethod())) {
-            sendJson(exchange, 405, "{\"error\":{\"message\":\"只支持 GET\"}}");
+        addCorsHeaders(exchange, "GET, HEAD, OPTIONS");
+        if (handleCorsPreflight(exchange)) {
             return;
         }
 
         String path = exchange.getRequestURI().getPath();
+        if (path.startsWith("/v1/")) {
+            sendJson(exchange, 404, errorJson("接口未实现：" + path, "not_found_error"));
+            return;
+        }
+
+        if (!isMethod(exchange, "GET") && !isMethod(exchange, "HEAD")) {
+            sendMethodNotAllowed(exchange, "GET, HEAD, OPTIONS");
+            return;
+        }
+
         if (!"/".equals(path) && !"/index.html".equals(path)) {
             sendText(exchange, 404, "Not Found", "text/plain; charset=utf-8");
             return;
@@ -133,8 +152,12 @@ final class OpenAiApiServer {
     }
 
     private void handleChatCompletions(HttpExchange exchange) throws IOException {
-        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-            sendJson(exchange, 405, "{\"error\":{\"message\":\"只支持 POST\"}}");
+        addCorsHeaders(exchange, "POST, OPTIONS");
+        if (handleCorsPreflight(exchange)) {
+            return;
+        }
+        if (!isMethod(exchange, "POST")) {
+            sendMethodNotAllowed(exchange, "POST, OPTIONS");
             return;
         }
 
@@ -183,7 +206,63 @@ final class OpenAiApiServer {
         }
     }
 
+    private void handleResponses(HttpExchange exchange) throws IOException {
+        addCorsHeaders(exchange, "POST, OPTIONS");
+        if (handleCorsPreflight(exchange)) {
+            return;
+        }
+        if (!isMethod(exchange, "POST")) {
+            sendMethodNotAllowed(exchange, "POST, OPTIONS");
+            return;
+        }
+
+        try {
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            Object parsed = SimpleJson.parse(body);
+            if (!(parsed instanceof Map<?, ?> request)) {
+                sendJson(exchange, 400, errorJson("请求体不是 JSON object", "invalid_request_error"));
+                return;
+            }
+
+            PromptData prompt = promptFromResponsesRequest(request);
+            if (prompt.latest().isBlank()) {
+                sendJson(exchange, 400, errorJson("input 为空", "invalid_request_error"));
+                return;
+            }
+
+            boolean stream = Boolean.TRUE.equals(request.get("stream"));
+            String model = resolveModel(request.get("model"));
+            SessionKey sessionKey = sessionKey(request, exchange, prompt);
+            String toolsText = responsesToolsText(request.get("tools"), request.get("tool_choice"));
+            logRequest(exchange, body, request, model, stream, sessionKey, prompt, toolsText);
+            ChatRequest chatRequest = new ChatRequest(
+                    model,
+                    sessionKey.value(),
+                    sessionKey.explicit(),
+                    prompt.full(),
+                    prompt.latest(),
+                    prompt.messageCount(),
+                    toolsText,
+                    wantsNewConversation(request, prompt, sessionKey));
+            if (stream) {
+                handleResponseStream(exchange, chatRequest);
+                return;
+            }
+
+            String text = backend.complete(chatRequest, null);
+            ToolCallResult toolCall = parseToolCallResult(text);
+            sendJson(exchange, 200, toolCall == null
+                    ? responseJson(model, text)
+                    : toolResponseJson(model, toolCall));
+        } catch (IllegalArgumentException e) {
+            sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
+        } catch (Exception e) {
+            sendJson(exchange, 500, errorJson(e.getMessage()));
+        }
+    }
+
     private void handleStream(HttpExchange exchange, ChatRequest request) throws IOException {
+        addCorsHeaders(exchange, "POST, OPTIONS");
         exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
         exchange.getResponseHeaders().set("Cache-Control", "no-cache");
         exchange.getResponseHeaders().set("Connection", "keep-alive");
@@ -219,6 +298,50 @@ final class OpenAiApiServer {
                 }
             });
             sendSse(out, chunkJson(id, request.model(), created, "", true));
+            out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+            out.flush();
+        }
+    }
+
+    private void handleResponseStream(HttpExchange exchange, ChatRequest request) throws IOException {
+        addCorsHeaders(exchange, "POST, OPTIONS");
+        exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
+        exchange.getResponseHeaders().set("Cache-Control", "no-cache");
+        exchange.getResponseHeaders().set("Connection", "keep-alive");
+        exchange.sendResponseHeaders(200, 0);
+
+        String id = "resp_" + UUID.randomUUID().toString().replace("-", "");
+        long created = Instant.now().getEpochSecond();
+        try (OutputStream out = exchange.getResponseBody()) {
+            sendSse(out, responseCreatedEvent(id, request.model(), created));
+            if (request.hasTools()) {
+                String text = backend.complete(request, null);
+                ToolCallResult toolCall = parseToolCallResult(text);
+                if (toolCall == null) {
+                    if (!text.isEmpty()) {
+                        sendSse(out, responseTextDeltaEvent(id, text));
+                    }
+                    sendSse(out, responseCompletedEvent(id, request.model(), created, text));
+                } else {
+                    sendSse(out, responseCompletedEvent(id, request.model(), created, toolResponseSummary(toolCall)));
+                }
+                out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                return;
+            }
+
+            StringBuilder text = new StringBuilder();
+            backend.complete(request, delta -> {
+                try {
+                    if (!delta.isEmpty()) {
+                        text.append(delta);
+                        sendSse(out, responseTextDeltaEvent(id, delta));
+                    }
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            sendSse(out, responseCompletedEvent(id, request.model(), created, text.toString()));
             out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
             out.flush();
         }
@@ -263,6 +386,138 @@ final class OpenAiApiServer {
         return new PromptData(full.toString(), latest, firstUser.isBlank() ? latest : firstUser, messageCount);
     }
 
+    private static PromptData promptFromResponsesRequest(Map<?, ?> request) {
+        Object input = request.get("input");
+        if (input == null) {
+            return promptFromMessages(request.get("messages"));
+        }
+
+        String instructions = contentText(request.get("instructions")).trim();
+        if (input instanceof String text) {
+            String body = text.trim();
+            String full = withInstructions(instructions, body.isBlank() ? "" : "user: " + body);
+            String latest = body.isBlank() ? instructions : body;
+            return new PromptData(full, latest, body.isBlank() ? latest : body, latest.isBlank() ? 0 : 1);
+        }
+
+        if (!(input instanceof List<?> list)) {
+            String text = scalarString(input);
+            String full = withInstructions(instructions, text.isBlank() ? "" : "user: " + text);
+            String latest = text.isBlank() ? instructions : text;
+            return new PromptData(full, latest, text.isBlank() ? latest : text, latest.isBlank() ? 0 : 1);
+        }
+
+        StringBuilder full = new StringBuilder();
+        if (!instructions.isBlank()) {
+            full.append("system: ").append(instructions);
+        }
+        String firstUser = "";
+        String latest = "";
+        int messageCount = instructions.isBlank() ? 0 : 1;
+        for (Object item : list) {
+            InputMessage message = responseInputMessage(item);
+            if (message.text().isBlank()) {
+                continue;
+            }
+            if (!full.isEmpty()) {
+                full.append('\n');
+            }
+            full.append(message.role()).append(": ").append(message.text());
+            messageCount++;
+            if ("user".equalsIgnoreCase(message.role())) {
+                if (firstUser.isBlank()) {
+                    firstUser = message.text();
+                }
+                latest = message.text();
+            } else if (latest.isBlank()) {
+                latest = message.text();
+            }
+        }
+        if (latest.isBlank()) {
+            latest = instructions;
+        }
+        return new PromptData(full.toString(), latest, firstUser.isBlank() ? latest : firstUser, messageCount);
+    }
+
+    private static String withInstructions(String instructions, String body) {
+        if (instructions.isBlank()) {
+            return body;
+        }
+        if (body.isBlank()) {
+            return "system: " + instructions;
+        }
+        return "system: " + instructions + "\n" + body;
+    }
+
+    private static InputMessage responseInputMessage(Object item) {
+        if (item instanceof String text) {
+            return new InputMessage("user", text);
+        }
+        if (!(item instanceof Map<?, ?> map)) {
+            return new InputMessage("user", scalarString(item));
+        }
+
+        String role = firstNonBlank(
+                stringValue(map.get("role"), ""),
+                responseRoleFromType(stringValue(map.get("type"), "")),
+                "user");
+        Object content = firstNonNull(map.get("content"), map.get("text"), map.get("input"), map.get("output"));
+        String text = responseContentText(content);
+        if (text.isBlank()) {
+            text = responseContentText(map.get("arguments"));
+        }
+        return new InputMessage(role, text);
+    }
+
+    private static String responseRoleFromType(String type) {
+        if ("message".equalsIgnoreCase(type)) {
+            return "";
+        }
+        if (type != null && type.toLowerCase().contains("assistant")) {
+            return "assistant";
+        }
+        if (type != null && type.toLowerCase().contains("system")) {
+            return "system";
+        }
+        if (type != null && type.toLowerCase().contains("tool")) {
+            return "tool";
+        }
+        return "user";
+    }
+
+    private static String responseContentText(Object content) {
+        if (content instanceof String text) {
+            return text;
+        }
+        if (content instanceof Number || content instanceof Boolean) {
+            return String.valueOf(content);
+        }
+        if (content instanceof Map<?, ?> map) {
+            return responseContentText(firstNonNull(
+                    map.get("text"),
+                    map.get("content"),
+                    map.get("input_text"),
+                    map.get("output_text"),
+                    map.get("arguments")));
+        }
+        if (!(content instanceof List<?> parts)) {
+            return "";
+        }
+
+        StringBuilder out = new StringBuilder();
+        for (Object part : parts) {
+            String text = responseContentText(part);
+            if (text.isBlank()) {
+                continue;
+            }
+            if (!out.isEmpty()) {
+                out.append('\n');
+            }
+            out.append(text);
+        }
+        return out.toString();
+    }
+
     private static String roleLabel(String role, Map<?, ?> message) {
         if (!"tool".equalsIgnoreCase(role)) {
             return role;
@@ -279,6 +534,14 @@ final class OpenAiApiServer {
         }
         return "tool_choice: " + toJson(toolChoice == null ? "auto" : toolChoice)
                 + "\ntools: " + toJson(list);
+    }
+
+    private static String responsesToolsText(Object tools, Object toolChoice) {
+        if (!(tools instanceof List<?> list) || list.isEmpty()) {
+            return "";
+        }
+        return "tool_choice: " + toJson(toolChoice == null ? "auto" : toolChoice)
+                + "\nresponses_tools: " + toJson(list);
     }
 
     private static String toolCallsText(Object value) {
@@ -855,6 +1118,39 @@ final class OpenAiApiServer {
                 + "}";
     }
 
+    private static String responseJson(String model, String text) {
+        String id = "resp_" + UUID.randomUUID().toString().replace("-", "");
+        long created = Instant.now().getEpochSecond();
+        String outputId = "msg_" + UUID.randomUUID().toString().replace("-", "");
+        return "{"
+                + "\"id\":" + SimpleJson.quote(id) + ","
+                + "\"object\":\"response\","
+                + "\"created_at\":" + created + ","
+                + "\"status\":\"completed\","
+                + "\"model\":" + SimpleJson.quote(model) + ","
+                + "\"output_text\":" + SimpleJson.quote(text) + ","
+                + "\"output\":[{\"id\":" + SimpleJson.quote(outputId)
+                + ",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":"
+                + SimpleJson.quote(text) + ",\"annotations\":[]}]}],"
+                + "\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}"
+                + "}";
+    }
+
+    private static String toolResponseJson(String model, ToolCallResult call) {
+        String id = "resp_" + UUID.randomUUID().toString().replace("-", "");
+        long created = Instant.now().getEpochSecond();
+        return "{"
+                + "\"id\":" + SimpleJson.quote(id) + ","
+                + "\"object\":\"response\","
+                + "\"created_at\":" + created + ","
+                + "\"status\":\"completed\","
+                + "\"model\":" + SimpleJson.quote(model) + ","
+                + "\"output_text\":\"\","
+                + "\"output\":[" + responseToolCallJson(call) + "],"
+                + "\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}"
+                + "}";
+    }
+
     private static String chunkJson(String id, String model, long created, String delta, boolean done) {
         return "{"
                 + "\"id\":" + SimpleJson.quote(id) + ","
@@ -879,6 +1175,64 @@ final class OpenAiApiServer {
                 + "}";
     }
 
+    private static String responseCreatedEvent(String id, String model, long created) {
+        return "{"
+                + "\"type\":\"response.created\","
+                + "\"response\":{\"id\":" + SimpleJson.quote(id)
+                + ",\"object\":\"response\",\"created_at\":" + created
+                + ",\"status\":\"in_progress\",\"model\":" + SimpleJson.quote(model)
+                + ",\"output\":[]}"
+                + "}";
+    }
+
+    private static String responseTextDeltaEvent(String id, String delta) {
+        return "{"
+                + "\"type\":\"response.output_text.delta\","
+                + "\"response_id\":" + SimpleJson.quote(id) + ","
+                + "\"output_index\":0,"
+                + "\"content_index\":0,"
+                + "\"delta\":" + SimpleJson.quote(delta)
+                + "}";
+    }
+
+    private static String responseCompletedEvent(String id, String model, long created, String text) {
+        return "{"
+                + "\"type\":\"response.completed\","
+                + "\"response\":" + responseJsonWithId(id, model, created, text)
+                + "}";
+    }
+
+    private static String responseJsonWithId(String id, String model, long created, String text) {
+        String outputId = "msg_" + UUID.randomUUID().toString().replace("-", "");
+        return "{"
+                + "\"id\":" + SimpleJson.quote(id) + ","
+                + "\"object\":\"response\","
+                + "\"created_at\":" + created + ","
+                + "\"status\":\"completed\","
+                + "\"model\":" + SimpleJson.quote(model) + ","
+                + "\"output_text\":" + SimpleJson.quote(text) + ","
+                + "\"output\":[{\"id\":" + SimpleJson.quote(outputId)
+                + ",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":"
+                + SimpleJson.quote(text) + ",\"annotations\":[]}]}],"
+                + "\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}"
+                + "}";
+    }
+
+    private static String responseToolCallJson(ToolCallResult call) {
+        return "{"
+                + "\"id\":" + SimpleJson.quote("fc_" + UUID.randomUUID().toString().replace("-", "")) + ","
+                + "\"type\":\"function_call\","
+                + "\"status\":\"completed\","
+                + "\"call_id\":" + SimpleJson.quote("call_" + UUID.randomUUID().toString().replace("-", "")) + ","
+                + "\"name\":" + SimpleJson.quote(call.name()) + ","
+                + "\"arguments\":" + SimpleJson.quote(call.argumentsJson())
+                + "}";
+    }
+
+    private static String toolResponseSummary(ToolCallResult call) {
+        return "function_call: " + call.name() + "(" + call.argumentsJson() + ")";
+    }
+
     private static String toolCallJson(ToolCallResult call, int index) {
         return "{"
                 + "\"index\":" + index + ","
@@ -894,7 +1248,34 @@ final class OpenAiApiServer {
         out.flush();
     }
 
+    private static boolean isMethod(HttpExchange exchange, String method) {
+        return method.equalsIgnoreCase(exchange.getRequestMethod());
+    }
+
+    private static boolean handleCorsPreflight(HttpExchange exchange) throws IOException {
+        if (!isMethod(exchange, "OPTIONS")) {
+            return false;
+        }
+        exchange.sendResponseHeaders(204, -1);
+        exchange.close();
+        return true;
+    }
+
+    private static void addCorsHeaders(HttpExchange exchange, String methods) {
+        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        exchange.getResponseHeaders().set("Access-Control-Allow-Methods", methods);
+        exchange.getResponseHeaders().set("Access-Control-Allow-Headers",
+                "authorization, content-type, openai-beta, openai-organization, openai-project, x-requested-with, x-conversation-id, x-session-id, x-chat-id, x-thread-id");
+        exchange.getResponseHeaders().set("Access-Control-Max-Age", "86400");
+    }
+
+    private static void sendMethodNotAllowed(HttpExchange exchange, String allowedMethods) throws IOException {
+        exchange.getResponseHeaders().set("Allow", allowedMethods);
+        sendJson(exchange, 405, errorJson("此接口支持的方法：" + allowedMethods, "invalid_request_error"));
+    }
+
     private static void sendJson(HttpExchange exchange, int status, String json) throws IOException {
+        addCorsHeaders(exchange, "GET, POST, OPTIONS");
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
         exchange.sendResponseHeaders(status, bytes.length);
@@ -904,6 +1285,7 @@ final class OpenAiApiServer {
     }
 
     private static void sendText(HttpExchange exchange, int status, String text, String contentType) throws IOException {
+        addCorsHeaders(exchange, "GET, HEAD, OPTIONS");
         byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", contentType);
         exchange.sendResponseHeaders(status, bytes.length);
@@ -999,6 +1381,9 @@ final class OpenAiApiServer {
     }
 
     private record PromptData(String full, String latest, String firstUser, int messageCount) {
+    }
+
+    private record InputMessage(String role, String text) {
     }
 
     private record ToolCallResult(String name, String argumentsJson) {
