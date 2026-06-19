@@ -462,6 +462,11 @@ public class Main {
     }
 
     private static String textFromChoice(java.util.List<?> choice) {
+        String imageUrl = generatedImageUrl(choice);
+        if (!imageUrl.isBlank()) {
+            return imageUrl;
+        }
+
         String direct = joinedStringArray(listValue(choice, 1));
         if (isAnswerText(direct)) {
             return direct;
@@ -473,6 +478,47 @@ public class Main {
         }
 
         return "";
+    }
+
+    private static String generatedImageUrl(Object value) {
+        String best = generatedImageUrlValue(value);
+        return best == null ? "" : best;
+    }
+
+    private static String generatedImageUrlValue(Object value) {
+        if (value instanceof String text) {
+            String normalized = normalizeCandidateText(text);
+            return isRealGeneratedImageUrl(normalized) ? normalized : null;
+        }
+        if (!(value instanceof java.util.List<?> list)) {
+            return null;
+        }
+        String fallback = null;
+        for (Object item : list) {
+            String candidate = generatedImageUrlValue(item);
+            if (candidate == null || candidate.isBlank()) {
+                continue;
+            }
+            if (candidate.contains("lh3.googleusercontent.com/gg-dl/")) {
+                return candidate;
+            }
+            if (fallback == null) {
+                fallback = candidate;
+            }
+        }
+        return fallback;
+    }
+
+    private static boolean isRealGeneratedImageUrl(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        String lower = value.toLowerCase(Locale.ROOT);
+        if (lower.contains("image_generation_content")) {
+            return false;
+        }
+        return lower.startsWith("https://lh3.googleusercontent.com/gg-dl/")
+                || lower.startsWith("http://lh3.googleusercontent.com/gg-dl/");
     }
 
     private static String joinedStringArray(Object value) {
