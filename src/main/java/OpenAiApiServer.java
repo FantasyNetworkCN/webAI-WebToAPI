@@ -204,6 +204,8 @@ final class OpenAiApiServer {
                     : toolCompletionJson(model, toolCall));
         } catch (IllegalArgumentException e) {
             sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
+        } catch (Main.BardRpcException e) {
+            sendJson(exchange, 502, errorJson(e.getMessage(), "upstream_error"));
         } catch (Exception e) {
             sendJson(exchange, 500, errorJson(e.getMessage()));
         }
@@ -260,6 +262,8 @@ final class OpenAiApiServer {
                     : toolResponseJson(model, toolCall));
         } catch (IllegalArgumentException e) {
             sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
+        } catch (Main.BardRpcException e) {
+            sendJson(exchange, 502, errorJson(e.getMessage(), "upstream_error"));
         } catch (Exception e) {
             sendJson(exchange, 500, errorJson(e.getMessage()));
         }
@@ -267,70 +271,82 @@ final class OpenAiApiServer {
 
     private void handleStream(HttpExchange exchange, ChatRequest request) throws IOException {
         addCorsHeaders(exchange, "POST, OPTIONS");
-        exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
-        exchange.getResponseHeaders().set("Cache-Control", "no-cache");
-        exchange.getResponseHeaders().set("Connection", "keep-alive");
-        exchange.sendResponseHeaders(200, 0);
-
         String id = "chatcmpl-" + UUID.randomUUID();
         long created = Instant.now().getEpochSecond();
-        try (OutputStream out = exchange.getResponseBody()) {
+        OutputStream out = null;
+        boolean started = false;
+        try {
+            out = openSseStream(exchange);
+            started = true;
+            final OutputStream streamOut = out;
             if (request.hasTools()) {
                 String text = backend.complete(request, null);
                 ToolCallResult toolCall = parseToolCallResult(text);
                 if (toolCall == null) {
                     if (!text.isEmpty()) {
-                        sendSse(out, chunkJson(id, request.model(), created, text, false));
+                        sendSse(streamOut, chunkJson(id, request.model(), created, text, false));
                     }
-                    sendSse(out, chunkJson(id, request.model(), created, "", true));
+                    sendSse(streamOut, chunkJson(id, request.model(), created, "", true));
                 } else {
-                    sendSse(out, toolChunkJson(id, request.model(), created, toolCall, false));
-                    sendSse(out, toolChunkJson(id, request.model(), created, toolCall, true));
+                    sendSse(streamOut, toolChunkJson(id, request.model(), created, toolCall, false));
+                    sendSse(streamOut, toolChunkJson(id, request.model(), created, toolCall, true));
                 }
-                out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-                out.flush();
+                streamOut.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                streamOut.flush();
                 return;
             }
 
             backend.complete(request, delta -> {
                 try {
                     if (!delta.isEmpty()) {
-                        sendSse(out, chunkJson(id, request.model(), created, delta, false));
+                        sendSse(streamOut, chunkJson(id, request.model(), created, delta, false));
                     }
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
             });
-            sendSse(out, chunkJson(id, request.model(), created, "", true));
-            out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-            out.flush();
+            sendSse(streamOut, chunkJson(id, request.model(), created, "", true));
+            streamOut.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+            streamOut.flush();
+        } catch (Main.BardRpcException e) {
+            if (!started || out == null) {
+                sendJson(exchange, 502, errorJson(e.getMessage(), "upstream_error"));
+            } else {
+                sendSse(out, errorSseJson(e.getMessage(), "upstream_error"));
+                out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                out.flush();
+            }
+        } finally {
+            if (out != null) {
+                out.close();
+            }
         }
     }
 
     private void handleResponseStream(HttpExchange exchange, ChatRequest request) throws IOException {
         addCorsHeaders(exchange, "POST, OPTIONS");
-        exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
-        exchange.getResponseHeaders().set("Cache-Control", "no-cache");
-        exchange.getResponseHeaders().set("Connection", "keep-alive");
-        exchange.sendResponseHeaders(200, 0);
-
         String id = "resp_" + UUID.randomUUID().toString().replace("-", "");
         long created = Instant.now().getEpochSecond();
-        try (OutputStream out = exchange.getResponseBody()) {
-            sendSse(out, responseCreatedEvent(id, request.model(), created));
+        OutputStream out = null;
+        boolean started = false;
+        try {
+            out = openSseStream(exchange);
+            started = true;
+            final OutputStream streamOut = out;
+            sendSse(streamOut, responseCreatedEvent(id, request.model(), created));
             if (request.hasTools()) {
                 String text = backend.complete(request, null);
                 ToolCallResult toolCall = parseToolCallResult(text);
                 if (toolCall == null) {
                     if (!text.isEmpty()) {
-                        sendSse(out, responseTextDeltaEvent(id, text));
+                        sendSse(streamOut, responseTextDeltaEvent(id, text));
                     }
-                    sendSse(out, responseCompletedEvent(id, request.model(), created, text));
+                    sendSse(streamOut, responseCompletedEvent(id, request.model(), created, text));
                 } else {
-                    sendSse(out, responseCompletedEvent(id, request.model(), created, toolResponseSummary(toolCall)));
+                    sendSse(streamOut, responseCompletedEvent(id, request.model(), created, toolResponseSummary(toolCall)));
                 }
-                out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-                out.flush();
+                streamOut.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                streamOut.flush();
                 return;
             }
 
@@ -339,16 +355,43 @@ final class OpenAiApiServer {
                 try {
                     if (!delta.isEmpty()) {
                         text.append(delta);
-                        sendSse(out, responseTextDeltaEvent(id, delta));
+                        sendSse(streamOut, responseTextDeltaEvent(id, delta));
                     }
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
             });
-            sendSse(out, responseCompletedEvent(id, request.model(), created, text.toString()));
-            out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-            out.flush();
+            sendSse(streamOut, responseCompletedEvent(id, request.model(), created, text.toString()));
+            streamOut.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+            streamOut.flush();
+        } catch (Main.BardRpcException e) {
+            if (!started || out == null) {
+                sendJson(exchange, 502, errorJson(e.getMessage(), "upstream_error"));
+            } else {
+                sendSse(out, errorSseJson(e.getMessage(), "upstream_error"));
+                out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                out.flush();
+            }
+        } finally {
+            if (out != null) {
+                out.close();
+            }
         }
+    }
+
+    private static OutputStream openSseStream(HttpExchange exchange) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
+        exchange.getResponseHeaders().set("Cache-Control", "no-cache");
+        exchange.getResponseHeaders().set("Connection", "keep-alive");
+        exchange.sendResponseHeaders(200, 0);
+        return exchange.getResponseBody();
+    }
+
+    private static String errorSseJson(String message, String type) {
+        return "{\"type\":\"error\",\"error\":{\"message\":"
+                + SimpleJson.quote(message == null ? "未知错误" : message)
+                + ",\"type\":" + SimpleJson.quote(type == null ? "upstream_error" : type)
+                + "}}";
     }
 
     private static PromptData promptFromMessages(Object messages) {

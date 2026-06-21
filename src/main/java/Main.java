@@ -1647,20 +1647,12 @@ public class Main {
 
                 String prompt = apiPrompt(request, conversation);
                 StringBuilder text = new StringBuilder();
-                try {
-                    sendInternal(config, client, request.model(), prompt, request.images(), ConversationState.stateless(), delta -> {
-                        text.append(delta);
-                        if (deltaSink != null) {
-                            deltaSink.accept(delta);
-                        }
-                });
-                } catch (BardRpcException e) {
-                    String fallback = "Gemini 返回临时 RPC 错误，网关已自动重试但仍未成功，请稍后再试。错误码：" + e.code();
+                sendInternal(config, client, request.model(), prompt, request.images(), ConversationState.stateless(), delta -> {
+                    text.append(delta);
                     if (deltaSink != null) {
-                        deltaSink.accept(fallback);
+                        deltaSink.accept(delta);
                     }
-                    text.append(fallback);
-                }
+                });
                 String answer = text.toString();
                 if (request.explicitSession() && request.messageCount() <= 1) {
                     conversation.appendUser(request.latestPrompt());
@@ -1813,7 +1805,7 @@ public class Main {
         }
     }
 
-    private static final class BardRpcException extends IOException {
+    static final class BardRpcException extends IOException {
         private final String code;
 
         private BardRpcException(String code, String body) {

@@ -670,6 +670,9 @@ createApp({
           continue;
         }
         const json = JSON.parse(data);
+        if (json.type === 'error') {
+          throw new Error(json.error?.message || '请求失败');
+        }
         assistant.content += json.choices?.[0]?.delta?.content || '';
       }
     },
