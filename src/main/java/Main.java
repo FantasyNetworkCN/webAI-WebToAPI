@@ -8,6 +8,7 @@ import okhttp3.Response;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -34,6 +35,7 @@ public class Main {
     private static final String DEFAULT_MODEL = "gemini-3.5-Flash";
     private static final int GEMINI_RPC_MAX_ATTEMPTS = 3;
     private static final Pattern BARD_ERROR_PATTERN = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]");
+    private static final Pattern WINDOWS_ABSOLUTE_PATH_PATTERN = Pattern.compile("^[a-z]:[\\\\/].*");
     private static final Map<String, ModelProfile> MODEL_PROFILES = modelProfiles();
 
     public static void main(String[] args) {
@@ -337,7 +339,7 @@ public class Main {
             if (comma < 0) {
                 throw new IOException("图片 data URL 缺少 base64 内容");
             }
-            return Base64.getDecoder().decode(value.substring(comma + 1));
+            return decodeImageBase64(value.substring(comma + 1), "图片 data URL base64 内容");
         }
         if (value.startsWith("http://") || value.startsWith("https://")) {
             Request request = new Request.Builder()
@@ -351,11 +353,73 @@ public class Main {
                 return response.body().bytes();
             }
         }
+        if (value.startsWith("file:")) {
+            Path fileUriPath = pathFromFileUri(value);
+            if (Files.exists(fileUriPath) && Files.isRegularFile(fileUriPath)) {
+                return Files.readAllBytes(fileUriPath);
+            }
+            throw new IllegalArgumentException("图片文件不存在或不可访问：" + fileUriPath);
+        }
         Path path = Path.of(value);
         if (Files.exists(path) && Files.isRegularFile(path)) {
             return Files.readAllBytes(path);
         }
-        return Base64.getDecoder().decode(value);
+        if (looksLikeLocalImagePath(value)) {
+            throw new IllegalArgumentException("图片文件不存在或不可访问：" + value);
+        }
+        return decodeImageBase64(value, "图片 base64 内容");
+    }
+
+    private static Path pathFromFileUri(String value) {
+        try {
+            return Path.of(URI.create(value));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("图片 file URI 无效：" + value, e);
+        }
+    }
+
+    private static byte[] decodeImageBase64(String raw, String description) {
+        String normalized = raw == null ? "" : raw.trim().replaceAll("\\s+", "");
+        if (normalized.isBlank()) {
+            throw new IllegalArgumentException(description + "为空");
+        }
+        int remainder = normalized.length() % 4;
+        if (remainder == 1) {
+            throw new IllegalArgumentException(description + "长度无效");
+        }
+        if (remainder > 1) {
+            normalized += "=".repeat(4 - remainder);
+        }
+
+        try {
+            if (normalized.indexOf('-') >= 0 || normalized.indexOf('_') >= 0) {
+                return Base64.getUrlDecoder().decode(normalized);
+            }
+            return Base64.getDecoder().decode(normalized);
+        } catch (IllegalArgumentException firstError) {
+            try {
+                return Base64.getUrlDecoder().decode(normalized);
+            } catch (IllegalArgumentException secondError) {
+                IllegalArgumentException error = new IllegalArgumentException(description + "不是有效的 base64/base64url");
+                error.addSuppressed(firstError);
+                error.addSuppressed(secondError);
+                throw error;
+            }
+        }
+    }
+
+    private static boolean looksLikeLocalImagePath(String value) {
+        String lower = value.toLowerCase(Locale.ROOT);
+        return lower.startsWith("/")
+                || lower.startsWith("\\")
+                || lower.startsWith("./")
+                || lower.startsWith("../")
+                || WINDOWS_ABSOLUTE_PATH_PATTERN.matcher(lower).matches()
+                || lower.endsWith(".png")
+                || lower.endsWith(".jpg")
+                || lower.endsWith(".jpeg")
+                || lower.endsWith(".webp")
+                || lower.endsWith(".gif");
     }
 
     private static String uploadGeminiImage(OkHttpClient client, CurlRequest curl, byte[] bytes, String filename) throws IOException {
