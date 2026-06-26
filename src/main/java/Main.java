@@ -181,11 +181,15 @@ public class Main {
         CurlRequest curl = CurlRequest.parse(config.curl);
         curl.prepareForConversation(conversation);
         curl.applyModel(profile);
-        if (!prompt.isBlank() && !prompt.equals(curl.originalPrompt())) {
-            curl.replacePrompt(prompt);
+        ImageUploadResult imageUpload = images == null || images.isEmpty()
+                ? ImageUploadResult.empty()
+                : uploadImages(client, curl, images);
+        String promptToSend = promptWithImageUploadResult(prompt, imageUpload);
+        if (!promptToSend.equals(curl.originalPrompt())) {
+            curl.replacePrompt(promptToSend);
         }
         if (images != null && !images.isEmpty()) {
-            curl.replaceImages(uploadImages(client, curl, images));
+            curl.replaceImages(imageUpload.attachments());
         }
 
         try (Response response = client.newCall(curl.toRequest()).execute()) {
@@ -320,20 +324,81 @@ public class Main {
         return builder.build();
     }
 
-    private static java.util.List<GeminiAttachment> uploadImages(OkHttpClient client,
-                                                                 CurlRequest curl,
-                                                                 java.util.List<OpenAiApiServer.ImageInput> images) throws IOException {
+    private static ImageUploadResult uploadImages(OkHttpClient client,
+                                                 CurlRequest curl,
+                                                 java.util.List<OpenAiApiServer.ImageInput> images) {
         java.util.ArrayList<GeminiAttachment> attachments = new java.util.ArrayList<>();
+        java.util.ArrayList<String> skipped = new java.util.ArrayList<>();
         for (OpenAiApiServer.ImageInput image : images) {
-            byte[] bytes = imageBytes(client, image);
-            String path = uploadGeminiImage(client, curl, bytes, image.filename());
-            attachments.add(new GeminiAttachment(path, image.mimeType(), image.filename()));
+            try {
+                byte[] bytes = imageBytes(client, image);
+                String path = uploadGeminiImage(client, curl, bytes, image.filename());
+                attachments.add(new GeminiAttachment(path, image.mimeType(), image.filename()));
+            } catch (Exception e) {
+                String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                skipped.add(image.filename() + "：" + reason);
+                System.err.println("跳过不可用图片 " + image.filename() + "：" + reason);
+            }
         }
-        return java.util.List.copyOf(attachments);
+        return new ImageUploadResult(java.util.List.copyOf(attachments), java.util.List.copyOf(skipped));
+    }
+
+    private static String promptWithImageUploadResult(String prompt, ImageUploadResult imageUpload) {
+        String base = prompt == null ? "" : prompt;
+        if (imageUpload == null || imageUpload.skippedCount() == 0) {
+            return base.isBlank() ? "请根据用户输入回答。" : base;
+        }
+        String notice = "[系统提示：用户提供了 "
+                + imageUpload.skippedCount()
+                + " 张图片，但服务端无法读取这些图片内容；请不要声称已经看到了图片，直接基于可见文字回答。]";
+        if (base.isBlank()) {
+            return notice;
+        }
+        return base + "\n" + notice;
     }
 
     private static byte[] imageBytes(OkHttpClient client, OpenAiApiServer.ImageInput image) throws IOException {
-        String value = image.url() == null ? "" : image.url().trim();
+        java.util.List<String> sources = image.sources();
+        if (sources == null || sources.isEmpty()) {
+            sources = java.util.List.of(image.url());
+        }
+
+        java.util.ArrayList<String> failures = new java.util.ArrayList<>();
+        IllegalArgumentException invalidFailure = null;
+        IOException ioFailure = null;
+        for (String source : sources) {
+            String value = source == null ? "" : source.trim();
+            if (value.isBlank()) {
+                continue;
+            }
+            try {
+                return imageBytesFromSource(client, value);
+            } catch (IllegalArgumentException e) {
+                invalidFailure = e;
+                failures.add(imageSourceLabel(value) + "：" + e.getMessage());
+            } catch (IOException e) {
+                ioFailure = e;
+                failures.add(imageSourceLabel(value) + "：" + e.getMessage());
+            }
+        }
+
+        String message = failures.isEmpty()
+                ? "图片来源为空"
+                : "无法读取图片，已尝试 " + failures.size() + " 个来源：" + String.join("；", failures)
+                + "。如果图片不在服务端本机，请传入 data URL、base64 或 http(s) URL";
+        if (invalidFailure != null || ioFailure != null) {
+            IllegalArgumentException error = new IllegalArgumentException(
+                    message,
+                    invalidFailure == null ? ioFailure : invalidFailure);
+            if (invalidFailure != null && ioFailure != null) {
+                error.addSuppressed(ioFailure);
+            }
+            throw error;
+        }
+        throw new IllegalArgumentException(message);
+    }
+
+    private static byte[] imageBytesFromSource(OkHttpClient client, String value) throws IOException {
         if (value.startsWith("data:")) {
             int comma = value.indexOf(',');
             if (comma < 0) {
@@ -368,6 +433,22 @@ public class Main {
             throw new IllegalArgumentException("图片文件不存在或不可访问：" + value);
         }
         return decodeImageBase64(value, "图片 base64 内容");
+    }
+
+    private static String imageSourceLabel(String value) {
+        if (value.startsWith("data:")) {
+            return "data URL";
+        }
+        if (value.startsWith("http://") || value.startsWith("https://")) {
+            return "远程 URL";
+        }
+        if (value.startsWith("file:")) {
+            return "file URI";
+        }
+        if (looksLikeLocalImagePath(value)) {
+            return "本地路径 " + value;
+        }
+        return "base64 内容";
     }
 
     private static Path pathFromFileUri(String value) {
@@ -1883,6 +1964,16 @@ public class Main {
     }
 
     private record GeminiAttachment(String path, String mimeType, String filename) {
+    }
+
+    private record ImageUploadResult(java.util.List<GeminiAttachment> attachments, java.util.List<String> skipped) {
+        private static ImageUploadResult empty() {
+            return new ImageUploadResult(java.util.List.of(), java.util.List.of());
+        }
+
+        private int skippedCount() {
+            return skipped == null ? 0 : skipped.size();
+        }
     }
 
     private record GeminiResult(String text, String conversationId, String responseId, String choiceId) {

@@ -1133,36 +1133,120 @@ final class OpenAiApiServer {
     }
 
     private static ImageInput imageInputFromPart(Map<?, ?> map) {
-        Object imageUrl = firstNonNull(map.get("image_url"), map.get("input_image"), map.get("image"), map.get("file"));
-        String url = "";
-        if (imageUrl instanceof Map<?, ?> nested) {
-            url = firstNonBlank(
-                    stringValue(nested.get("url"), ""),
-                    stringValue(nested.get("data"), ""),
-                    stringValue(nested.get("base64"), ""),
-                    stringValue(nested.get("image_url"), ""));
-        } else {
-            url = stringValue(imageUrl, "");
+        java.util.ArrayList<String> sources = new java.util.ArrayList<>();
+        addImageSources(sources, map.get("image_url"));
+        addImageSources(sources, map.get("input_image"));
+        addImageSources(sources, map.get("image"));
+        addImageSources(sources, map.get("file"));
+        addImageSourceFields(sources, map);
+
+        List<String> normalizedSources = normalizeImageSources("", sources);
+        if (normalizedSources.isEmpty()) {
+            return null;
         }
-        if (url.isBlank()) {
-            url = firstNonBlank(
-                    stringValue(map.get("url"), ""),
-                    stringValue(map.get("data"), ""),
-                    stringValue(map.get("base64"), ""));
-        }
+        String url = normalizedSources.get(0);
         if (url.isBlank()) {
             return null;
         }
         String mime = firstNonBlank(
                 stringValue(map.get("mime_type"), ""),
                 stringValue(map.get("mimeType"), ""),
-                mimeFromDataUrl(url),
+                mimeFromDataUrl(firstDataUrl(normalizedSources)),
                 mimeFromFilename(url));
         String filename = firstNonBlank(
                 stringValue(map.get("filename"), ""),
                 stringValue(map.get("name"), ""),
+                stringValue(map.get("file_name"), ""),
+                nestedImageFilename(map),
                 "image_" + shortHash(url) + extensionForMime(mime));
-        return new ImageInput(url, mime, filename);
+        return new ImageInput(url, mime, filename, normalizedSources);
+    }
+
+    private static void addImageSources(java.util.List<String> sources, Object value) {
+        if (value instanceof Map<?, ?> nested) {
+            addImageSourceFields(sources, nested);
+            return;
+        }
+        if (value instanceof List<?> list) {
+            for (Object item : list) {
+                addImageSources(sources, item);
+            }
+            return;
+        }
+        addImageSource(sources, stringValue(value, ""));
+    }
+
+    private static void addImageSourceFields(java.util.List<String> sources, Map<?, ?> map) {
+        addImageSource(sources, stringValue(map.get("url"), ""));
+        addImageSource(sources, stringValue(map.get("image_url"), ""));
+        addImageSource(sources, stringValue(map.get("data"), ""));
+        addImageSource(sources, stringValue(map.get("base64"), ""));
+        addImageSource(sources, stringValue(map.get("file_data"), ""));
+        addImageSource(sources, stringValue(map.get("file_url"), ""));
+        addImageSource(sources, stringValue(map.get("uri"), ""));
+        addImageSource(sources, stringValue(map.get("path"), ""));
+    }
+
+    private static void addImageSource(java.util.List<String> sources, String value) {
+        if (value != null && !value.trim().isBlank()) {
+            sources.add(value.trim());
+        }
+    }
+
+    private static List<String> normalizeImageSources(String primary, List<String> sources) {
+        java.util.ArrayList<String> normalized = new java.util.ArrayList<>();
+        addNormalizedImageSource(normalized, primary);
+        if (sources != null) {
+            for (String source : sources) {
+                addNormalizedImageSource(normalized, source);
+            }
+        }
+        return List.copyOf(normalized);
+    }
+
+    private static void addNormalizedImageSource(java.util.List<String> sources, String value) {
+        if (value == null || value.trim().isBlank()) {
+            return;
+        }
+        String normalized = value.trim();
+        if (!sources.contains(normalized)) {
+            sources.add(normalized);
+        }
+    }
+
+    private static String firstDataUrl(List<String> sources) {
+        for (String source : sources) {
+            if (source != null && source.startsWith("data:")) {
+                return source;
+            }
+        }
+        return "";
+    }
+
+    private static String nestedImageFilename(Map<?, ?> map) {
+        String filename = firstNestedImageFilename(map.get("image_url"));
+        if (!filename.isBlank()) {
+            return filename;
+        }
+        filename = firstNestedImageFilename(map.get("input_image"));
+        if (!filename.isBlank()) {
+            return filename;
+        }
+        filename = firstNestedImageFilename(map.get("image"));
+        if (!filename.isBlank()) {
+            return filename;
+        }
+        return firstNestedImageFilename(map.get("file"));
+    }
+
+    private static String firstNestedImageFilename(Object value) {
+        if (value instanceof Map<?, ?> nested) {
+            return firstNonBlank(
+                    stringValue(nested.get("filename"), ""),
+                    stringValue(nested.get("name"), ""),
+                    stringValue(nested.get("file_name"), ""));
+        }
+        return "";
     }
 
     private static String mimeFromDataUrl(String value) {
@@ -1583,7 +1667,17 @@ final class OpenAiApiServer {
     private record PromptData(String full, String latest, String firstUser, int messageCount, List<ImageInput> images) {
     }
 
-    record ImageInput(String url, String mimeType, String filename) {
+    record ImageInput(String url, String mimeType, String filename, List<String> sources) {
+        ImageInput(String url, String mimeType, String filename) {
+            this(url, mimeType, filename, List.of());
+        }
+
+        ImageInput {
+            url = url == null ? "" : url.trim();
+            mimeType = mimeType == null || mimeType.isBlank() ? mimeFromFilename(filename) : mimeType.trim();
+            filename = filename == null || filename.isBlank() ? "image.png" : filename.trim();
+            sources = normalizeImageSources(url, sources);
+        }
     }
 
     private record ContentParts(String text, List<ImageInput> images) {
