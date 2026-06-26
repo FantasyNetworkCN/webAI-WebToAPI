@@ -333,17 +333,26 @@ final class OpenAiApiServer {
             out = openSseStream(exchange);
             started = true;
             final OutputStream streamOut = out;
-            sendSse(streamOut, responseCreatedEvent(id, request.model(), created));
+            sendResponseSse(streamOut, responseCreatedEvent(id, request.model(), created));
             if (request.hasTools()) {
                 String text = backend.complete(request, null);
                 ToolCallResult toolCall = parseToolCallResult(text);
                 if (toolCall == null) {
+                    String outputId = responseMessageId();
+                    sendResponseSse(streamOut, responseOutputItemAddedEvent(id, outputId));
+                    sendResponseSse(streamOut, responseContentPartAddedEvent(id, outputId));
                     if (!text.isEmpty()) {
-                        sendSse(streamOut, responseTextDeltaEvent(id, text));
+                        sendResponseSse(streamOut, responseTextDeltaEvent(id, text));
                     }
-                    sendSse(streamOut, responseCompletedEvent(id, request.model(), created, text));
+                    sendResponseSse(streamOut, responseTextDoneEvent(id, text));
+                    sendResponseSse(streamOut, responseContentPartDoneEvent(id, outputId, text));
+                    sendResponseSse(streamOut, responseOutputItemDoneEvent(id, outputId, text));
+                    sendResponseSse(streamOut, responseCompletedEvent(id, request.model(), created, outputId, text));
                 } else {
-                    sendSse(streamOut, responseCompletedEvent(id, request.model(), created, toolResponseSummary(toolCall)));
+                    ResponseToolCall responseToolCall = ResponseToolCall.from(toolCall);
+                    sendResponseSse(streamOut, responseOutputToolCallAddedEvent(id, responseToolCall));
+                    sendResponseSse(streamOut, responseOutputToolCallDoneEvent(id, responseToolCall));
+                    sendResponseSse(streamOut, responseCompletedToolCallEvent(id, request.model(), created, responseToolCall));
                 }
                 streamOut.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
                 streamOut.flush();
@@ -351,24 +360,30 @@ final class OpenAiApiServer {
             }
 
             StringBuilder text = new StringBuilder();
+            String outputId = responseMessageId();
+            sendResponseSse(streamOut, responseOutputItemAddedEvent(id, outputId));
+            sendResponseSse(streamOut, responseContentPartAddedEvent(id, outputId));
             backend.complete(request, delta -> {
                 try {
                     if (!delta.isEmpty()) {
                         text.append(delta);
-                        sendSse(streamOut, responseTextDeltaEvent(id, delta));
+                        sendResponseSse(streamOut, responseTextDeltaEvent(id, delta));
                     }
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
             });
-            sendSse(streamOut, responseCompletedEvent(id, request.model(), created, text.toString()));
+            sendResponseSse(streamOut, responseTextDoneEvent(id, text.toString()));
+            sendResponseSse(streamOut, responseContentPartDoneEvent(id, outputId, text.toString()));
+            sendResponseSse(streamOut, responseOutputItemDoneEvent(id, outputId, text.toString()));
+            sendResponseSse(streamOut, responseCompletedEvent(id, request.model(), created, outputId, text.toString()));
             streamOut.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
             streamOut.flush();
         } catch (Main.BardRpcException e) {
             if (!started || out == null) {
                 sendJson(exchange, 502, errorJson(e.getMessage(), "upstream_error"));
             } else {
-                sendSse(out, errorSseJson(e.getMessage(), "upstream_error"));
+                sendResponseSse(out, errorSseJson(e.getMessage(), "upstream_error"));
                 out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
                 out.flush();
             }
@@ -1468,6 +1483,26 @@ final class OpenAiApiServer {
                 + "}";
     }
 
+    private static String responseOutputItemAddedEvent(String responseId, String outputId) {
+        return "{"
+                + "\"type\":\"response.output_item.added\","
+                + "\"response_id\":" + SimpleJson.quote(responseId) + ","
+                + "\"output_index\":0,"
+                + "\"item\":" + responseMessageJson(outputId, "")
+                + "}";
+    }
+
+    private static String responseContentPartAddedEvent(String responseId, String outputId) {
+        return "{"
+                + "\"type\":\"response.content_part.added\","
+                + "\"response_id\":" + SimpleJson.quote(responseId) + ","
+                + "\"item_id\":" + SimpleJson.quote(outputId) + ","
+                + "\"output_index\":0,"
+                + "\"content_index\":0,"
+                + "\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}"
+                + "}";
+    }
+
     private static String responseTextDeltaEvent(String id, String delta) {
         return "{"
                 + "\"type\":\"response.output_text.delta\","
@@ -1478,15 +1513,69 @@ final class OpenAiApiServer {
                 + "}";
     }
 
-    private static String responseCompletedEvent(String id, String model, long created, String text) {
+    private static String responseTextDoneEvent(String id, String text) {
         return "{"
-                + "\"type\":\"response.completed\","
-                + "\"response\":" + responseJsonWithId(id, model, created, text)
+                + "\"type\":\"response.output_text.done\","
+                + "\"response_id\":" + SimpleJson.quote(id) + ","
+                + "\"output_index\":0,"
+                + "\"content_index\":0,"
+                + "\"text\":" + SimpleJson.quote(text)
                 + "}";
     }
 
-    private static String responseJsonWithId(String id, String model, long created, String text) {
-        String outputId = "msg_" + UUID.randomUUID().toString().replace("-", "");
+    private static String responseContentPartDoneEvent(String responseId, String outputId, String text) {
+        return "{"
+                + "\"type\":\"response.content_part.done\","
+                + "\"response_id\":" + SimpleJson.quote(responseId) + ","
+                + "\"item_id\":" + SimpleJson.quote(outputId) + ","
+                + "\"output_index\":0,"
+                + "\"content_index\":0,"
+                + "\"part\":{\"type\":\"output_text\",\"text\":" + SimpleJson.quote(text) + ",\"annotations\":[]}"
+                + "}";
+    }
+
+    private static String responseOutputItemDoneEvent(String responseId, String outputId, String text) {
+        return "{"
+                + "\"type\":\"response.output_item.done\","
+                + "\"response_id\":" + SimpleJson.quote(responseId) + ","
+                + "\"output_index\":0,"
+                + "\"item\":" + responseMessageJson(outputId, text)
+                + "}";
+    }
+
+    private static String responseCompletedEvent(String id, String model, long created, String outputId, String text) {
+        return "{"
+                + "\"type\":\"response.completed\","
+                + "\"response\":" + responseJsonWithId(id, model, created, outputId, text)
+                + "}";
+    }
+
+    private static String responseOutputToolCallAddedEvent(String responseId, ResponseToolCall call) {
+        return "{"
+                + "\"type\":\"response.output_item.added\","
+                + "\"response_id\":" + SimpleJson.quote(responseId) + ","
+                + "\"output_index\":0,"
+                + "\"item\":" + responseToolCallJson(call)
+                + "}";
+    }
+
+    private static String responseOutputToolCallDoneEvent(String responseId, ResponseToolCall call) {
+        return "{"
+                + "\"type\":\"response.output_item.done\","
+                + "\"response_id\":" + SimpleJson.quote(responseId) + ","
+                + "\"output_index\":0,"
+                + "\"item\":" + responseToolCallJson(call)
+                + "}";
+    }
+
+    private static String responseCompletedToolCallEvent(String id, String model, long created, ResponseToolCall call) {
+        return "{"
+                + "\"type\":\"response.completed\","
+                + "\"response\":" + responseToolCallJsonWithId(id, model, created, call)
+                + "}";
+    }
+
+    private static String responseJsonWithId(String id, String model, long created, String outputId, String text) {
         return "{"
                 + "\"id\":" + SimpleJson.quote(id) + ","
                 + "\"object\":\"response\","
@@ -1501,15 +1590,44 @@ final class OpenAiApiServer {
                 + "}";
     }
 
-    private static String responseToolCallJson(ToolCallResult call) {
+    private static String responseToolCallJsonWithId(String id, String model, long created, ResponseToolCall call) {
         return "{"
-                + "\"id\":" + SimpleJson.quote("fc_" + UUID.randomUUID().toString().replace("-", "")) + ","
+                + "\"id\":" + SimpleJson.quote(id) + ","
+                + "\"object\":\"response\","
+                + "\"created_at\":" + created + ","
+                + "\"status\":\"completed\","
+                + "\"model\":" + SimpleJson.quote(model) + ","
+                + "\"output_text\":\"\","
+                + "\"output\":[" + responseToolCallJson(call) + "],"
+                + "\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}"
+                + "}";
+    }
+
+    private static String responseMessageJson(String outputId, String text) {
+        return "{"
+                + "\"id\":" + SimpleJson.quote(outputId)
+                + ",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":"
+                + SimpleJson.quote(text) + ",\"annotations\":[]}]"
+                + "}";
+    }
+
+    private static String responseMessageId() {
+        return "msg_" + UUID.randomUUID().toString().replace("-", "");
+    }
+
+    private static String responseToolCallJson(ResponseToolCall call) {
+        return "{"
+                + "\"id\":" + SimpleJson.quote(call.id()) + ","
                 + "\"type\":\"function_call\","
                 + "\"status\":\"completed\","
-                + "\"call_id\":" + SimpleJson.quote("call_" + UUID.randomUUID().toString().replace("-", "")) + ","
+                + "\"call_id\":" + SimpleJson.quote(call.callId()) + ","
                 + "\"name\":" + SimpleJson.quote(call.name()) + ","
                 + "\"arguments\":" + SimpleJson.quote(call.argumentsJson())
                 + "}";
+    }
+
+    private static String responseToolCallJson(ToolCallResult call) {
+        return responseToolCallJson(ResponseToolCall.from(call));
     }
 
     private static String toolResponseSummary(ToolCallResult call) {
@@ -1529,6 +1647,27 @@ final class OpenAiApiServer {
     private static void sendSse(OutputStream out, String json) throws IOException {
         out.write(("data: " + json + "\n\n").getBytes(StandardCharsets.UTF_8));
         out.flush();
+    }
+
+    private static void sendResponseSse(OutputStream out, String json) throws IOException {
+        String type = eventType(json);
+        if (type.isBlank()) {
+            sendSse(out, json);
+            return;
+        }
+        out.write(("event: " + type + "\n" + "data: " + json + "\n\n").getBytes(StandardCharsets.UTF_8));
+        out.flush();
+    }
+
+    private static String eventType(String json) {
+        try {
+            Object parsed = SimpleJson.parse(json);
+            if (parsed instanceof Map<?, ?> map) {
+                return stringValue(map.get("type"), "");
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
     }
 
     private static boolean isMethod(HttpExchange exchange, String method) {
@@ -1687,5 +1826,12 @@ final class OpenAiApiServer {
     }
 
     private record ToolCallResult(String name, String argumentsJson) {
+    }
+
+    private record ResponseToolCall(String id, String callId, String name, String argumentsJson) {
+        private static ResponseToolCall from(ToolCallResult call) {
+            String suffix = UUID.randomUUID().toString().replace("-", "");
+            return new ResponseToolCall("fc_" + suffix, "call_" + suffix, call.name(), call.argumentsJson());
+        }
     }
 }

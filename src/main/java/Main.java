@@ -1823,6 +1823,7 @@ public class Main {
         private static String isolatedPrompt(String transcript) {
             return "当前对话正在通过 OpenAI 兼容网关回答。如果用户让你生成图片请你正常生成。图片生成请不要使用任何工具\n"
                     + "下面的“当前会话上下文”是唯一允许使用的上下文。\n"
+                    + "请你记住，如有需要必须使用工具，图片生成除外。尤其是运行在agent中必须高强度依赖于工具的使用\n"
                     + "当前会话上下文：\n"
                     + transcript;
         }
