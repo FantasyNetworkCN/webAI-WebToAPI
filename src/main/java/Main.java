@@ -1,5 +1,6 @@
 import okhttp3.HttpUrl;
 import okhttp3.MediaType;
+import okhttp3.MultipartBody;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
@@ -39,6 +40,8 @@ public class Main {
     private static final int GEMINI_RPC_MAX_ATTEMPTS = 3;
     private static final Pattern BARD_ERROR_PATTERN = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]");
     private static final Pattern WINDOWS_ABSOLUTE_PATH_PATTERN = Pattern.compile("^[a-z]:[\\\\/].*");
+    private static final Pattern UUID_PATTERN = Pattern.compile(
+            "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}");
     private static final Map<String, ModelProfile> MODEL_PROFILES = modelProfiles();
 
     public static void main(String[] args) {
@@ -228,12 +231,9 @@ public class Main {
         }
 
         ClaudeCurlRequest curl = ClaudeCurlRequest.parse(config.claudeCurl);
-        String promptToSend = promptWithImageUploadResult(prompt, images == null || images.isEmpty()
-                ? ImageUploadResult.empty()
-                : new ImageUploadResult(java.util.List.of(), images.stream()
-                .map(OpenAiApiServer.ImageInput::filename)
-                .toList()));
-        curl.prepare(profile.name(), promptToSend);
+        ClaudeUploadResult uploadResult = uploadClaudeImages(client, curl, images);
+        String promptToSend = promptWithClaudeUploadResult(prompt, uploadResult);
+        curl.prepare(profile.name(), promptToSend, uploadResult.fileUuids());
 
         try (Response response = client.newCall(curl.toRequest()).execute()) {
             if (response.body() == null) {
@@ -246,6 +246,72 @@ public class Main {
             }
             return streamClaudeText(response, deltaSink);
         }
+    }
+
+    private static ClaudeUploadResult uploadClaudeImages(OkHttpClient client, ClaudeCurlRequest completionCurl,
+                                                         java.util.List<OpenAiApiServer.ImageInput> images) {
+        if (images == null || images.isEmpty()) {
+            return ClaudeUploadResult.empty();
+        }
+
+        java.util.ArrayList<String> fileUuids = new java.util.ArrayList<>();
+        java.util.ArrayList<String> skipped = new java.util.ArrayList<>();
+        for (OpenAiApiServer.ImageInput image : images) {
+            try {
+                byte[] bytes = imageBytes(client, image);
+                String fileUuid = uploadClaudeImage(client, completionCurl, bytes, image.mimeType(), image.filename());
+                fileUuids.add(fileUuid);
+            } catch (Exception e) {
+                String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                skipped.add(image.filename() + "：" + reason);
+                System.err.println("跳过不可用 Claude 图片 " + image.filename() + "：" + reason);
+            }
+        }
+        return new ClaudeUploadResult(java.util.List.copyOf(fileUuids), java.util.List.copyOf(skipped));
+    }
+
+    private static String uploadClaudeImage(OkHttpClient client, ClaudeCurlRequest completionCurl,
+                                            byte[] bytes, String mimeType, String filename) throws IOException {
+        try (Response response = client.newCall(completionCurl.toUploadRequest(bytes, mimeType, filename)).execute()) {
+            if (!response.isSuccessful() || response.body() == null) {
+                throw new IOException("Claude 图片上传失败，HTTP 状态=" + response.code()
+                        + "，响应=" + preview(response.body() == null ? "" : response.body().string()));
+            }
+            String body = response.body().string();
+            String fileUuid = claudeFileUuid(body);
+            if (fileUuid.isBlank()) {
+                throw new IOException("Claude 图片上传响应缺少 file_uuid：" + preview(body));
+            }
+            return fileUuid;
+        }
+    }
+
+    private static String promptWithClaudeUploadResult(String prompt, ClaudeUploadResult uploadResult) {
+        String base = prompt == null ? "" : prompt;
+        if (uploadResult == null || uploadResult.skippedCount() == 0) {
+            return base.isBlank() ? "请根据用户输入回答。" : base;
+        }
+        String notice = "[系统提示：用户提供了 "
+                + uploadResult.skippedCount()
+                + " 张图片未能上传；请仅基于已成功上传的图片和可见文字回答。]";
+        if (base.isBlank()) {
+            return notice;
+        }
+        return base + "\n" + notice;
+    }
+
+    private static String claudeFileUuid(String body) {
+        Object parsed = MiniJson.parse(body);
+        String found = findNestedString(parsed, "file_uuid");
+        if (!found.isBlank()) {
+            return found;
+        }
+        found = findNestedString(parsed, "uuid");
+        if (!found.isBlank() && UUID_PATTERN.matcher(found).matches()) {
+            return found;
+        }
+        Matcher matcher = UUID_PATTERN.matcher(body == null ? "" : body);
+        return matcher.find() ? matcher.group() : "";
     }
 
     private static GeminiResult streamClaudeText(Response response, Consumer<String> deltaSink) throws IOException {
@@ -363,6 +429,45 @@ public class Main {
         for (String value : values) {
             if (value != null && !value.isBlank()) {
                 return value;
+            }
+        }
+        return "";
+    }
+
+    private static String findNestedString(Object value, String key) {
+        return findNestedString(value, key, 0);
+    }
+
+    private static String findNestedString(Object value, String key, int depth) {
+        if (value == null || key == null || depth > 8) {
+            return "";
+        }
+        if (value instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                if (key.equalsIgnoreCase(String.valueOf(entry.getKey()))) {
+                    Object entryValue = entry.getValue();
+                    if (entryValue instanceof String text) {
+                        return text;
+                    }
+                    if (entryValue instanceof Number || entryValue instanceof Boolean) {
+                        return String.valueOf(entryValue);
+                    }
+                }
+            }
+            for (Object child : map.values()) {
+                String found = findNestedString(child, key, depth + 1);
+                if (!found.isBlank()) {
+                    return found;
+                }
+            }
+            return "";
+        }
+        if (value instanceof java.util.List<?> list) {
+            for (Object child : list) {
+                String found = findNestedString(child, key, depth + 1);
+                if (!found.isBlank()) {
+                    return found;
+                }
             }
         }
         return "";
@@ -605,6 +710,23 @@ public class Main {
             return "本地路径 " + value;
         }
         return "base64 内容";
+    }
+
+    private static String mimeFromFilename(String filename) {
+        String lower = filename == null ? "" : filename.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".png")) {
+            return "image/png";
+        }
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+            return "image/jpeg";
+        }
+        if (lower.endsWith(".webp")) {
+            return "image/webp";
+        }
+        if (lower.endsWith(".gif")) {
+            return "image/gif";
+        }
+        return "application/octet-stream";
     }
 
     private static Path pathFromFileUri(String value) {
@@ -2036,7 +2158,39 @@ public class Main {
             return request;
         }
 
-        private void prepare(String model, String prompt) throws IOException {
+        private String conversationId() {
+            java.util.List<String> segments = url.pathSegments();
+            for (int i = 0; i + 1 < segments.size(); i++) {
+                if ("chat_conversations".equals(segments.get(i)) || "conversations".equals(segments.get(i))) {
+                    return segments.get(i + 1);
+                }
+            }
+            return "";
+        }
+
+        private HttpUrl uploadUrl() throws IOException {
+            String organizationId = "";
+            String conversationId = "";
+            java.util.List<String> segments = url.pathSegments();
+            for (int i = 0; i + 1 < segments.size(); i++) {
+                String segment = segments.get(i);
+                if ("organizations".equals(segment)) {
+                    organizationId = segments.get(i + 1);
+                } else if ("chat_conversations".equals(segment) || "conversations".equals(segment)) {
+                    conversationId = segments.get(i + 1);
+                }
+            }
+            if (organizationId.isBlank() || conversationId.isBlank()) {
+                throw new IOException("Claude completion URL 缺少 organization 或 conversation id，无法构造图片上传 URL");
+            }
+            return url.newBuilder()
+                    .encodedPath("/api/organizations/" + organizationId
+                            + "/conversations/" + conversationId + "/wiggle/upload-file")
+                    .query(null)
+                    .build();
+        }
+
+        private void prepare(String model, String prompt, java.util.List<String> fileUuids) throws IOException {
             Object parsed = MiniJson.parse(body);
             if (!(parsed instanceof Map<?, ?> rawRoot)) {
                 throw new IOException("Claude curl body 不是有效 JSON");
@@ -2073,6 +2227,7 @@ public class Main {
                 createParamsMap.put("model", model);
             }
 
+            root.put("files", fileUuids == null ? java.util.List.of() : java.util.List.copyOf(fileUuids));
             body = toJson(root);
         }
 
@@ -2087,6 +2242,34 @@ public class Main {
                     builder.header(name, value);
                 }
             });
+            return builder.build();
+        }
+
+        private Request toUploadRequest(byte[] bytes, String mimeType, String filename) throws IOException {
+            String safeFilename = filename == null || filename.isBlank()
+                    ? System.currentTimeMillis() + "_image.png"
+                    : filename;
+            String contentType = firstNonBlank(mimeType, mimeFromFilename(safeFilename), "application/octet-stream");
+            RequestBody fileBody = RequestBody.create(bytes, MediaType.get(contentType));
+            MultipartBody multipart = new MultipartBody.Builder()
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("file", safeFilename, fileBody)
+                    .build();
+
+            Request.Builder builder = new Request.Builder()
+                    .url(uploadUrl())
+                    .post(multipart);
+
+            headers.forEach((name, value) -> {
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (!"host".equals(lower)
+                        && !"content-length".equals(lower)
+                        && !"content-type".equals(lower)
+                        && !"accept".equals(lower)) {
+                    builder.header(name, value);
+                }
+            });
+            builder.header("accept", "*/*");
             return builder.build();
         }
     }
@@ -2299,6 +2482,16 @@ public class Main {
     private record ImageUploadResult(java.util.List<GeminiAttachment> attachments, java.util.List<String> skipped) {
         private static ImageUploadResult empty() {
             return new ImageUploadResult(java.util.List.of(), java.util.List.of());
+        }
+
+        private int skippedCount() {
+            return skipped == null ? 0 : skipped.size();
+        }
+    }
+
+    private record ClaudeUploadResult(java.util.List<String> fileUuids, java.util.List<String> skipped) {
+        private static ClaudeUploadResult empty() {
+            return new ClaudeUploadResult(java.util.List.of(), java.util.List.of());
         }
 
         private int skippedCount() {
