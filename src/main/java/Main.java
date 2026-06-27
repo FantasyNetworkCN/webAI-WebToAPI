@@ -16,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Locale;
@@ -38,6 +39,7 @@ public class Main {
     private static final String DEFAULT_MODEL = "gemini-3.5-Flash";
     private static final String CLAUDE_MODEL = "claude-sonnet-4-6";
     private static final int GEMINI_RPC_MAX_ATTEMPTS = 3;
+    private static final Pattern CLAUDE_RESETS_AT_PATTERN = Pattern.compile("\\\"resetsAt\\\"\\s*:\\s*(\\d+)");
     private static final Pattern BARD_ERROR_PATTERN = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]");
     private static final Pattern WINDOWS_ABSOLUTE_PATH_PATTERN = Pattern.compile("^[a-z]:[\\\\/].*");
     private static final Pattern UUID_PATTERN = Pattern.compile(
@@ -253,6 +255,16 @@ public class Main {
                     }
                     if (!response.isSuccessful()) {
                         String body = response.body().string();
+                        if (response.code() == 429) {
+                            Instant resetAt = claudeRateLimitResetAt(body);
+                            if (resetAt != null && resetAt.isAfter(Instant.now())) {
+                                String error = "Claude 请求限流，HTTP 状态=429，恢复时间=" + resetAt + "，响应=" + preview(body);
+                                config.claudeCookieStore.disableUntil(cookie.id(), resetAt, error);
+                                lastError = new IOException(error);
+                                System.err.println("Claude cookie 触发 429，临时禁用到 " + resetAt + "：" + cookie.label());
+                                continue;
+                            }
+                        }
                         throw new IOException("Claude 请求失败，HTTP 状态=" + response.code()
                                 + "，响应=" + preview(body));
                     }
@@ -267,6 +279,26 @@ public class Main {
             }
         }
         throw lastError == null ? new IOException("Claude cookie 调用失败") : lastError;
+    }
+
+    private static Instant claudeRateLimitResetAt(String body) {
+        Object parsed = MiniJson.parse(body);
+        String resetsAt = findNestedString(parsed, "resetsAt");
+        if (resetsAt.isBlank()) {
+            Matcher matcher = CLAUDE_RESETS_AT_PATTERN.matcher(body == null ? "" : body);
+            if (matcher.find()) {
+                resetsAt = matcher.group(1);
+            }
+        }
+        if (resetsAt.isBlank()) {
+            return null;
+        }
+        try {
+            long epochSeconds = Long.parseLong(resetsAt.trim());
+            return Instant.ofEpochSecond(epochSeconds);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 
     private static ClaudeUploadResult uploadClaudeImages(OkHttpClient client, ClaudeCurlRequest completionCurl,

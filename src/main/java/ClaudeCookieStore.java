@@ -39,17 +39,19 @@ final class ClaudeCookieStore {
             statement.executeUpdate("""
                     create table if not exists claude_cookies (
                         id text primary key,
-                        cookie text not null unique,
-                        org_id text not null,
-                        label text not null,
-                        active integer not null default 1,
-                        failure_count integer not null default 0,
-                        last_error text not null default '',
-                        last_used_at text not null default '',
-                        created_at text not null,
-                        updated_at text not null
-                    )
-                    """);
+	                        cookie text not null unique,
+	                        org_id text not null,
+	                        label text not null,
+	                        active integer not null default 1,
+	                        failure_count integer not null default 0,
+	                        last_error text not null default '',
+	                        last_used_at text not null default '',
+	                        disabled_until text not null default '',
+	                        created_at text not null,
+	                        updated_at text not null
+	                    )
+	                    """);
+            addColumnIfMissing(statement, "claude_cookies", "disabled_until", "text not null default ''");
         } catch (SQLException e) {
             throw new IOException("初始化 Claude cookie SQLite 失败：" + e.getMessage(), e);
         }
@@ -67,13 +69,14 @@ final class ClaudeCookieStore {
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement("""
                      insert into claude_cookies
-                     (id, cookie, org_id, label, active, failure_count, last_error, last_used_at, created_at, updated_at)
-                     values (?, ?, ?, ?, 1, 0, '', '', ?, ?)
+                     (id, cookie, org_id, label, active, failure_count, last_error, last_used_at, disabled_until, created_at, updated_at)
+                     values (?, ?, ?, ?, 1, 0, '', '', '', ?, ?)
                      on conflict(cookie) do update set
                          org_id = excluded.org_id,
                          active = 1,
                          failure_count = 0,
                          last_error = '',
+                         disabled_until = '',
                          updated_at = excluded.updated_at
                      """)) {
             statement.setString(1, id);
@@ -90,9 +93,10 @@ final class ClaudeCookieStore {
     }
 
     synchronized List<CookieRecord> list() throws IOException {
+        clearExpiredDisables();
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement("""
-                     select id, org_id, label, active, failure_count, last_error, last_used_at, created_at, updated_at, cookie
+                     select id, org_id, label, active, failure_count, last_error, last_used_at, disabled_until, created_at, updated_at, cookie
                      from claude_cookies
                      order by updated_at desc
                      """);
@@ -110,7 +114,7 @@ final class ClaudeCookieStore {
     synchronized List<CookieRecord> activeShuffled() throws IOException {
         ArrayList<CookieRecord> records = new ArrayList<>();
         for (CookieRecord record : list()) {
-            if (record.active()) {
+            if (record.active() && !record.isTemporarilyDisabled()) {
                 records.add(record);
             }
         }
@@ -131,6 +135,33 @@ final class ClaudeCookieStore {
         updateUsage(id, false, error == null ? "" : error);
     }
 
+    synchronized void disableUntil(String id, Instant until, String error) {
+        if (until == null || !until.isAfter(Instant.now())) {
+            markFailure(id, error);
+            return;
+        }
+        String now = Instant.now().toString();
+        String safeError = error == null ? "" : error;
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     update claude_cookies
+                     set failure_count = failure_count + 1,
+                         last_error = ?,
+                         last_used_at = ?,
+                         disabled_until = ?,
+                         updated_at = ?
+                     where id = ?
+                     """)) {
+            statement.setString(1, safeError.length() > 500 ? safeError.substring(0, 500) : safeError);
+            statement.setString(2, now);
+            statement.setString(3, until.toString());
+            statement.setString(4, now);
+            statement.setString(5, id);
+            statement.executeUpdate();
+        } catch (SQLException ignored) {
+        }
+    }
+
     synchronized void delete(String id) throws IOException {
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement("delete from claude_cookies where id = ?")) {
@@ -145,7 +176,7 @@ final class ClaudeCookieStore {
         String now = Instant.now().toString();
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement(success
-                     ? "update claude_cookies set failure_count = 0, last_error = '', last_used_at = ?, updated_at = ? where id = ?"
+                     ? "update claude_cookies set failure_count = 0, last_error = '', last_used_at = ?, disabled_until = '', updated_at = ? where id = ?"
                      : "update claude_cookies set failure_count = failure_count + 1, last_error = ?, last_used_at = ?, updated_at = ? where id = ?")) {
             if (success) {
                 statement.setString(1, now);
@@ -165,7 +196,7 @@ final class ClaudeCookieStore {
     private CookieRecord get(String id) throws IOException {
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement("""
-                     select id, org_id, label, active, failure_count, last_error, last_used_at, created_at, updated_at, cookie
+                     select id, org_id, label, active, failure_count, last_error, last_used_at, disabled_until, created_at, updated_at, cookie
                      from claude_cookies where id = ?
                      """)) {
             statement.setString(1, id);
@@ -190,6 +221,7 @@ final class ClaudeCookieStore {
                 result.getInt("failure_count"),
                 result.getString("last_error"),
                 result.getString("last_used_at"),
+                result.getString("disabled_until"),
                 result.getString("created_at"),
                 result.getString("updated_at"),
                 cookie == null ? 0 : cookie.length(),
@@ -200,6 +232,32 @@ final class ClaudeCookieStore {
 
     private Connection connect() throws SQLException {
         return DriverManager.getConnection("jdbc:sqlite:" + databasePath);
+    }
+
+    private static void addColumnIfMissing(Statement statement, String table, String column, String definition) throws SQLException {
+        try {
+            statement.executeUpdate("alter table " + table + " add column " + column + " " + definition);
+        } catch (SQLException e) {
+            String message = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
+            if (!message.contains("duplicate column name")) {
+                throw e;
+            }
+        }
+    }
+
+    private void clearExpiredDisables() {
+        String now = Instant.now().toString();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     update claude_cookies
+                     set disabled_until = '', updated_at = ?
+                     where disabled_until <> '' and disabled_until <= ?
+                     """)) {
+            statement.setString(1, now);
+            statement.setString(2, now);
+            statement.executeUpdate();
+        } catch (SQLException ignored) {
+        }
     }
 
     private static String extractCookie(String raw) {
@@ -368,8 +426,19 @@ final class ClaudeCookieStore {
     }
 
     record CookieRecord(String id, String orgId, String label, boolean active, int failureCount,
-                        String lastError, String lastUsedAt, String createdAt, String updatedAt,
+                        String lastError, String lastUsedAt, String disabledUntil, String createdAt, String updatedAt,
                         int cookieLength, boolean hasSessionKey, String cookie) {
+        boolean isTemporarilyDisabled() {
+            if (disabledUntil == null || disabledUntil.isBlank()) {
+                return false;
+            }
+            try {
+                return Instant.parse(disabledUntil).isAfter(Instant.now());
+            } catch (Exception ignored) {
+                return false;
+            }
+        }
+
         String publicJson() {
             return "{"
                     + "\"id\":" + SimpleJson.quote(id) + ","
@@ -379,6 +448,8 @@ final class ClaudeCookieStore {
                     + "\"failure_count\":" + failureCount + ","
                     + "\"last_error\":" + SimpleJson.quote(lastError == null ? "" : lastError) + ","
                     + "\"last_used_at\":" + SimpleJson.quote(lastUsedAt == null ? "" : lastUsedAt) + ","
+                    + "\"disabled_until\":" + SimpleJson.quote(disabledUntil == null ? "" : disabledUntil) + ","
+                    + "\"temporarily_disabled\":" + isTemporarilyDisabled() + ","
                     + "\"created_at\":" + SimpleJson.quote(createdAt == null ? "" : createdAt) + ","
                     + "\"updated_at\":" + SimpleJson.quote(updatedAt == null ? "" : updatedAt) + ","
                     + "\"cookie_length\":" + cookieLength + ","

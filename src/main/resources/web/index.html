@@ -338,6 +338,11 @@
       box-shadow: var(--shadow);
     }
 
+    .cookie-item.temporarily-disabled {
+      border-color: #fed7aa;
+      background: #fff7ed;
+    }
+
     .log-head, .cookie-head {
       display: flex;
       flex-wrap: wrap;
@@ -346,6 +351,12 @@
       margin-bottom: 8px;
       color: var(--muted);
       font-size: 12px;
+    }
+
+    .pill.warn {
+      border-color: #fdba74;
+      background: #ffedd5;
+      color: #9a3412;
     }
 
     .cookie-form {
@@ -529,14 +540,22 @@
       </div>
       <div v-if="claudeCookies.length === 0" class="empty">还没有 Claude cookie。粘贴 curl 保存后，claude-sonnet-4-6 会随机选择可用 cookie 调用。</div>
       <div v-else class="cookie-list">
-        <article v-for="cookie in claudeCookies" :key="cookie.id" class="cookie-item">
+        <article v-for="cookie in claudeCookies" :key="cookie.id" class="cookie-item" :class="{ 'temporarily-disabled': cookie.temporarily_disabled }">
           <div class="cookie-head">
             <span class="pill">{{ cookie.label }}</span>
             <span class="pill">{{ cookie.org_id }}</span>
-            <span class="pill">{{ cookie.active ? 'active' : 'disabled' }}</span>
+            <span class="pill" :class="{ warn: cookie.temporarily_disabled || !cookie.active }">
+              {{ cookie.temporarily_disabled ? 'rate limited' : (cookie.active ? 'active' : 'disabled') }}
+            </span>
+            <span class="pill warn" v-if="cookie.temporarily_disabled">
+              恢复：{{ formatCookieTime(cookie.disabled_until) }}
+            </span>
             <span class="pill">fail {{ cookie.failure_count }}</span>
             <span class="pill">len {{ cookie.cookie_length }}</span>
             <button class="btn danger" @click="deleteClaudeCookie(cookie.id)" :disabled="loadingClaudeCookies">删除</button>
+          </div>
+          <div class="error" v-if="cookie.temporarily_disabled">
+            此 Cookie 已因 Claude 429 限流临时禁用，恢复时间：{{ formatCookieTime(cookie.disabled_until) }}。到期后会自动重新参与随机调用。
           </div>
           <div class="error" v-if="cookie.last_error">{{ cookie.last_error }}</div>
         </article>
@@ -765,6 +784,16 @@ createApp({
         return 'Gemini';
       }
       return '系统';
+    },
+    formatCookieTime(value) {
+      if (!value) {
+        return '-';
+      }
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return value;
+      }
+      return date.toLocaleString();
     },
     async openLogs() {
       this.view = 'logs';
