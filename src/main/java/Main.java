@@ -340,7 +340,17 @@ public class Main {
         StringBuilder text = new StringBuilder();
 
         while (true) {
-            String line = response.body().source().readUtf8Line();
+            String line;
+            try {
+                line = response.body().source().readUtf8Line();
+            } catch (IOException e) {
+                if (!text.isEmpty()) {
+                    System.err.println("Claude 流读取中断，已收到 "
+                            + text.length() + " 字符，按已完成响应处理：" + e.getMessage());
+                    break;
+                }
+                throw e;
+            }
             if (line == null) {
                 break;
             }
@@ -2343,7 +2353,7 @@ public class Main {
         private static String isolatedPrompt(String transcript) {
             return "当前对话正在通过 OpenAI 兼容网关回答。如果用户让你生成图片请你正常生成。图片生成请不要使用任何工具(如果你不是gemini请忽略图片相关)\n"
                     + "下面的“当前会话上下文”是唯一允许使用的上下文。\n"
-                    + "请你记住，如有需要必须使用工具，图片生成除外。尤其是运行在agent中必须高强度依赖于工具的使用\n"
+                    + "如果上层客户端提供了工具，工具只能由 OpenAI 兼容客户端执行；你不能在 Claude 自己的环境、容器、浏览器、终端或内置工具里执行这些工具。\n"
                     + "当前会话上下文：\n"
                     + transcript;
         }
@@ -2353,10 +2363,13 @@ public class Main {
             if (!request.hasTools()) {
                 return prompt;
             }
-            return prompt + "\n\n可用工具如下：\n"
+            return prompt + "\n\n下面是上层 OpenAI 客户端提供的工具 schema。你当前没有可直接执行的工具，只能决定是否请求客户端调用工具。\n"
+                    + "可用工具如下：\n"
                     + request.toolsText()
-                    + "\n\n如果需要调用工具，必须只输出一个 JSON 对象，不要输出其他文字。格式：\n"
+                    + "\n\n如果需要调用工具，必须只输出一个 JSON 对象，不要输出任何解释、Markdown、代码块或自然语言。格式：\n"
                     + "{\"tool_calls\":[{\"function\":{\"name\":\"工具名\",\"arguments\":{\"参数名\":\"参数值\"}}}]}\n"
+                    + "禁止声明你已经调用了工具；禁止尝试自己执行工具；禁止把工具调用改写成 shell、Python、浏览器或 Claude 内置工具操作。\n"
+                    + "如果不确定参数，先用合理参数请求客户端工具调用，不要自己猜测执行结果。\n"
                     + "如果不需要调用工具，就正常回答。";
         }
     }

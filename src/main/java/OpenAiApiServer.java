@@ -379,9 +379,13 @@ final class OpenAiApiServer {
             if (!started || out == null) {
                 sendJson(exchange, 502, errorJson(e.getMessage(), "upstream_error"));
             } else {
-                sendSse(out, errorSseJson(e.getMessage(), "upstream_error"));
-                out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-                out.flush();
+                safeSendSseErrorDone(out, e.getMessage(), "upstream_error", false);
+            }
+        } catch (Exception e) {
+            if (!started || out == null) {
+                sendJson(exchange, 500, errorJson(e.getMessage()));
+            } else {
+                safeSendSseErrorDone(out, e.getMessage(), "upstream_error", false);
             }
         } finally {
             if (out != null) {
@@ -450,9 +454,13 @@ final class OpenAiApiServer {
             if (!started || out == null) {
                 sendJson(exchange, 502, errorJson(e.getMessage(), "upstream_error"));
             } else {
-                sendResponseSse(out, errorSseJson(e.getMessage(), "upstream_error"));
-                out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-                out.flush();
+                safeSendSseErrorDone(out, e.getMessage(), "upstream_error", true);
+            }
+        } catch (Exception e) {
+            if (!started || out == null) {
+                sendJson(exchange, 500, errorJson(e.getMessage()));
+            } else {
+                safeSendSseErrorDone(out, e.getMessage(), "upstream_error", true);
             }
         } finally {
             if (out != null) {
@@ -474,6 +482,20 @@ final class OpenAiApiServer {
                 + SimpleJson.quote(message == null ? "未知错误" : message)
                 + ",\"type\":" + SimpleJson.quote(type == null ? "upstream_error" : type)
                 + "}}";
+    }
+
+    private static void safeSendSseErrorDone(OutputStream out, String message, String type, boolean responseFormat) {
+        try {
+            if (responseFormat) {
+                sendResponseSse(out, errorSseJson(message, type));
+            } else {
+                sendSse(out, errorSseJson(message, type));
+            }
+            out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+            out.flush();
+        } catch (IOException writeError) {
+            System.err.println("SSE 错误收尾写入失败：" + writeError.getMessage());
+        }
     }
 
     private static PromptData promptFromMessages(Object messages) {
