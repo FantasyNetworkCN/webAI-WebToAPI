@@ -32,7 +32,10 @@ public class Main {
 
     private static final MediaType FORM_MEDIA_TYPE =
             MediaType.get("application/x-www-form-urlencoded;charset=UTF-8");
+    private static final MediaType JSON_MEDIA_TYPE =
+            MediaType.get("application/json;charset=UTF-8");
     private static final String DEFAULT_MODEL = "gemini-3.5-Flash";
+    private static final String CLAUDE_MODEL = "claude-sonnet-4-6";
     private static final int GEMINI_RPC_MAX_ATTEMPTS = 3;
     private static final Pattern BARD_ERROR_PATTERN = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]");
     private static final Pattern WINDOWS_ABSOLUTE_PATH_PATTERN = Pattern.compile("^[a-z]:[\\\\/].*");
@@ -157,6 +160,11 @@ public class Main {
     private static GeminiResult sendInternal(AppConfig config, OkHttpClient client, String model, String prompt,
                                              java.util.List<OpenAiApiServer.ImageInput> images,
                                              ConversationState conversation, Consumer<String> deltaSink) throws IOException {
+        ModelProfile profile = modelProfile(model);
+        if (profile.provider() == ModelProvider.CLAUDE) {
+            return sendClaudeInternal(config, client, profile, prompt, images, deltaSink);
+        }
+
         BardRpcException lastRetryableError = null;
         for (int attempt = 1; attempt <= GEMINI_RPC_MAX_ATTEMPTS; attempt++) {
             try {
@@ -211,8 +219,153 @@ public class Main {
         }
     }
 
+    private static GeminiResult sendClaudeInternal(AppConfig config, OkHttpClient client, ModelProfile profile,
+                                                   String prompt,
+                                                   java.util.List<OpenAiApiServer.ImageInput> images,
+                                                   Consumer<String> deltaSink) throws IOException {
+        if (!AppConfig.hasCurlText(config.claudeCurl)) {
+            throw new IOException("config.yml 里没有 claudeCurl 内容。把完整 Claude completion curl 粘到 claudeCurl: 后面。");
+        }
+
+        ClaudeCurlRequest curl = ClaudeCurlRequest.parse(config.claudeCurl);
+        String promptToSend = promptWithImageUploadResult(prompt, images == null || images.isEmpty()
+                ? ImageUploadResult.empty()
+                : new ImageUploadResult(java.util.List.of(), images.stream()
+                .map(OpenAiApiServer.ImageInput::filename)
+                .toList()));
+        curl.prepare(profile.name(), promptToSend);
+
+        try (Response response = client.newCall(curl.toRequest()).execute()) {
+            if (response.body() == null) {
+                throw new IOException("Claude 返回了空响应");
+            }
+            if (!response.isSuccessful()) {
+                String body = response.body().string();
+                throw new IOException("Claude 请求失败，HTTP 状态=" + response.code()
+                        + "，响应=" + preview(body));
+            }
+            return streamClaudeText(response, deltaSink);
+        }
+    }
+
+    private static GeminiResult streamClaudeText(Response response, Consumer<String> deltaSink) throws IOException {
+        StringBuilder all = new StringBuilder();
+        StringBuilder text = new StringBuilder();
+
+        while (true) {
+            String line = response.body().source().readUtf8Line();
+            if (line == null) {
+                break;
+            }
+
+            all.append(line).append('\n');
+            String trimmed = line.trim();
+            if (!trimmed.startsWith("data:")) {
+                continue;
+            }
+
+            String data = trimmed.substring("data:".length()).trim();
+            if (data.isBlank() || "[DONE]".equals(data)) {
+                continue;
+            }
+
+            String delta = claudeDeltaText(data);
+            if (delta.isBlank()) {
+                continue;
+            }
+            text.append(delta);
+            if (deltaSink != null) {
+                deltaSink.accept(delta);
+            }
+        }
+
+        dumpRawResponseIfRequested(all.toString());
+        if (text.isEmpty()) {
+            String fallback = claudeDeltaText(all.toString());
+            if (!fallback.isBlank()) {
+                text.append(fallback);
+                if (deltaSink != null) {
+                    deltaSink.accept(fallback);
+                }
+            }
+        }
+        if (text.isEmpty()) {
+            throw new IOException("无法从 Claude 响应里解析文本：" + preview(all.toString()));
+        }
+        return new GeminiResult(text.toString(), "", "", "");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String claudeDeltaText(String json) {
+        Object parsed = MiniJson.parse(json);
+        if (!(parsed instanceof Map<?, ?> root)) {
+            return "";
+        }
+
+        String direct = firstNonBlank(
+                stringValue(root.get("completion")),
+                stringValue(root.get("text")),
+                stringValue(root.get("delta")));
+        if (!direct.isBlank()) {
+            return direct;
+        }
+
+        Object delta = root.get("delta");
+        if (delta instanceof Map<?, ?> deltaMap) {
+            direct = firstNonBlank(
+                    stringValue(deltaMap.get("text")),
+                    stringValue(deltaMap.get("completion")));
+            if (!direct.isBlank()) {
+                return direct;
+            }
+        }
+
+        Object message = root.get("message");
+        if (message instanceof Map<?, ?> messageMap) {
+            direct = claudeContentText(messageMap.get("content"));
+            if (!direct.isBlank()) {
+                return direct;
+            }
+        }
+
+        Object contentBlock = root.get("content_block");
+        return claudeContentText(contentBlock);
+    }
+
+    private static String claudeContentText(Object value) {
+        if (value instanceof String text) {
+            return text;
+        }
+        if (value instanceof Map<?, ?> map) {
+            return firstNonBlank(stringValue(map.get("text")), stringValue(map.get("completion")));
+        }
+        if (value instanceof java.util.List<?> list) {
+            StringBuilder out = new StringBuilder();
+            for (Object item : list) {
+                String text = claudeContentText(item);
+                if (!text.isBlank()) {
+                    out.append(text);
+                }
+            }
+            return out.toString();
+        }
+        return "";
+    }
+
     private static boolean isRetryableBardError(BardRpcException e) {
         return e != null && e.code() != null && !e.code().isBlank();
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) {
+            return "";
+        }
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return "";
     }
 
     private static void sleepBeforeRetry(int failedAttempt) throws IOException {
@@ -226,19 +379,22 @@ public class Main {
 
     private static Map<String, ModelProfile> modelProfiles() {
         Map<String, ModelProfile> profiles = new LinkedHashMap<>();
-        profiles.put(DEFAULT_MODEL, new ModelProfile(DEFAULT_MODEL, null, null, null, null));
+        profiles.put(DEFAULT_MODEL, new ModelProfile(DEFAULT_MODEL, ModelProvider.GEMINI, null, null, null, null));
         profiles.put("gemini-3.1-Pro", new ModelProfile(
                 "gemini-3.1-Pro",
+                ModelProvider.GEMINI,
                 "9d8ca3786ebdfbea",
                 3,
                 "2cc5278d23ac6305f37b1e606442fb1e",
                 3));
         profiles.put("gemini-3.1-Flash-Lite", new ModelProfile(
                 "gemini-3.1-Flash-Lite",
+                ModelProvider.GEMINI,
                 "cf41b0e0dd7d53e5",
                 6,
                 "afe4fdb4dcc64484a436c7456c034885",
                 6));
+        profiles.put(CLAUDE_MODEL, new ModelProfile(CLAUDE_MODEL, ModelProvider.CLAUDE, null, null, null, null));
         return java.util.Collections.unmodifiableMap(profiles);
     }
 
@@ -990,6 +1146,42 @@ public class Main {
         return URLEncoder.encode(value, StandardCharsets.UTF_8);
     }
 
+    private static String toJson(Object value) {
+        if (value == null) {
+            return "null";
+        }
+        if (value instanceof String text) {
+            return jsonQuote(text);
+        }
+        if (value instanceof Number || value instanceof Boolean) {
+            return String.valueOf(value);
+        }
+        if (value instanceof Map<?, ?> map) {
+            StringBuilder out = new StringBuilder("{");
+            int count = 0;
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                if (count++ > 0) {
+                    out.append(',');
+                }
+                out.append(jsonQuote(String.valueOf(entry.getKey())))
+                        .append(':')
+                        .append(toJson(entry.getValue()));
+            }
+            return out.append('}').toString();
+        }
+        if (value instanceof java.util.List<?> list) {
+            StringBuilder out = new StringBuilder("[");
+            for (int i = 0; i < list.size(); i++) {
+                if (i > 0) {
+                    out.append(',');
+                }
+                out.append(toJson(list.get(i)));
+            }
+            return out.append(']').toString();
+        }
+        return jsonQuote(String.valueOf(value));
+    }
+
     private static String shellUnescape(String value) {
         StringBuilder out = new StringBuilder(value.length());
         for (int i = 0; i < value.length(); i++) {
@@ -1025,6 +1217,7 @@ public class Main {
         private String openAiHost = "127.0.0.1";
         private int openAiPort = 8080;
         private String curl;
+        private String claudeCurl = "";
 
         private static AppConfig load(Path path) throws IOException {
             if (!Files.exists(path)) {
@@ -1045,6 +1238,7 @@ public class Main {
             config.openAiHost = stringValue(sectionValue(text, "openai", "host"), config.openAiHost);
             config.openAiPort = intValue(sectionValue(text, "openai", "port"), config.openAiPort);
             config.curl = extractCurl(text);
+            config.claudeCurl = extractNamedCurl(text, "claudeCurl");
             if (!hasCurlText(config.curl)) {
                 throw new IOException("config.yml 里没有 curl 内容。把完整 StreamGenerate curl 粘到 curl: 后面。");
             }
@@ -1679,7 +1873,7 @@ public class Main {
                     continue;
                 }
                 if (c == '$' && i + 1 < normalized.length() && normalized.charAt(i + 1) == '\'') {
-                    int end = findClosingQuote(normalized, i + 2, '\'');
+                    int end = findClosingAnsiCQuote(normalized, i + 2);
                     current.append(ansiCUnquote(normalized.substring(i + 2, end)));
                     i = end + 1;
                     continue;
@@ -1691,7 +1885,7 @@ public class Main {
                     continue;
                 }
                 if (c == '"') {
-                    int end = findClosingQuote(normalized, i + 1, '"');
+                    int end = findClosingDoubleQuote(normalized, i + 1);
                     current.append(doubleQuoteUnescape(normalized.substring(i + 1, end)));
                     i = end + 1;
                     continue;
@@ -1713,6 +1907,34 @@ public class Main {
         private static int findClosingQuote(String text, int start, char quote) {
             for (int i = start; i < text.length(); i++) {
                 if (text.charAt(i) == quote) {
+                    return i;
+                }
+            }
+            return text.length();
+        }
+
+        private static int findClosingAnsiCQuote(String text, int start) {
+            for (int i = start; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (c == '\\' && i + 1 < text.length()) {
+                    i++;
+                    continue;
+                }
+                if (c == '\'') {
+                    return i;
+                }
+            }
+            return text.length();
+        }
+
+        private static int findClosingDoubleQuote(String text, int start) {
+            for (int i = start; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (c == '\\' && i + 1 < text.length()) {
+                    i++;
+                    continue;
+                }
+                if (c == '"') {
                     return i;
                 }
             }
@@ -1765,6 +1987,107 @@ public class Main {
                 }
             }
             return out.toString();
+        }
+    }
+
+    private static final class ClaudeCurlRequest {
+        private HttpUrl url;
+        private final Map<String, String> headers = new LinkedHashMap<>();
+        private String cookie = "";
+        private String body = "";
+
+        private static ClaudeCurlRequest parse(String curl) throws IOException {
+            java.util.List<String> tokens = CurlRequest.shellTokens(curl);
+            ClaudeCurlRequest request = new ClaudeCurlRequest();
+            for (int i = 0; i < tokens.size(); i++) {
+                String token = tokens.get(i);
+                if ("curl".equals(token) || "url".equals(token)) {
+                    continue;
+                }
+                if (request.url == null && (token.startsWith("https://") || token.startsWith("http://"))) {
+                    request.url = HttpUrl.get(token);
+                    continue;
+                }
+                if (("-H".equals(token) || "--header".equals(token)) && i + 1 < tokens.size()) {
+                    CurlRequest.addHeader(request.headers, tokens.get(++i));
+                    continue;
+                }
+                if (("-b".equals(token) || "--cookie".equals(token)) && i + 1 < tokens.size()) {
+                    request.cookie = tokens.get(++i);
+                    continue;
+                }
+                if (("-d".equals(token) || "--data".equals(token) || "--data-raw".equals(token)
+                        || "--data-binary".equals(token) || "--data-ascii".equals(token)) && i + 1 < tokens.size()) {
+                    request.body = tokens.get(++i);
+                    continue;
+                }
+                if (token.startsWith("--data-raw=") || token.startsWith("--data=")
+                        || token.startsWith("--data-binary=") || token.startsWith("--data-ascii=")) {
+                    request.body = token.substring(token.indexOf('=') + 1);
+                }
+            }
+
+            if (request.url == null) {
+                throw new IOException("Claude curl 里没有解析到 URL");
+            }
+            request.cookie = CurlRequest.required(request.cookie, "Claude cookie");
+            request.body = CurlRequest.required(request.body, "Claude JSON body");
+            request.headers.put("Cookie", request.cookie);
+            return request;
+        }
+
+        private void prepare(String model, String prompt) throws IOException {
+            Object parsed = MiniJson.parse(body);
+            if (!(parsed instanceof Map<?, ?> rawRoot)) {
+                throw new IOException("Claude curl body 不是有效 JSON");
+            }
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> root = (Map<String, Object>) rawRoot;
+            root.put("prompt", prompt == null ? "" : prompt);
+            root.put("model", model);
+            root.put("timezone", firstNonBlank(stringValue(root.get("timezone")), "Asia/Shanghai"));
+            root.put("locale", firstNonBlank(stringValue(root.get("locale")), "en-US"));
+            root.put("thinking_mode", firstNonBlank(stringValue(root.get("thinking_mode")), "off"));
+            if (root.containsKey("human_message_uuid")) {
+                root.put("human_message_uuid", UUID.randomUUID().toString());
+            }
+
+            Object turnUuids = root.get("turn_message_uuids");
+            if (turnUuids instanceof Map<?, ?> rawTurnUuids) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> turnUuidMap = (Map<String, Object>) rawTurnUuids;
+                turnUuidMap.put("human_message_uuid", UUID.randomUUID().toString());
+                turnUuidMap.put("assistant_message_uuid", UUID.randomUUID().toString());
+            } else {
+                Map<String, Object> turnUuidMap = new LinkedHashMap<>();
+                turnUuidMap.put("human_message_uuid", UUID.randomUUID().toString());
+                turnUuidMap.put("assistant_message_uuid", UUID.randomUUID().toString());
+                root.put("turn_message_uuids", turnUuidMap);
+            }
+
+            Object createParams = root.get("create_conversation_params");
+            if (createParams instanceof Map<?, ?> rawCreateParams) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> createParamsMap = (Map<String, Object>) rawCreateParams;
+                createParamsMap.put("model", model);
+            }
+
+            body = toJson(root);
+        }
+
+        private Request toRequest() {
+            Request.Builder builder = new Request.Builder()
+                    .url(url)
+                    .post(RequestBody.create(body, JSON_MEDIA_TYPE));
+
+            headers.forEach((name, value) -> {
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (!"host".equals(lower) && !"content-length".equals(lower)) {
+                    builder.header(name, value);
+                }
+            });
+            return builder.build();
         }
     }
 
@@ -1961,7 +2284,13 @@ public class Main {
         }
     }
 
-    private record ModelProfile(String name, String headerToken, Integer headerMode, String requestHash, Integer tailMode) {
+    private enum ModelProvider {
+        GEMINI,
+        CLAUDE
+    }
+
+    private record ModelProfile(String name, ModelProvider provider, String headerToken, Integer headerMode,
+                                String requestHash, Integer tailMode) {
     }
 
     private record GeminiAttachment(String path, String mimeType, String filename) {

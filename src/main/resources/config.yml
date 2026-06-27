@@ -11,6 +11,10 @@ openai:
   host: 0.0.0.0
   port: 11434
 
+# 把完整的 Claude completion curl 粘到下一行。
+# 使用 claude-sonnet-4-6 时必须配置；不需要按 YAML 缩进。
+claudeCurl:
+
 # 把完整的 StreamGenerate curl 粘到下一行。
 # 不需要按 YAML 缩进。
 curl: curl 'https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=boq_assistant-bard-web-server_20260616.21_p0&f.sid=-6534691612186764417&hl=zh-CN&_reqid=11867356&rt=c' \
