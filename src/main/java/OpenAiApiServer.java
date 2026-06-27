@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -27,15 +28,18 @@ final class OpenAiApiServer {
     private final List<String> models;
     private final String defaultModel;
     private final ChatBackend backend;
+    private final ClaudeCookieStore claudeCookieStore;
     private HttpServer server;
     private ExecutorService executor;
 
-    OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend) {
+    OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
+                    ClaudeCookieStore claudeCookieStore) {
         this.host = host;
         this.port = port;
         this.defaultModel = defaultModel == null || defaultModel.isBlank() ? "Gemini-web" : defaultModel;
         this.models = models == null || models.isEmpty() ? List.of(this.defaultModel) : List.copyOf(models);
         this.backend = backend;
+        this.claudeCookieStore = claudeCookieStore;
     }
 
     void start() throws IOException {
@@ -44,6 +48,7 @@ final class OpenAiApiServer {
         server.createContext("/v1/chat/completions", this::handleChatCompletions);
         server.createContext("/v1/models", this::handleModels);
         server.createContext("/debug/openai-logs", this::handleOpenAiLogs);
+        server.createContext("/debug/claude-cookies", this::handleClaudeCookies);
         server.createContext("/", this::handleStatic);
         executor = Executors.newCachedThreadPool();
         server.setExecutor(executor);
@@ -113,6 +118,68 @@ final class OpenAiApiServer {
         }
         json.append("]}");
         sendJson(exchange, 200, json.toString());
+    }
+
+    private void handleClaudeCookies(HttpExchange exchange) throws IOException {
+        addCorsHeaders(exchange, "GET, POST, DELETE, OPTIONS");
+        if (handleCorsPreflight(exchange)) {
+            return;
+        }
+        if (claudeCookieStore == null) {
+            sendJson(exchange, 500, errorJson("Claude cookie 存储未初始化"));
+            return;
+        }
+
+        try {
+            if (isMethod(exchange, "GET")) {
+                sendJson(exchange, 200, claudeCookieListJson());
+                return;
+            }
+            if (isMethod(exchange, "POST")) {
+                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                Object parsed = SimpleJson.parse(body);
+                String raw = "";
+                if (parsed instanceof Map<?, ?> map) {
+                    raw = stringValue(map.get("curl"), "");
+                    if (raw.isBlank()) {
+                        raw = stringValue(map.get("cookie"), "");
+                    }
+                }
+                if (raw.isBlank()) {
+                    raw = body;
+                }
+                ClaudeCookieStore.CookieRecord record = claudeCookieStore.addFromCurl(raw);
+                sendJson(exchange, 200, "{\"ok\":true,\"cookie\":" + record.publicJson() + "}");
+                return;
+            }
+            if (isMethod(exchange, "DELETE")) {
+                String id = queryValue(exchange.getRequestURI().getRawQuery(), "id");
+                if (id == null || id.isBlank()) {
+                    sendJson(exchange, 400, errorJson("缺少 id", "invalid_request_error"));
+                    return;
+                }
+                claudeCookieStore.delete(id);
+                sendJson(exchange, 200, "{\"ok\":true}");
+                return;
+            }
+            sendMethodNotAllowed(exchange, "GET, POST, DELETE, OPTIONS");
+        } catch (IllegalArgumentException e) {
+            sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
+        } catch (Exception e) {
+            sendJson(exchange, 500, errorJson(e.getMessage()));
+        }
+    }
+
+    private String claudeCookieListJson() throws IOException {
+        List<ClaudeCookieStore.CookieRecord> records = claudeCookieStore.list();
+        StringBuilder out = new StringBuilder("{\"data\":[");
+        for (int i = 0; i < records.size(); i++) {
+            if (i > 0) {
+                out.append(',');
+            }
+            out.append(records.get(i).publicJson());
+        }
+        return out.append("]}").toString();
     }
 
     private void handleStatic(HttpExchange exchange) throws IOException {
@@ -1086,6 +1153,21 @@ final class OpenAiApiServer {
             }
         }
         return fallback;
+    }
+
+    private static String queryValue(String rawQuery, String name) {
+        if (rawQuery == null || rawQuery.isBlank()) {
+            return "";
+        }
+        for (String pair : rawQuery.split("&")) {
+            int equals = pair.indexOf('=');
+            String key = equals < 0 ? pair : pair.substring(0, equals);
+            if (!name.equals(URLDecoder.decode(key, StandardCharsets.UTF_8))) {
+                continue;
+            }
+            return equals < 0 ? "" : URLDecoder.decode(pair.substring(equals + 1), StandardCharsets.UTF_8);
+        }
+        return "";
     }
 
     private static ContentParts contentParts(Object content) {

@@ -312,12 +312,12 @@
       max-height: 180px;
     }
 
-    .logs {
+    .logs, .cookies {
       overflow: auto;
       padding: 22px;
     }
 
-    .log-toolbar {
+    .log-toolbar, .cookie-toolbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -325,12 +325,12 @@
       margin-bottom: 14px;
     }
 
-    .log-list {
+    .log-list, .cookie-list {
       display: grid;
       gap: 10px;
     }
 
-    .log-item {
+    .log-item, .cookie-item {
       border: 1px solid var(--line);
       background: #fff;
       border-radius: 8px;
@@ -338,13 +338,31 @@
       box-shadow: var(--shadow);
     }
 
-    .log-head {
+    .log-head, .cookie-head {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
       align-items: center;
       margin-bottom: 8px;
       color: var(--muted);
+      font-size: 12px;
+    }
+
+    .cookie-form {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 14px;
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 8px;
+      padding: 12px;
+      box-shadow: var(--shadow);
+    }
+
+    .cookie-form textarea {
+      min-height: 140px;
+      max-height: 260px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 12px;
     }
 
@@ -402,7 +420,7 @@
         padding: 12px 16px;
       }
 
-      .messages, .logs {
+      .messages, .logs, .cookies {
         padding: 16px;
       }
 
@@ -457,12 +475,13 @@
   <main class="main">
     <header class="topbar">
       <div class="topbar-title">
-        <strong>{{ view === 'chat' ? '聊天' : '请求日志' }}</strong>
+        <strong>{{ title }}</strong>
         <span>{{ subtitle }}</span>
       </div>
       <div class="tabs">
         <button class="tab" :class="{ active: view === 'chat' }" @click="view = 'chat'">聊天</button>
         <button class="tab" :class="{ active: view === 'logs' }" @click="openLogs">日志</button>
+        <button class="tab" :class="{ active: view === 'cookies' }" @click="openCookies">Claude Cookie</button>
       </div>
     </header>
 
@@ -479,7 +498,7 @@
       </article>
     </section>
 
-    <section v-else class="logs">
+    <section v-else-if="view === 'logs'" class="logs">
       <div class="log-toolbar">
         <button class="btn" @click="loadLogs" :disabled="loadingLogs">刷新日志</button>
         <span class="pill">{{ logs.length }} 条</span>
@@ -494,6 +513,32 @@
             <span class="pill">{{ log.session_key_hash || '-' }}</span>
           </div>
           <pre class="log-body">{{ pretty(log) }}</pre>
+        </article>
+      </div>
+    </section>
+
+    <section v-else class="cookies">
+      <div class="cookie-form">
+        <textarea v-model="claudeCurlInput" placeholder="粘贴 Claude completion curl，服务端只会提取 cookie 并存入 SQLite"></textarea>
+        <div class="cookie-toolbar">
+          <button class="btn primary" @click="saveClaudeCookie" :disabled="savingClaudeCookie || !claudeCurlInput.trim()">
+            {{ savingClaudeCookie ? '保存中' : '保存 Cookie' }}
+          </button>
+          <button class="btn" @click="loadClaudeCookies" :disabled="loadingClaudeCookies">刷新</button>
+        </div>
+      </div>
+      <div v-if="claudeCookies.length === 0" class="empty">还没有 Claude cookie。粘贴 curl 保存后，claude-sonnet-4-6 会随机选择可用 cookie 调用。</div>
+      <div v-else class="cookie-list">
+        <article v-for="cookie in claudeCookies" :key="cookie.id" class="cookie-item">
+          <div class="cookie-head">
+            <span class="pill">{{ cookie.label }}</span>
+            <span class="pill">{{ cookie.org_id }}</span>
+            <span class="pill">{{ cookie.active ? 'active' : 'disabled' }}</span>
+            <span class="pill">fail {{ cookie.failure_count }}</span>
+            <span class="pill">len {{ cookie.cookie_length }}</span>
+            <button class="btn danger" @click="deleteClaudeCookie(cookie.id)" :disabled="loadingClaudeCookies">删除</button>
+          </div>
+          <div class="error" v-if="cookie.last_error">{{ cookie.last_error }}</div>
         </article>
       </div>
     </section>
@@ -523,6 +568,8 @@ createApp({
       online: false,
       loadingModels: false,
       loadingLogs: false,
+      loadingClaudeCookies: false,
+      savingClaudeCookie: false,
       sending: false,
       stream: true,
       view: 'chat',
@@ -531,15 +578,29 @@ createApp({
       sessionId: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
       systemPrompt: '',
       draft: '',
+      claudeCurlInput: '',
       messages: [],
       logs: [],
+      claudeCookies: [],
       error: ''
     };
   },
   computed: {
+    title() {
+      if (this.view === 'logs') {
+        return '请求日志';
+      }
+      if (this.view === 'cookies') {
+        return 'Claude Cookie';
+      }
+      return '聊天';
+    },
     subtitle() {
       if (this.view === 'logs') {
         return '本地脱敏日志：logs/openai-requests.jsonl';
+      }
+      if (this.view === 'cookies') {
+        return `${this.claudeCookies.length} 个账号 Cookie`;
       }
       return `${this.selectedModel || '未加载模型'} · ${this.stream ? 'stream' : 'json'} · ${this.sessionId}`;
     }
@@ -708,6 +769,68 @@ createApp({
     async openLogs() {
       this.view = 'logs';
       await this.loadLogs();
+    },
+    async openCookies() {
+      this.view = 'cookies';
+      await this.loadClaudeCookies();
+    },
+    async loadClaudeCookies() {
+      this.loadingClaudeCookies = true;
+      this.error = '';
+      try {
+        const response = await fetch('/debug/claude-cookies');
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data?.error?.message || `Cookie 接口失败：${response.status}`);
+        }
+        this.claudeCookies = data.data || [];
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.loadingClaudeCookies = false;
+      }
+    },
+    async saveClaudeCookie() {
+      if (!this.claudeCurlInput.trim() || this.savingClaudeCookie) {
+        return;
+      }
+      this.savingClaudeCookie = true;
+      this.error = '';
+      try {
+        const response = await fetch('/debug/claude-cookies', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ curl: this.claudeCurlInput })
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          throw new Error(data?.error?.message || `保存失败：${response.status}`);
+        }
+        this.claudeCurlInput = '';
+        await this.loadClaudeCookies();
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.savingClaudeCookie = false;
+      }
+    },
+    async deleteClaudeCookie(id) {
+      this.loadingClaudeCookies = true;
+      this.error = '';
+      try {
+        const response = await fetch(`/debug/claude-cookies?id=${encodeURIComponent(id)}`, {
+          method: 'DELETE'
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          throw new Error(data?.error?.message || `删除失败：${response.status}`);
+        }
+        await this.loadClaudeCookies();
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.loadingClaudeCookies = false;
+      }
     },
     async loadLogs() {
       this.loadingLogs = true;

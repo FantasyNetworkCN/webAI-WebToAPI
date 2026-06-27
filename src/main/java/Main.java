@@ -48,6 +48,8 @@ public class Main {
         try {
             AppConfig config = AppConfig.load(Path.of("config.yml"));
             OkHttpClient client = buildHttpClient(config);
+            ClaudeCookieStore claudeCookieStore = new ClaudeCookieStore(Path.of("data", "claude-cookies.sqlite"));
+            config.claudeCookieStore = claudeCookieStore;
 
             if (args.length > 1 && "--parse-file".equals(args[0])) {
                 GeminiResult result = parseGeminiResultOrThrow(Files.readString(Path.of(args[1])));
@@ -75,7 +77,7 @@ public class Main {
                 return;
             }
 
-            OpenAiApiServer server = startApiServer(config, client);
+            OpenAiApiServer server = startApiServer(config, client, claudeCookieStore);
             try {
                 runLoop(config, client);
             } finally {
@@ -88,7 +90,8 @@ public class Main {
         }
     }
 
-    private static OpenAiApiServer startApiServer(AppConfig config, OkHttpClient client) throws IOException {
+    private static OpenAiApiServer startApiServer(AppConfig config, OkHttpClient client,
+                                                  ClaudeCookieStore claudeCookieStore) throws IOException {
         if (!config.openAiEnabled) {
             System.out.println("OpenAI API 未启用。");
             return null;
@@ -99,7 +102,8 @@ public class Main {
                 config.openAiPort,
                 modelNames(),
                 DEFAULT_MODEL,
-                new ApiChatBackend(config, client));
+                new ApiChatBackend(config, client),
+                claudeCookieStore);
         server.start();
         return server;
     }
@@ -226,26 +230,43 @@ public class Main {
                                                    String prompt,
                                                    java.util.List<OpenAiApiServer.ImageInput> images,
                                                    Consumer<String> deltaSink) throws IOException {
-        if (!AppConfig.hasCurlText(config.claudeCurl)) {
-            throw new IOException("config.yml 里没有 claudeCurl 内容。把完整 Claude completion curl 粘到 claudeCurl: 后面。");
+        if (config.claudeCookieStore == null) {
+            throw new IOException("Claude cookie 存储未初始化");
         }
 
-        ClaudeCurlRequest curl = ClaudeCurlRequest.parse(config.claudeCurl);
-        ClaudeUploadResult uploadResult = uploadClaudeImages(client, curl, images);
-        String promptToSend = promptWithClaudeUploadResult(prompt, uploadResult);
-        curl.prepare(profile.name(), promptToSend, uploadResult.fileUuids());
-
-        try (Response response = client.newCall(curl.toRequest()).execute()) {
-            if (response.body() == null) {
-                throw new IOException("Claude 返回了空响应");
-            }
-            if (!response.isSuccessful()) {
-                String body = response.body().string();
-                throw new IOException("Claude 请求失败，HTTP 状态=" + response.code()
-                        + "，响应=" + preview(body));
-            }
-            return streamClaudeText(response, deltaSink);
+        java.util.List<ClaudeCookieStore.CookieRecord> cookies = config.claudeCookieStore.activeShuffled();
+        if (cookies.isEmpty()) {
+            throw new IOException("没有可用 Claude cookie。请在前端粘贴 Claude curl 添加账号 cookie。");
         }
+
+        IOException lastError = null;
+        for (ClaudeCookieStore.CookieRecord cookie : cookies) {
+            try {
+                ClaudeCurlRequest curl = ClaudeCurlRequest.create(cookie.cookie(), cookie.orgId());
+                ClaudeUploadResult uploadResult = uploadClaudeImages(client, curl, images);
+                String promptToSend = promptWithClaudeUploadResult(prompt, uploadResult);
+                curl.prepare(profile.name(), promptToSend, uploadResult.fileUuids());
+
+                try (Response response = client.newCall(curl.toRequest()).execute()) {
+                    if (response.body() == null) {
+                        throw new IOException("Claude 返回了空响应");
+                    }
+                    if (!response.isSuccessful()) {
+                        String body = response.body().string();
+                        throw new IOException("Claude 请求失败，HTTP 状态=" + response.code()
+                                + "，响应=" + preview(body));
+                    }
+                    GeminiResult result = streamClaudeText(response, deltaSink);
+                    config.claudeCookieStore.markSuccess(cookie.id());
+                    return result;
+                }
+            } catch (IOException e) {
+                lastError = e;
+                config.claudeCookieStore.markFailure(cookie.id(), e.getMessage());
+                System.err.println("Claude cookie 调用失败，切换下一个：" + cookie.label() + "：" + e.getMessage());
+            }
+        }
+        throw lastError == null ? new IOException("Claude cookie 调用失败") : lastError;
     }
 
     private static ClaudeUploadResult uploadClaudeImages(OkHttpClient client, ClaudeCurlRequest completionCurl,
@@ -1339,7 +1360,7 @@ public class Main {
         private String openAiHost = "127.0.0.1";
         private int openAiPort = 8080;
         private String curl;
-        private String claudeCurl = "";
+        private ClaudeCookieStore claudeCookieStore;
 
         private static AppConfig load(Path path) throws IOException {
             if (!Files.exists(path)) {
@@ -1360,7 +1381,6 @@ public class Main {
             config.openAiHost = stringValue(sectionValue(text, "openai", "host"), config.openAiHost);
             config.openAiPort = intValue(sectionValue(text, "openai", "port"), config.openAiPort);
             config.curl = extractCurl(text);
-            config.claudeCurl = extractNamedCurl(text, "claudeCurl");
             if (!hasCurlText(config.curl)) {
                 throw new IOException("config.yml 里没有 curl 内容。把完整 StreamGenerate curl 粘到 curl: 后面。");
             }
@@ -2118,44 +2138,49 @@ public class Main {
         private String cookie = "";
         private String body = "";
 
-        private static ClaudeCurlRequest parse(String curl) throws IOException {
-            java.util.List<String> tokens = CurlRequest.shellTokens(curl);
+        private static ClaudeCurlRequest create(String cookie, String orgId) throws IOException {
             ClaudeCurlRequest request = new ClaudeCurlRequest();
-            for (int i = 0; i < tokens.size(); i++) {
-                String token = tokens.get(i);
-                if ("curl".equals(token) || "url".equals(token)) {
-                    continue;
-                }
-                if (request.url == null && (token.startsWith("https://") || token.startsWith("http://"))) {
-                    request.url = HttpUrl.get(token);
-                    continue;
-                }
-                if (("-H".equals(token) || "--header".equals(token)) && i + 1 < tokens.size()) {
-                    CurlRequest.addHeader(request.headers, tokens.get(++i));
-                    continue;
-                }
-                if (("-b".equals(token) || "--cookie".equals(token)) && i + 1 < tokens.size()) {
-                    request.cookie = tokens.get(++i);
-                    continue;
-                }
-                if (("-d".equals(token) || "--data".equals(token) || "--data-raw".equals(token)
-                        || "--data-binary".equals(token) || "--data-ascii".equals(token)) && i + 1 < tokens.size()) {
-                    request.body = tokens.get(++i);
-                    continue;
-                }
-                if (token.startsWith("--data-raw=") || token.startsWith("--data=")
-                        || token.startsWith("--data-binary=") || token.startsWith("--data-ascii=")) {
-                    request.body = token.substring(token.indexOf('=') + 1);
-                }
+            String organizationId = orgId == null || orgId.isBlank()
+                    ? cookieValue(cookie, "lastActiveOrg")
+                    : orgId;
+            if (organizationId.isBlank()) {
+                throw new IOException("Claude cookie 缺少 lastActiveOrg，无法构造 organization URL");
             }
-
-            if (request.url == null) {
-                throw new IOException("Claude curl 里没有解析到 URL");
+            request.url = new HttpUrl.Builder()
+                    .scheme("https")
+                    .host("claude.ai")
+                    .addPathSegment("api")
+                    .addPathSegment("organizations")
+                    .addPathSegment(organizationId)
+                    .addPathSegment("chat_conversations")
+                    .addPathSegment(UUID.randomUUID().toString())
+                    .addPathSegment("completion")
+                    .build();
+            request.cookie = CurlRequest.required(cookie, "Claude cookie");
+            request.headers.put("accept", "text/event-stream");
+            request.headers.put("accept-language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7");
+            request.headers.put("anthropic-client-platform", "web_claude_ai");
+            String deviceId = cookieValue(cookie, "anthropic-device-id");
+            if (!deviceId.isBlank()) {
+                request.headers.put("anthropic-device-id", deviceId);
             }
-            request.cookie = CurlRequest.required(request.cookie, "Claude cookie");
-            request.body = CurlRequest.required(request.body, "Claude JSON body");
+            request.headers.put("cache-control", "no-cache");
+            request.headers.put("content-type", "application/json");
+            request.headers.put("origin", "https://claude.ai");
+            request.headers.put("pragma", "no-cache");
+            request.headers.put("referer", "https://claude.ai/new");
+            request.headers.put("sec-fetch-dest", "empty");
+            request.headers.put("sec-fetch-mode", "cors");
+            request.headers.put("sec-fetch-site", "same-origin");
+            request.headers.put("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
             request.headers.put("Cookie", request.cookie);
             return request;
+        }
+
+        private static String cookieValue(String cookie, String name) {
+            Pattern pattern = Pattern.compile("(?:^|;\\s*)" + Pattern.quote(name) + "=([^;]+)");
+            Matcher matcher = pattern.matcher(cookie == null ? "" : cookie);
+            return matcher.find() ? matcher.group(1) : "";
         }
 
         private String conversationId() {
@@ -2190,44 +2215,33 @@ public class Main {
                     .build();
         }
 
-        private void prepare(String model, String prompt, java.util.List<String> fileUuids) throws IOException {
-            Object parsed = MiniJson.parse(body);
-            if (!(parsed instanceof Map<?, ?> rawRoot)) {
-                throw new IOException("Claude curl body 不是有效 JSON");
-            }
-
-            @SuppressWarnings("unchecked")
-            Map<String, Object> root = (Map<String, Object>) rawRoot;
+        private void prepare(String model, String prompt, java.util.List<String> fileUuids) {
+            Map<String, Object> root = new LinkedHashMap<>();
             root.put("prompt", prompt == null ? "" : prompt);
+            root.put("timezone", "Asia/Shanghai");
+            root.put("locale", "en-US");
             root.put("model", model);
-            root.put("timezone", firstNonBlank(stringValue(root.get("timezone")), "Asia/Shanghai"));
-            root.put("locale", firstNonBlank(stringValue(root.get("locale")), "en-US"));
-            root.put("thinking_mode", firstNonBlank(stringValue(root.get("thinking_mode")), "off"));
-            if (root.containsKey("human_message_uuid")) {
-                root.put("human_message_uuid", UUID.randomUUID().toString());
-            }
-
-            Object turnUuids = root.get("turn_message_uuids");
-            if (turnUuids instanceof Map<?, ?> rawTurnUuids) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> turnUuidMap = (Map<String, Object>) rawTurnUuids;
-                turnUuidMap.put("human_message_uuid", UUID.randomUUID().toString());
-                turnUuidMap.put("assistant_message_uuid", UUID.randomUUID().toString());
-            } else {
-                Map<String, Object> turnUuidMap = new LinkedHashMap<>();
-                turnUuidMap.put("human_message_uuid", UUID.randomUUID().toString());
-                turnUuidMap.put("assistant_message_uuid", UUID.randomUUID().toString());
-                root.put("turn_message_uuids", turnUuidMap);
-            }
-
-            Object createParams = root.get("create_conversation_params");
-            if (createParams instanceof Map<?, ?> rawCreateParams) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> createParamsMap = (Map<String, Object>) rawCreateParams;
-                createParamsMap.put("model", model);
-            }
-
+            root.put("effort", "max");
+            root.put("thinking_mode", "off");
+            root.put("tools", java.util.List.of());
+            Map<String, Object> turnUuidMap = new LinkedHashMap<>();
+            turnUuidMap.put("human_message_uuid", UUID.randomUUID().toString());
+            turnUuidMap.put("assistant_message_uuid", UUID.randomUUID().toString());
+            root.put("turn_message_uuids", turnUuidMap);
+            root.put("attachments", java.util.List.of());
             root.put("files", fileUuids == null ? java.util.List.of() : java.util.List.copyOf(fileUuids));
+            root.put("sync_sources", java.util.List.of());
+            root.put("rendering_mode", "messages");
+            Map<String, Object> createParamsMap = new LinkedHashMap<>();
+            createParamsMap.put("name", "");
+            createParamsMap.put("model", model);
+            createParamsMap.put("include_conversation_preferences", true);
+            createParamsMap.put("paprika_mode", null);
+            createParamsMap.put("compass_mode", null);
+            createParamsMap.put("tool_search_mode", "auto");
+            createParamsMap.put("is_temporary", false);
+            createParamsMap.put("enabled_imagine", true);
+            root.put("create_conversation_params", createParamsMap);
             body = toJson(root);
         }
 

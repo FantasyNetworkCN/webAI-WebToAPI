@@ -38,4 +38,5 @@ build/
 .idea
 .mvn
 logs
+data/
 /config.yml
