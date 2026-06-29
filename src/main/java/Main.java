@@ -5,6 +5,8 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -25,10 +27,13 @@ import java.util.Objects;
 import java.util.Scanner;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class Main {
 
@@ -50,6 +55,7 @@ public class Main {
         try {
             AppConfig config = AppConfig.load(Path.of("config.yml"));
             OkHttpClient client = buildHttpClient(config);
+            config.geminiCookieProvider = GeminiCookieProvider.create(config);
             ClaudeCookieStore claudeCookieStore = new ClaudeCookieStore(Path.of("data", "claude-cookies.sqlite"));
             config.claudeCookieStore = claudeCookieStore;
 
@@ -64,6 +70,7 @@ public class Main {
 
             if (args.length > 0 && "--no-send".equals(args[0])) {
                 CurlRequest curl = CurlRequest.parse(config.curl);
+                config.refreshGeminiCookie(curl);
                 curl.prepareForConversation(new ConversationState());
                 curl.applyModel(modelProfile(DEFAULT_MODEL));
                 String prompt = joinArgs(args, 1);
@@ -196,6 +203,7 @@ public class Main {
                                                  ConversationState conversation, Consumer<String> deltaSink) throws IOException {
         ModelProfile profile = modelProfile(model);
         CurlRequest curl = CurlRequest.parse(config.curl);
+        config.refreshGeminiCookie(curl);
         curl.prepareForConversation(conversation);
         curl.applyModel(profile);
         ImageUploadResult imageUpload = images == null || images.isEmpty()
@@ -542,6 +550,14 @@ public class Main {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("Gemini 请求重试被中断", e);
+        }
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -1403,6 +1419,16 @@ public class Main {
         private int openAiPort = 8080;
         private String curl;
         private ClaudeCookieStore claudeCookieStore;
+        private GeminiCookieProvider geminiCookieProvider;
+        private boolean geminiCookieEnabled = true;
+        private boolean geminiCookieLaunchChrome = true;
+        private String geminiCookieChromeBinary = "google-chrome";
+        private String geminiCookieUserDataDir =
+                Path.of(System.getProperty("user.home"), ".config", "google-chrome-debug").toString();
+        private String geminiCookieHost = "127.0.0.1";
+        private int geminiCookiePort = 9222;
+        private String geminiCookiePageUrl = "https://gemini.google.com/app";
+        private String geminiCookieUrls = "https://gemini.google.com,https://gemini.google.com/app,https://google.com";
 
         private static AppConfig load(Path path) throws IOException {
             if (!Files.exists(path)) {
@@ -1422,11 +1448,55 @@ public class Main {
             config.openAiEnabled = booleanValue(sectionValue(text, "openai", "enabled"), config.openAiEnabled);
             config.openAiHost = stringValue(sectionValue(text, "openai", "host"), config.openAiHost);
             config.openAiPort = intValue(sectionValue(text, "openai", "port"), config.openAiPort);
+            config.geminiCookieEnabled = booleanValue(
+                    sectionValue(text, "gemini_cookie", "enabled"),
+                    config.geminiCookieEnabled);
+            config.geminiCookieLaunchChrome = booleanValue(
+                    sectionValue(text, "gemini_cookie", "launch_chrome"),
+                    config.geminiCookieLaunchChrome);
+            config.geminiCookieChromeBinary = stringValue(
+                    sectionValue(text, "gemini_cookie", "chrome_binary"),
+                    config.geminiCookieChromeBinary);
+            config.geminiCookieUserDataDir = expandHome(stringValue(
+                    sectionValue(text, "gemini_cookie", "user_data_dir"),
+                    config.geminiCookieUserDataDir));
+            config.geminiCookieHost = stringValue(
+                    sectionValue(text, "gemini_cookie", "debug_host"),
+                    config.geminiCookieHost);
+            config.geminiCookiePort = intValue(
+                    sectionValue(text, "gemini_cookie", "debug_port"),
+                    config.geminiCookiePort);
+            config.geminiCookiePageUrl = stringValue(
+                    sectionValue(text, "gemini_cookie", "page_url"),
+                    config.geminiCookiePageUrl);
+            config.geminiCookieUrls = stringValue(
+                    sectionValue(text, "gemini_cookie", "cookie_urls"),
+                    config.geminiCookieUrls);
             config.curl = extractCurl(text);
             if (!hasCurlText(config.curl)) {
                 throw new IOException("config.yml 里没有 curl 内容。把完整 StreamGenerate curl 粘到 curl: 后面。");
             }
             return config;
+        }
+
+        private void refreshGeminiCookie(CurlRequest curl) throws IOException {
+            if (geminiCookieProvider == null) {
+                return;
+            }
+            geminiCookieProvider.applyTo(curl);
+        }
+
+        private static String expandHome(String value) {
+            if (value == null || value.isBlank()) {
+                return value;
+            }
+            if (value.equals("~")) {
+                return System.getProperty("user.home");
+            }
+            if (value.startsWith("~/")) {
+                return System.getProperty("user.home") + value.substring(1);
+            }
+            return value;
         }
 
         private static String extractCurl(String text) {
@@ -1554,6 +1624,278 @@ public class Main {
         }
     }
 
+    private static final class GeminiCookieProvider {
+        private static final Duration CHROME_START_TIMEOUT = Duration.ofSeconds(12);
+        private static final Duration WEBSOCKET_TIMEOUT = Duration.ofSeconds(10);
+
+        private final OkHttpClient client;
+        private final boolean launchChrome;
+        private final String chromeBinary;
+        private final String userDataDir;
+        private final String host;
+        private final int port;
+        private final String pageUrl;
+        private final java.util.List<String> cookieUrls;
+        private boolean launchAttempted;
+
+        private GeminiCookieProvider(AppConfig config) {
+            this.client = new OkHttpClient.Builder()
+                    .connectTimeout(Duration.ofSeconds(2))
+                    .readTimeout(Duration.ofSeconds(10))
+                    .writeTimeout(Duration.ofSeconds(10))
+                    .proxy(Proxy.NO_PROXY)
+                    .build();
+            this.launchChrome = config.geminiCookieLaunchChrome;
+            this.chromeBinary = config.geminiCookieChromeBinary;
+            this.userDataDir = config.geminiCookieUserDataDir;
+            this.host = config.geminiCookieHost;
+            this.port = config.geminiCookiePort;
+            this.pageUrl = config.geminiCookiePageUrl;
+            this.cookieUrls = parseCookieUrls(config.geminiCookieUrls);
+        }
+
+        private static GeminiCookieProvider create(AppConfig config) {
+            return config.geminiCookieEnabled ? new GeminiCookieProvider(config) : null;
+        }
+
+        private void applyTo(CurlRequest curl) throws IOException {
+            String cookie = fetchCookie();
+            curl.setCookie(cookie);
+        }
+
+        private String fetchCookie() throws IOException {
+            ensureChrome();
+            String wsUrl = geminiWebSocketUrl();
+            String response = sendWebSocketCommand(wsUrl, cookieCommandJson());
+            Object parsed = SimpleJson.parse(response);
+            if (!(parsed instanceof Map<?, ?> map)) {
+                throw new IOException("Chrome DevTools 返回了无法解析的 Cookie 响应");
+            }
+            Object result = map.get("result");
+            if (!(result instanceof Map<?, ?> resultMap)) {
+                throw new IOException("Chrome DevTools Cookie 响应缺少 result：" + preview(response));
+            }
+            Object cookies = resultMap.get("cookies");
+            if (!(cookies instanceof java.util.List<?> cookieList)) {
+                throw new IOException("Chrome DevTools Cookie 响应缺少 cookies：" + preview(response));
+            }
+
+            LinkedHashMap<String, String> dedup = new LinkedHashMap<>();
+            for (Object item : cookieList) {
+                if (!(item instanceof Map<?, ?> cookieMap)) {
+                    continue;
+                }
+                String name = stringObject(cookieMap.get("name"));
+                String value = stringObject(cookieMap.get("value"));
+                if (!name.isBlank()) {
+                    dedup.put(name, value);
+                }
+            }
+
+            StringBuilder out = new StringBuilder();
+            for (Map.Entry<String, String> entry : dedup.entrySet()) {
+                if (out.length() > 0) {
+                    out.append("; ");
+                }
+                out.append(entry.getKey()).append('=').append(entry.getValue());
+            }
+            String cookie = out.toString();
+            if (cookie.isBlank()) {
+                throw new IOException("已连接 Chrome 9222，但 Gemini/Google Cookie 为空。请在拉起的 Chrome 里登录 Gemini。");
+            }
+            return cookie;
+        }
+
+        private void ensureChrome() throws IOException {
+            if (debugEndpointReady()) {
+                return;
+            }
+            if (!launchChrome) {
+                throw new IOException("Chrome DevTools 端口不可用：http://" + host + ":" + port + "/json");
+            }
+
+            launchChrome();
+            long deadline = System.nanoTime() + CHROME_START_TIMEOUT.toNanos();
+            while (System.nanoTime() < deadline) {
+                if (debugEndpointReady()) {
+                    return;
+                }
+                sleepQuietly(250);
+            }
+            throw new IOException("已尝试启动 Chrome，但 DevTools 端口仍不可用：http://" + host + ":" + port + "/json");
+        }
+
+        private boolean debugEndpointReady() {
+            Request request = new Request.Builder()
+                    .url(debugJsonUrl())
+                    .get()
+                    .build();
+            try (Response response = client.newCall(request).execute()) {
+                return response.isSuccessful();
+            } catch (IOException ignored) {
+                return false;
+            }
+        }
+
+        private void launchChrome() throws IOException {
+            if (launchAttempted) {
+                return;
+            }
+            launchAttempted = true;
+            java.util.List<String> command = new java.util.ArrayList<>();
+            command.add(chromeBinary);
+            command.add("--remote-debugging-port=" + port);
+            command.add("--user-data-dir=" + userDataDir);
+            command.add("--remote-allow-origins=*");
+            command.add("--disable-vulkan");
+            if (pageUrl != null && !pageUrl.isBlank()) {
+                command.add(pageUrl);
+            }
+            new ProcessBuilder(command)
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.DISCARD)
+                    .start();
+        }
+
+        private String geminiWebSocketUrl() throws IOException {
+            IOException firstError = null;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try {
+                    String wsUrl = findGeminiWebSocketUrl();
+                    if (!wsUrl.isBlank()) {
+                        return wsUrl;
+                    }
+                } catch (IOException e) {
+                    firstError = e;
+                }
+                if (launchChrome && attempt == 0) {
+                    launchAttempted = false;
+                    launchChrome();
+                    sleepQuietly(1000);
+                }
+            }
+            if (firstError != null) {
+                throw firstError;
+            }
+            throw new IOException("Chrome 9222 中没有找到 Gemini 页面。请在自动拉起的 Chrome 里打开并登录 "
+                    + pageUrl);
+        }
+
+        private String findGeminiWebSocketUrl() throws IOException {
+            Request request = new Request.Builder()
+                    .url(debugJsonUrl())
+                    .get()
+                    .build();
+            try (Response response = client.newCall(request).execute()) {
+                if (!response.isSuccessful() || response.body() == null) {
+                    throw new IOException("读取 Chrome 页面列表失败，HTTP 状态=" + response.code());
+                }
+                Object parsed = SimpleJson.parse(response.body().string());
+                if (!(parsed instanceof java.util.List<?> pages)) {
+                    throw new IOException("Chrome 页面列表格式异常");
+                }
+                for (Object page : pages) {
+                    if (!(page instanceof Map<?, ?> map)) {
+                        continue;
+                    }
+                    String type = stringObject(map.get("type"));
+                    String title = stringObject(map.get("title"));
+                    String url = stringObject(map.get("url"));
+                    String wsUrl = stringObject(map.get("webSocketDebuggerUrl"));
+                    if ("page".equals(type)
+                            && !wsUrl.isBlank()
+                            && (url.contains("gemini.google.com") || title.contains("Gemini"))) {
+                        return wsUrl;
+                    }
+                }
+            }
+            return "";
+        }
+
+        private String sendWebSocketCommand(String wsUrl, String command) throws IOException {
+            CountDownLatch latch = new CountDownLatch(1);
+            AtomicReference<String> message = new AtomicReference<>("");
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Request request = new Request.Builder().url(wsUrl).build();
+            WebSocket ws = client.newWebSocket(request, new WebSocketListener() {
+                @Override
+                public void onOpen(WebSocket webSocket, Response response) {
+                    webSocket.send(command);
+                }
+
+                @Override
+                public void onMessage(WebSocket webSocket, String text) {
+                    Object parsed = SimpleJson.parse(text);
+                    if (parsed instanceof Map<?, ?> map && Objects.equals(map.get("id"), 1L)) {
+                        message.set(text);
+                        webSocket.close(1000, "done");
+                        latch.countDown();
+                    }
+                }
+
+                @Override
+                public void onFailure(WebSocket webSocket, Throwable t, Response response) {
+                    failure.set(t);
+                    latch.countDown();
+                }
+            });
+
+            try {
+                if (!latch.await(WEBSOCKET_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
+                    ws.cancel();
+                    throw new IOException("等待 Chrome DevTools Cookie 响应超时");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                ws.cancel();
+                throw new IOException("等待 Chrome DevTools Cookie 响应被中断", e);
+            }
+            if (failure.get() != null) {
+                throw new IOException("连接 Chrome DevTools WebSocket 失败：" + failure.get().getMessage(), failure.get());
+            }
+            if (message.get().isBlank()) {
+                throw new IOException("Chrome DevTools 没有返回 Cookie 响应");
+            }
+            return message.get();
+        }
+
+        private String cookieCommandJson() {
+            StringBuilder out = new StringBuilder();
+            out.append("{\"id\":1,\"method\":\"Network.getCookies\",\"params\":{\"urls\":[");
+            for (int i = 0; i < cookieUrls.size(); i++) {
+                if (i > 0) {
+                    out.append(',');
+                }
+                out.append(SimpleJson.quote(cookieUrls.get(i)));
+            }
+            return out.append("]}}").toString();
+        }
+
+        private String debugJsonUrl() {
+            return "http://" + host + ":" + port + "/json";
+        }
+
+        private static java.util.List<String> parseCookieUrls(String value) {
+            java.util.ArrayList<String> out = new java.util.ArrayList<>();
+            for (String part : (value == null ? "" : value).split(",")) {
+                String url = part.trim();
+                if (!url.isBlank()) {
+                    out.add(url);
+                }
+            }
+            if (out.isEmpty()) {
+                out.add("https://gemini.google.com");
+                out.add("https://gemini.google.com/app");
+                out.add("https://google.com");
+            }
+            return java.util.List.copyOf(out);
+        }
+
+        private static String stringObject(Object value) {
+            return value == null ? "" : String.valueOf(value);
+        }
+    }
+
     private static final class CurlRequest {
         private HttpUrl url;
         private final Map<String, String> headers = new LinkedHashMap<>();
@@ -1595,11 +1937,21 @@ public class Main {
             if (request.url == null) {
                 throw new IOException("curl 里没有解析到 URL");
             }
-            request.cookie = required(request.cookie, "cookie");
             request.form = required(request.form, "form body");
             request.originalPrompt = readPromptFromForm(request.form);
-            request.headers.put("Cookie", request.cookie);
+            if (!request.cookie.isBlank()) {
+                request.headers.put("Cookie", request.cookie);
+            }
             return request;
+        }
+
+        private void setCookie(String cookie) {
+            this.cookie = cookie == null ? "" : cookie.trim();
+            if (this.cookie.isBlank()) {
+                headers.remove("Cookie");
+            } else {
+                headers.put("Cookie", this.cookie);
+            }
         }
 
         private Request toRequest() {
