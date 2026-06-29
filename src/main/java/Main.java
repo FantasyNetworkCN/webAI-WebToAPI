@@ -1659,14 +1659,20 @@ public class Main {
         }
 
         private void applyTo(CurlRequest curl) throws IOException {
-            String cookie = fetchCookie();
-            curl.setCookie(cookie);
+            GeminiCredentials credentials = fetchCredentials();
+            curl.setCookie(credentials.cookie());
+            curl.setAtToken(credentials.snLm0e());
         }
 
-        private String fetchCookie() throws IOException {
+        private GeminiCredentials fetchCredentials() throws IOException {
             ensureChrome();
             String wsUrl = geminiWebSocketUrl();
-            String response = sendWebSocketCommand(wsUrl, cookieCommandJson());
+            String response = sendWebSocketCommand(wsUrl, cookieCommandJson(), 1);
+            String tokenResponse = sendWebSocketCommand(wsUrl, tokenCommandJson(), 2);
+            String token = snLm0eToken(tokenResponse);
+            if (token.isBlank() || "not_found".equals(token)) {
+                throw new IOException("Cookie 已获取，但页面里没有 SNlM0e。请确认 Chrome 的 Gemini 标签页处于已登录状态。");
+            }
             Object parsed = SimpleJson.parse(response);
             if (!(parsed instanceof Map<?, ?> map)) {
                 throw new IOException("Chrome DevTools 返回了无法解析的 Cookie 响应");
@@ -1703,7 +1709,7 @@ public class Main {
             if (cookie.isBlank()) {
                 throw new IOException("已连接 Chrome 9222，但 Gemini/Google Cookie 为空。请在拉起的 Chrome 里登录 Gemini。");
             }
-            return cookie;
+            return new GeminiCredentials(cookie, token);
         }
 
         private void ensureChrome() throws IOException {
@@ -1812,7 +1818,7 @@ public class Main {
             return "";
         }
 
-        private String sendWebSocketCommand(String wsUrl, String command) throws IOException {
+        private String sendWebSocketCommand(String wsUrl, String command, long expectedId) throws IOException {
             CountDownLatch latch = new CountDownLatch(1);
             AtomicReference<String> message = new AtomicReference<>("");
             AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -1826,7 +1832,7 @@ public class Main {
                 @Override
                 public void onMessage(WebSocket webSocket, String text) {
                     Object parsed = SimpleJson.parse(text);
-                    if (parsed instanceof Map<?, ?> map && Objects.equals(map.get("id"), 1L)) {
+                    if (parsed instanceof Map<?, ?> map && Objects.equals(map.get("id"), expectedId)) {
                         message.set(text);
                         webSocket.close(1000, "done");
                         latch.countDown();
@@ -1871,6 +1877,28 @@ public class Main {
             return out.append("]}}").toString();
         }
 
+        private String tokenCommandJson() {
+            return "{\"id\":2,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":"
+                    + SimpleJson.quote("window.WIZ_global_data && window.WIZ_global_data.SNlM0e ? window.WIZ_global_data.SNlM0e : \"not_found\"")
+                    + "}}";
+        }
+
+        private String snLm0eToken(String response) throws IOException {
+            Object parsed = SimpleJson.parse(response);
+            if (!(parsed instanceof Map<?, ?> map)) {
+                throw new IOException("Chrome DevTools 返回了无法解析的 SNlM0e 响应");
+            }
+            Object result = map.get("result");
+            if (!(result instanceof Map<?, ?> resultMap)) {
+                throw new IOException("Chrome DevTools SNlM0e 响应缺少 result：" + preview(response));
+            }
+            Object nested = resultMap.get("result");
+            if (!(nested instanceof Map<?, ?> nestedMap)) {
+                throw new IOException("Chrome DevTools SNlM0e 响应缺少 result.value：" + preview(response));
+            }
+            return stringObject(nestedMap.get("value"));
+        }
+
         private String debugJsonUrl() {
             return "http://" + host + ":" + port + "/json";
         }
@@ -1893,6 +1921,9 @@ public class Main {
 
         private static String stringObject(Object value) {
             return value == null ? "" : String.valueOf(value);
+        }
+
+        private record GeminiCredentials(String cookie, String snLm0e) {
         }
     }
 
@@ -1952,6 +1983,14 @@ public class Main {
             } else {
                 headers.put("Cookie", this.cookie);
             }
+        }
+
+        private void setAtToken(String token) {
+            String value = token == null ? "" : token.trim();
+            if (value.isBlank()) {
+                return;
+            }
+            form = setFormValue(form, "at", value);
         }
 
         private Request toRequest() {
@@ -2375,6 +2414,31 @@ public class Main {
                 } else {
                     out.append(part);
                 }
+            }
+            return out.toString();
+        }
+
+        private static String setFormValue(String form, String key, String value) {
+            boolean found = false;
+            StringBuilder out = new StringBuilder();
+            for (String part : form.split("&", -1)) {
+                if (!out.isEmpty()) {
+                    out.append('&');
+                }
+
+                int index = part.indexOf('=');
+                if (index > 0 && key.equals(formDecode(part.substring(0, index)))) {
+                    out.append(formEncode(key)).append('=').append(formEncode(value));
+                    found = true;
+                } else {
+                    out.append(part);
+                }
+            }
+            if (!found) {
+                if (!out.isEmpty() && out.charAt(out.length() - 1) != '&') {
+                    out.append('&');
+                }
+                out.append(formEncode(key)).append('=').append(formEncode(value));
             }
             return out.toString();
         }

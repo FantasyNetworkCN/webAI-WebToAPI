@@ -11,10 +11,11 @@ openai:
   host: 0.0.0.0
   port: 11434
 
-# Gemini Cookie 自动获取。
+# Gemini Cookie 与 SNlM0e 自动获取。
 # 程序会自动执行：
 # google-chrome --remote-debugging-port=9222 --user-data-dir="~/.config/google-chrome-debug" --remote-allow-origins="*" --disable-vulkan
-# 然后通过 Chrome DevTools Protocol 从 Gemini 页面读取 Cookie，并覆盖 curl 里的静态 -b Cookie。
+# 然后通过 Chrome DevTools Protocol 从 Gemini 页面读取 Cookie 和 window.WIZ_global_data.SNlM0e，
+# 并覆盖 curl 里的静态 -b Cookie 与 form body 里的 at 参数。
 gemini_cookie:
   enabled: true
   launch_chrome: true
@@ -27,6 +28,7 @@ gemini_cookie:
 
 # 把完整的 StreamGenerate curl 粘到下一行。
 # 不需要按 YAML 缩进；-b Cookie 可以省略，即使保留也会被 gemini_cookie 自动覆盖。
+# --data-raw 里的 at 参数也会自动替换为页面当前 SNlM0e。
 curl: curl 'https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=boq_assistant-bard-web-server_20260616.21_p0&f.sid=-6534691612186764417&hl=zh-CN&_reqid=11867356&rt=c' \
   -H 'accept: */*' \
   -H 'accept-language: zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6,ja-JP;q=0.5,ja;q=0.4' \
