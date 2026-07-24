@@ -41,7 +41,7 @@ public class Main {
             MediaType.get("application/x-www-form-urlencoded;charset=UTF-8");
     private static final MediaType JSON_MEDIA_TYPE =
             MediaType.get("application/json;charset=UTF-8");
-    private static final String DEFAULT_MODEL = "gemini-3.5-Flash";
+    private static final String DEFAULT_MODEL = "gemini-3.6-Flash";
     private static final String CLAUDE_MODEL = "claude-sonnet-4-6";
     private static final int GEMINI_RPC_MAX_ATTEMPTS = 3;
     private static final Pattern CLAUDE_RESETS_AT_PATTERN = Pattern.compile("\\\"resetsAt\\\"\\s*:\\s*(\\d+)");

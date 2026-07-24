@@ -638,7 +638,7 @@ createApp({
         }
         const data = await response.json();
         this.models = (data.data || []).map(item => item.id);
-        this.selectedModel = this.models[0] || 'gemini-3.5-Flash';
+        this.selectedModel = this.models[0] || 'gemini-3.6-Flash';
         this.online = true;
       } catch (err) {
         this.error = err.message || String(err);
