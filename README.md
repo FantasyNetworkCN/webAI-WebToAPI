@@ -163,9 +163,25 @@ docker compose logs webtoapi | tail -100
 NOVNC_PORT=16082 VNC_PORT=15910 docker compose up -d
 ```
 
+如果打开后仍显示文件列表，使用新镜像重新构建：
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+```
+
 ### Gemini 请求失败或提示未登录
 
 通过 noVNC 检查 Chromium 是否仍登录 Gemini。Cookie 失效时重新登录；不要只复制旧 Cookie 到公开环境。
+
+如果 VNC 桌面为空，查看 Chromium 和桌面进程日志：
+
+```bash
+docker compose logs webtoapi | grep -i -E 'chrom|xvfb|supervisor'
+```
+
+容器启动脚本会自动修复数据 volume 权限，Chromium profile 保存在
+`webtoapi-data` volume 中。
 
 ### 代理连接失败
 

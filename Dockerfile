@@ -22,10 +22,14 @@ COPY docker/supervisor/gemini-chrome.conf /etc/supervisor/conf.d/gemini-chrome.c
 COPY docker/supervisor/webtoapi.conf /etc/supervisor/conf.d/webtoapi.conf
 COPY docker/supervisor/desktop.conf /etc/supervisor/conf.d/desktop.conf
 COPY docker/start-vnc.sh /usr/local/bin/start-vnc.sh
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/supervisord.conf /etc/supervisor/supervisord.conf
 
-RUN chmod 0755 /usr/local/bin/start-vnc.sh \
+RUN chmod 0755 /usr/local/bin/start-vnc.sh /usr/local/bin/entrypoint.sh \
+    && if [ -f /usr/share/novnc/vnc.html ]; then \
+         ln -sf vnc.html /usr/share/novnc/index.html; \
+       fi \
     && chown -R webtoapi:webtoapi /app/target /app/data /app/logs
 
 EXPOSE 60000 5910 6082
-ENTRYPOINT ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
