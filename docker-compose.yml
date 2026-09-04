@@ -1,0 +1,40 @@
+services:
+  # One container: Snowluma virtual desktop + regular Chromium + Java API.
+  webtoapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: webai-webtoapi:latest
+    restart: unless-stopped
+    shm_size: 2gb
+    ports:
+      - "${OPENAI_HOST_PORT:-60000}:60000"
+      - "${NOVNC_PORT:-6082}:6082"
+      - "${VNC_PORT:-5910}:5910"
+    environment:
+      VNC_PASSWD: "${VNC_PASSWD:-change-me}"
+      OPENAI_PORT: "60000"
+      PROXY_ENABLED: "${PROXY_ENABLED:-true}"
+      PROXY_TYPE: "${PROXY_TYPE:-http}"
+      PROXY_HOST: "${PROXY_HOST:-host.docker.internal}"
+      PROXY_PORT: "${PROXY_PORT:-7890}"
+      GEMINI_COOKIE_ENABLED: "true"
+      GEMINI_COOKIE_LAUNCH_CHROME: "false"
+      GEMINI_COOKIE_DEBUG_HOST: "127.0.0.1"
+      GEMINI_COOKIE_DEBUG_PORT: "9222"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9222/json >/dev/null && curl -fsS http://127.0.0.1:60000/v1/models >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - webtoapi-data:/app/data
+      - webtoapi-logs:/app/logs
+
+volumes:
+  webtoapi-data:
+  webtoapi-logs:

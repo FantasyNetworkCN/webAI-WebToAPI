@@ -1472,6 +1472,23 @@ public class Main {
             config.geminiCookieUrls = stringValue(
                     sectionValue(text, "gemini_cookie", "cookie_urls"),
                     config.geminiCookieUrls);
+            // Environment overrides make the browser/CDP sidecar configurable without
+            // editing the mounted curl configuration inside a container.
+            config.geminiCookieEnabled = booleanEnv("GEMINI_COOKIE_ENABLED", config.geminiCookieEnabled);
+            config.geminiCookieLaunchChrome = booleanEnv(
+                    "GEMINI_COOKIE_LAUNCH_CHROME", config.geminiCookieLaunchChrome);
+            config.geminiCookieChromeBinary = stringEnv(
+                    "GEMINI_COOKIE_CHROME_BINARY", config.geminiCookieChromeBinary);
+            config.geminiCookieHost = stringEnv("GEMINI_COOKIE_DEBUG_HOST", config.geminiCookieHost);
+            config.geminiCookiePort = intEnv("GEMINI_COOKIE_DEBUG_PORT", config.geminiCookiePort);
+            config.geminiCookiePageUrl = stringEnv("GEMINI_COOKIE_PAGE_URL", config.geminiCookiePageUrl);
+            config.proxyEnabled = booleanEnv("PROXY_ENABLED", config.proxyEnabled);
+            config.proxyType = stringEnv("PROXY_TYPE", config.proxyType);
+            config.proxyHost = stringEnv("PROXY_HOST", config.proxyHost);
+            config.proxyPort = intEnv("PROXY_PORT", config.proxyPort);
+            config.openAiEnabled = booleanEnv("OPENAI_ENABLED", config.openAiEnabled);
+            config.openAiHost = stringEnv("OPENAI_HOST", config.openAiHost);
+            config.openAiPort = intEnv("OPENAI_PORT", config.openAiPort);
             config.curl = extractCurl(text);
             if (!hasCurlText(config.curl)) {
                 throw new IOException("config.yml 里没有 curl 内容。把完整 StreamGenerate curl 粘到 curl: 后面。");
@@ -1597,6 +1614,28 @@ public class Main {
 
         private static int intValue(String value, int fallback) {
             return value == null || value.isBlank() ? fallback : Integer.parseInt(value);
+        }
+
+        private static String stringEnv(String name, String fallback) {
+            String value = System.getenv(name);
+            return value == null || value.isBlank() ? fallback : value.trim();
+        }
+
+        private static boolean booleanEnv(String name, boolean fallback) {
+            String value = System.getenv(name);
+            return value == null || value.isBlank() ? fallback : Boolean.parseBoolean(value.trim());
+        }
+
+        private static int intEnv(String name, int fallback) {
+            String value = System.getenv(name);
+            if (value == null || value.isBlank()) {
+                return fallback;
+            }
+            try {
+                return Integer.parseInt(value.trim());
+            } catch (NumberFormatException ignored) {
+                return fallback;
+            }
         }
 
         private static String sectionValue(String text, String section, String key) {

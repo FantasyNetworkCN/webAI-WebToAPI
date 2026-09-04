@@ -1,0 +1,7 @@
+.git
+.idea
+target
+data
+logs
+config.yml
+*.sqlite
