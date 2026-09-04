@@ -26,10 +26,11 @@ COPY docker/supervisor/webtoapi.conf /etc/supervisor/conf.d/webtoapi.conf
 COPY docker/supervisor/desktop.conf /etc/supervisor/conf.d/desktop.conf
 COPY docker/start-vnc.sh /usr/local/bin/start-vnc.sh
 COPY docker/start-chromium.sh /usr/local/bin/start-chromium.sh
+COPY docker/start-openbox.sh /usr/local/bin/start-openbox.sh
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/supervisord.conf /etc/supervisor/supervisord.conf
 
-RUN chmod 0755 /usr/local/bin/start-vnc.sh /usr/local/bin/start-chromium.sh /usr/local/bin/entrypoint.sh \
+RUN chmod 0755 /usr/local/bin/start-vnc.sh /usr/local/bin/start-chromium.sh /usr/local/bin/start-openbox.sh /usr/local/bin/entrypoint.sh \
     && if [ -f /usr/share/novnc/vnc.html ]; then \
          ln -sf vnc.html /usr/share/novnc/index.html; \
        fi \

@@ -1746,7 +1746,7 @@ public class Main {
             }
             String cookie = out.toString();
             if (cookie.isBlank()) {
-                throw new IOException("已连接 Chrome 9222，但 Gemini/Google Cookie 为空。请在拉起的 Chrome 里登录 Gemini。");
+                throw new IOException("已连接 Chrome " + port + "，但 Gemini/Google Cookie 为空。请在拉起的 Chrome 里登录 Gemini。");
             }
             return new GeminiCredentials(cookie, token);
         }
@@ -1822,7 +1822,7 @@ public class Main {
             if (firstError != null) {
                 throw firstError;
             }
-            throw new IOException("Chrome 9222 中没有找到 Gemini 页面。请在自动拉起的 Chrome 里打开并登录 "
+            throw new IOException("Chrome " + port + " 中没有找到 Gemini 页面。请在自动拉起的 Chrome 里打开并登录 "
                     + pageUrl);
         }
 

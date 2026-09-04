@@ -1,5 +1,5 @@
 services:
-  # One container: Snowluma virtual desktop + regular Chromium + Java API.
+  # One container: virtual desktop + regular Chromium + Java API.
   webtoapi:
     build:
       context: .
@@ -7,25 +7,24 @@ services:
     image: webai-webtoapi:latest
     restart: unless-stopped
     shm_size: 2gb
-    ports:
-      - "${OPENAI_HOST_PORT:-60000}:60000"
-      - "${NOVNC_PORT:-6082}:6082"
-      - "${VNC_PORT:-5910}:5910"
+    # Share the host network so the container can reach a proxy bound to
+    # the host's 127.0.0.1:7890. Service ports are therefore direct host ports.
+    network_mode: host
     environment:
       VNC_PASSWD: "${VNC_PASSWD:-change-me}"
       OPENAI_PORT: "60000"
       PROXY_ENABLED: "${PROXY_ENABLED:-true}"
       PROXY_TYPE: "${PROXY_TYPE:-http}"
-      PROXY_HOST: "${PROXY_HOST:-host.docker.internal}"
+      PROXY_HOST: "${PROXY_HOST:-127.0.0.1}"
       PROXY_PORT: "${PROXY_PORT:-7890}"
       GEMINI_COOKIE_ENABLED: "true"
       GEMINI_COOKIE_LAUNCH_CHROME: "false"
       GEMINI_COOKIE_DEBUG_HOST: "127.0.0.1"
-      GEMINI_COOKIE_DEBUG_PORT: "9222"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      # Host networking makes CDP ports global on the host; keep this project
+      # separate from other browser containers that commonly use 9222.
+      GEMINI_COOKIE_DEBUG_PORT: "19222"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9222/json >/dev/null && curl -fsS http://127.0.0.1:60000/v1/models >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:19222/json >/dev/null && curl -fsS http://127.0.0.1:60000/v1/models >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 30

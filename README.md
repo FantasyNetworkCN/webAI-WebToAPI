@@ -17,6 +17,9 @@ Java 通过 Chromium 的本机 CDP 接口读取 Gemini Cookie 和 `SNlM0e`，然
 - Docker Compose v2（命令为 `docker compose`）
 - 能访问 Gemini 的网络环境；如果需要代理，准备一个 HTTP/SOCKS 代理
 
+当前 Compose 使用 Linux `host` 网络模式，建议在 Linux Docker Engine 上运行。
+容器会直接占用宿主机的 `60000`、`5910`、`6082` 端口。
+
 ## 配置
 
 ### 1. 准备 `config.yml`
@@ -27,9 +30,10 @@ Java 通过 Chromium 的本机 CDP 接口读取 Gemini Cookie 和 `SNlM0e`，然
 
 ### 2. 配置代理（可选）
 
-Compose 默认使用宿主机上的 HTTP 代理 `host.docker.internal:7890`，对应项目配置中的默认值。
+Compose 使用 host 网络，默认直接访问宿主机的 HTTP 代理
+`127.0.0.1:7890`。
 
-没有代理时：
+没有代理时（Java 和 Chromium 都直连）：
 
 ```bash
 PROXY_ENABLED=false docker compose up -d --build
@@ -38,11 +42,21 @@ PROXY_ENABLED=false docker compose up -d --build
 使用其他代理时：
 
 ```bash
-PROXY_TYPE=http PROXY_HOST=host.docker.internal PROXY_PORT=7890 \
+PROXY_TYPE=http PROXY_HOST=127.0.0.1 PROXY_PORT=7890 \
   docker compose up -d --build
 ```
 
 `PROXY_TYPE` 支持 `http` 和 `socks`。
+
+启用宿主机代理时不要设置 `PROXY_ENABLED=false`。例如：
+
+```bash
+PROXY_ENABLED=true PROXY_HOST=127.0.0.1 PROXY_PORT=7890 \
+  docker compose up -d --build
+```
+
+该代理同时用于 Java 请求和 Chromium 浏览器。由于使用 host 网络，宿主机
+`127.0.0.1` 对容器可见。
 
 ## 启动
 
@@ -105,13 +119,8 @@ curl http://localhost:60000/v1/chat/completions \
   }'
 ```
 
-修改宿主机 API 端口（容器内部仍使用 `60000`）：
-
-```bash
-OPENAI_HOST_PORT=11434 docker compose up -d
-```
-
-此时 API 地址为 `http://localhost:11434`。
+host 网络模式下，服务端口直接占用宿主机端口，不能使用 Compose 的端口映射
+变量。需要改端口时，请同步修改 `config.yml`、supervisor 配置和 Dockerfile。
 
 ## 常用命令
 
@@ -144,7 +153,7 @@ docker compose down -v
 | `60000` | OpenAI 兼容 API |
 | `6082`  | noVNC 网页 |
 | `5910`  | VNC 服务 |
-| `9222`  | Chromium CDP，仅容器内部监听，不对外暴露 |
+| `19222` | Chromium CDP，仅本项目使用，不对外暴露 |
 
 不要把 `6082`、`5910` 暴露到不可信公网；登录完成后建议通过防火墙或反向代理限制访问。
 
@@ -157,11 +166,7 @@ docker compose ps
 docker compose logs webtoapi | tail -100
 ```
 
-确认容器状态为 `Up`，并确认宿主机的 `6082` 端口没有被其他程序占用。也可以修改端口：
-
-```bash
-NOVNC_PORT=16082 VNC_PORT=15910 docker compose up -d
-```
+确认容器状态为 `Up`，并确认宿主机的 `6082` 端口没有被其他程序占用。
 
 如果打开后仍显示文件列表，使用新镜像重新构建：
 
@@ -186,10 +191,10 @@ docker compose logs webtoapi | grep -i -E 'chrom|xvfb|supervisor'
 
 ### 代理连接失败
 
-容器内的 `127.0.0.1` 指向容器自身。如果代理运行在宿主机，不要把 `PROXY_HOST` 设置为 `127.0.0.1`，应使用：
+当前使用 host 网络，容器内的 `127.0.0.1` 就是宿主机回环地址。代理应配置为：
 
 ```bash
-PROXY_HOST=host.docker.internal PROXY_PORT=7890 docker compose up -d
+PROXY_ENABLED=true PROXY_HOST=127.0.0.1 PROXY_PORT=7890 docker compose up -d
 ```
 
 ### API 没有启动
