@@ -181,7 +181,8 @@ docker compose logs webtoapi | grep -i -E 'chrom|xvfb|supervisor'
 ```
 
 容器启动脚本会自动修复数据 volume 权限，Chromium profile 保存在
-`webtoapi-data` volume 中。
+`webtoapi-data` volume 中。镜像会自动探测 Chromium 的实际安装路径，避免
+不同 Debian 架构下 `/usr/bin/chromium` 路径不一致。
 
 ### 代理连接失败
 
