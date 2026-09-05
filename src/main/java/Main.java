@@ -1459,7 +1459,29 @@ public class Main {
             config.proxyPort = port;
             savePersisted();
             clientRef.set(buildHttpClient(config));
+            restartChromium();
             return json();
+        }
+
+        private void restartChromium() {
+            try {
+                Process process = new ProcessBuilder(
+                        "/usr/bin/supervisorctl", "-c", "/etc/supervisor/supervisord.conf",
+                        "restart", "gemini-chrome")
+                        .redirectErrorStream(true)
+                        .start();
+                if (!process.waitFor(15, TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                    System.err.println("代理已更新，但重启 Chromium 超时");
+                    return;
+                }
+                String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                if (process.exitValue() != 0) {
+                    System.err.println("代理已更新，但重启 Chromium 失败：" + output);
+                }
+            } catch (Exception e) {
+                System.err.println("代理已更新，但无法自动重启 Chromium：" + e.getMessage());
+            }
         }
 
         private void loadPersisted() throws IOException {

@@ -476,7 +476,7 @@
 <div id="app" class="app">
   <aside class="sidebar">
     <div class="brand">
-      <h1>Gemini WebToAPI</h1>
+      <h1>WebAI-WebToAPI</h1>
       <span class="status" :class="{ ok: online }"></span>
     </div>
 
@@ -614,7 +614,7 @@
           </select>
         </div>
         <div class="hint">
-          默认值为 127.0.0.1:7890。Docker bridge 网络中，127.0.0.1 指向容器自身；访问宿主机代理通常填写 host.docker.internal（或宿主机可从 Docker 访问的地址）。保存后 Java 请求立即使用新配置，Chromium 会在容器重启后使用新配置。
+          默认值为 127.0.0.1:7890。Docker bridge 网络中，127.0.0.1 指向容器自身；访问宿主机代理通常填写 host.docker.internal（或宿主机可从 Docker 访问的地址）。保存后 Java 和 Chromium 都会自动使用新配置。
         </div>
         <div class="cookie-toolbar">
           <button class="btn primary" @click="saveProxySettings" :disabled="loadingProxy || savingProxy">

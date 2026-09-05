@@ -19,7 +19,8 @@ The Compose file uses an isolated bridge network. The default proxy shown in
 the Web UI is `127.0.0.1:7890`; in bridge mode that points at the container.
 To reach a proxy on the host, open the API page's "代理设置" tab and change
 the host to `host.docker.internal` (the proxy must allow Docker bridge clients),
-or disable it with `PROXY_ENABLED=false`.
+or disable it with `PROXY_ENABLED=false`. Saving in the Web UI rebuilds the Java
+HTTP client and restarts Chromium so both use the new proxy.
 
 Open `http://localhost:6082` and complete the Google/Gemini login in the
 visible Chromium window. The profile is persisted in the `webtoapi-data`
