@@ -15,8 +15,9 @@ credentials.
 VNC_PASSWD='a-strong-password' docker compose up -d --build
 ```
 
-The Compose file uses host networking and reaches the HTTP proxy on the host at
-`127.0.0.1:7890`. Override it when needed, or disable it with
+The Compose file uses an isolated bridge network and reaches the host HTTP
+proxy through `host.docker.internal:7890`. The proxy must allow connections
+from the Docker bridge; otherwise use a host-side relay or disable it with
 `PROXY_ENABLED=false`.
 
 Open `http://localhost:6082` and complete the Google/Gemini login in the

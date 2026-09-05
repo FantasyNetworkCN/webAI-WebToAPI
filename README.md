@@ -17,8 +17,8 @@ Java 通过 Chromium 的本机 CDP 接口读取 Gemini Cookie 和 `SNlM0e`，然
 - Docker Compose v2（命令为 `docker compose`）
 - 能访问 Gemini 的网络环境；如果需要代理，准备一个 HTTP/SOCKS 代理
 
-当前 Compose 使用 Linux `host` 网络模式，建议在 Linux Docker Engine 上运行。
-容器会直接占用宿主机的 `60000`、`5910`、`6082` 端口。
+当前 Compose 使用独立的 bridge 网络，与 Snowluma 等其他容器隔离。
+宿主机端口通过 Compose 映射，不会共享 Chrome、VNC 或 CDP 进程。
 
 ## 配置
 
@@ -30,8 +30,7 @@ Java 通过 Chromium 的本机 CDP 接口读取 Gemini Cookie 和 `SNlM0e`，然
 
 ### 2. 配置代理（可选）
 
-Compose 使用 host 网络，默认直接访问宿主机的 HTTP 代理
-`127.0.0.1:7890`。
+Compose 默认通过 `host.docker.internal:7890` 访问宿主机 HTTP 代理。
 
 没有代理时（Java 和 Chromium 都直连）：
 
@@ -42,7 +41,7 @@ PROXY_ENABLED=false docker compose up -d --build
 使用其他代理时：
 
 ```bash
-PROXY_TYPE=http PROXY_HOST=127.0.0.1 PROXY_PORT=7890 \
+PROXY_TYPE=http PROXY_HOST=host.docker.internal PROXY_PORT=7890 \
   docker compose up -d --build
 ```
 
@@ -51,12 +50,13 @@ PROXY_TYPE=http PROXY_HOST=127.0.0.1 PROXY_PORT=7890 \
 启用宿主机代理时不要设置 `PROXY_ENABLED=false`。例如：
 
 ```bash
-PROXY_ENABLED=true PROXY_HOST=127.0.0.1 PROXY_PORT=7890 \
+PROXY_ENABLED=true PROXY_HOST=host.docker.internal PROXY_PORT=7890 \
   docker compose up -d --build
 ```
 
-该代理同时用于 Java 请求和 Chromium 浏览器。由于使用 host 网络，宿主机
-`127.0.0.1` 对容器可见。
+该代理同时用于 Java 请求和 Chromium 浏览器。bridge 网络下，代理需要允许
+来自 Docker 网关的连接；如果代理只能监听宿主机 `127.0.0.1`，请使用宿主机
+转发端口，或继续使用 host 网络。
 
 ## 启动
 
@@ -119,8 +119,12 @@ curl http://localhost:60000/v1/chat/completions \
   }'
 ```
 
-host 网络模式下，服务端口直接占用宿主机端口，不能使用 Compose 的端口映射
-变量。需要改端口时，请同步修改 `config.yml`、supervisor 配置和 Dockerfile。
+可以通过环境变量选择宿主机空闲端口，例如：
+
+```bash
+OPENAI_HOST_PORT=16000 NOVNC_PORT=16082 VNC_PORT=15910 \
+  docker compose up -d --build
+```
 
 ## 常用命令
 
@@ -191,10 +195,10 @@ docker compose logs webtoapi | grep -i -E 'chrom|xvfb|supervisor'
 
 ### 代理连接失败
 
-当前使用 host 网络，容器内的 `127.0.0.1` 就是宿主机回环地址。代理应配置为：
+bridge 网络下，容器内的 `127.0.0.1` 是容器自身。宿主机代理应配置为：
 
 ```bash
-PROXY_ENABLED=true PROXY_HOST=127.0.0.1 PROXY_PORT=7890 docker compose up -d
+PROXY_ENABLED=true PROXY_HOST=host.docker.internal PROXY_PORT=7890 docker compose up -d
 ```
 
 ### API 没有启动
