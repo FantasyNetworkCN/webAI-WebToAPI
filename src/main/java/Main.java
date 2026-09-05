@@ -17,6 +17,7 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
@@ -24,6 +25,7 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Properties;
 import java.util.Scanner;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -54,7 +56,10 @@ public class Main {
     public static void main(String[] args) {
         try {
             AppConfig config = AppConfig.load(Path.of("config.yml"));
+            AtomicReference<OkHttpClient> clientRef = new AtomicReference<>();
+            ProxySettingsManager proxySettings = new ProxySettingsManager(config, clientRef);
             OkHttpClient client = buildHttpClient(config);
+            clientRef.set(client);
             config.geminiCookieProvider = GeminiCookieProvider.create(config);
             ClaudeCookieStore claudeCookieStore = new ClaudeCookieStore(Path.of("data", "claude-cookies.sqlite"));
             config.claudeCookieStore = claudeCookieStore;
@@ -86,7 +91,7 @@ public class Main {
                 return;
             }
 
-            OpenAiApiServer server = startApiServer(config, client, claudeCookieStore);
+            OpenAiApiServer server = startApiServer(config, clientRef, proxySettings, claudeCookieStore);
             try {
                 runLoop(config, client);
             } finally {
@@ -99,7 +104,8 @@ public class Main {
         }
     }
 
-    private static OpenAiApiServer startApiServer(AppConfig config, OkHttpClient client,
+    private static OpenAiApiServer startApiServer(AppConfig config, AtomicReference<OkHttpClient> clientRef,
+                                                  OpenAiApiServer.ProxySettingsBackend proxySettings,
                                                   ClaudeCookieStore claudeCookieStore) throws IOException {
         if (!config.openAiEnabled) {
             System.out.println("OpenAI API 未启用。");
@@ -111,8 +117,9 @@ public class Main {
                 config.openAiPort,
                 modelNames(),
                 DEFAULT_MODEL,
-                new ApiChatBackend(config, client),
-                claudeCookieStore);
+                new ApiChatBackend(config, clientRef),
+                claudeCookieStore,
+                proxySettings);
         server.start();
         return server;
     }
@@ -1407,6 +1414,120 @@ public class Main {
             }
         }
         return out.toString();
+    }
+
+    private static final class ProxySettingsManager implements OpenAiApiServer.ProxySettingsBackend {
+        private static final Path SETTINGS_PATH = Path.of("data", "proxy-settings.properties");
+        private final AppConfig config;
+        private final AtomicReference<OkHttpClient> clientRef;
+
+        private ProxySettingsManager(AppConfig config, AtomicReference<OkHttpClient> clientRef) throws IOException {
+            this.config = config;
+            this.clientRef = clientRef;
+            loadPersisted();
+        }
+
+        @Override
+        public synchronized String getJson() {
+            return json();
+        }
+
+        @Override
+        public synchronized String update(String body) throws IOException {
+            Object parsed = SimpleJson.parse(body == null ? "" : body);
+            if (!(parsed instanceof Map<?, ?> values)) {
+                throw new IllegalArgumentException("请求体必须是 JSON object");
+            }
+
+            boolean enabled = objectBooleanValue(values.get("enabled"), config.proxyEnabled);
+            String type = objectStringValue(values.get("type"), config.proxyType).trim().toLowerCase(Locale.ROOT);
+            String host = objectStringValue(values.get("host"), config.proxyHost).trim();
+            int port = objectIntValue(values.get("port"), config.proxyPort);
+            if (!type.equals("http") && !type.equals("socks")) {
+                throw new IllegalArgumentException("代理类型只能是 http 或 socks");
+            }
+            if (host.isBlank()) {
+                throw new IllegalArgumentException("代理地址不能为空");
+            }
+            if (port < 1 || port > 65535) {
+                throw new IllegalArgumentException("代理端口必须在 1-65535 之间");
+            }
+
+            config.proxyEnabled = enabled;
+            config.proxyType = type;
+            config.proxyHost = host;
+            config.proxyPort = port;
+            savePersisted();
+            clientRef.set(buildHttpClient(config));
+            return json();
+        }
+
+        private void loadPersisted() throws IOException {
+            if (!Files.exists(SETTINGS_PATH)) {
+                return;
+            }
+            Properties properties = new Properties();
+            try (java.io.Reader reader = Files.newBufferedReader(SETTINGS_PATH, StandardCharsets.UTF_8)) {
+                properties.load(reader);
+            }
+            config.proxyEnabled = AppConfig.booleanValue(properties.getProperty("enabled"), config.proxyEnabled);
+            String type = properties.getProperty("type", config.proxyType).trim().toLowerCase(Locale.ROOT);
+            if (type.equals("http") || type.equals("socks")) {
+                config.proxyType = type;
+            }
+            String host = properties.getProperty("host", config.proxyHost).trim();
+            if (!host.isBlank()) {
+                config.proxyHost = host;
+            }
+            int port = AppConfig.intValue(properties.getProperty("port"), config.proxyPort);
+            if (port >= 1 && port <= 65535) {
+                config.proxyPort = port;
+            }
+        }
+
+        private void savePersisted() throws IOException {
+            Files.createDirectories(SETTINGS_PATH.getParent());
+            Properties properties = new Properties();
+            properties.setProperty("enabled", Boolean.toString(config.proxyEnabled));
+            properties.setProperty("type", config.proxyType);
+            properties.setProperty("host", config.proxyHost);
+            properties.setProperty("port", Integer.toString(config.proxyPort));
+            try (java.io.Writer writer = Files.newBufferedWriter(SETTINGS_PATH, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                properties.store(writer, "WebToAPI proxy settings");
+            }
+        }
+
+        private String json() {
+            return "{\"enabled\":" + config.proxyEnabled
+                    + ",\"type\":" + SimpleJson.quote(config.proxyType)
+                    + ",\"host\":" + SimpleJson.quote(config.proxyHost)
+                    + ",\"port\":" + config.proxyPort + "}";
+        }
+
+        private static boolean objectBooleanValue(Object value, boolean fallback) {
+            if (value instanceof Boolean bool) {
+                return bool;
+            }
+            if (value instanceof String text) {
+                return AppConfig.booleanValue(text, fallback);
+            }
+            return fallback;
+        }
+
+        private static String objectStringValue(Object value, String fallback) {
+            return value instanceof String text ? text : fallback;
+        }
+
+        private static int objectIntValue(Object value, int fallback) {
+            if (value instanceof Number number) {
+                return number.intValue();
+            }
+            if (value instanceof String text) {
+                return AppConfig.intValue(text, fallback);
+            }
+            return fallback;
+        }
     }
 
     private static final class AppConfig {
@@ -2787,12 +2908,12 @@ public class Main {
 
     private static final class ApiChatBackend implements OpenAiApiServer.ChatBackend {
         private final AppConfig config;
-        private final OkHttpClient client;
+        private final AtomicReference<OkHttpClient> clientRef;
         private final Map<String, ApiConversation> conversations = new ConcurrentHashMap<>();
 
-        private ApiChatBackend(AppConfig config, OkHttpClient client) {
+        private ApiChatBackend(AppConfig config, AtomicReference<OkHttpClient> clientRef) {
             this.config = config;
-            this.client = client;
+            this.clientRef = clientRef;
         }
 
         @Override
@@ -2809,7 +2930,7 @@ public class Main {
 
                 String prompt = apiPrompt(request, conversation);
                 StringBuilder text = new StringBuilder();
-                sendInternal(config, client, request.model(), prompt, request.images(), ConversationState.stateless(), delta -> {
+                sendInternal(config, clientRef.get(), request.model(), prompt, request.images(), ConversationState.stateless(), delta -> {
                     text.append(delta);
                     if (deltaSink != null) {
                         deltaSink.accept(delta);

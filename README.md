@@ -30,7 +30,14 @@ Java 通过 Chromium 的本机 CDP 接口读取 Gemini Cookie 和 `SNlM0e`，然
 
 ### 2. 配置代理（可选）
 
-Compose 默认通过 `host.docker.internal:7890` 访问宿主机 HTTP 代理。
+也可以直接打开 API 首页的“代理设置”页修改代理，保存后立即生效并写入
+`data/proxy-settings.properties`（Docker 中会持久化在 `webtoapi-data` volume）。
+默认值为 `127.0.0.1:7890`。
+保存后 Java 请求立即使用新配置；Chromium 会在容器重启后读取保存的配置。
+
+Compose 默认使用 `127.0.0.1:7890`。在 bridge 网络中，这个地址指向容器自身；
+如果代理运行在宿主机，请在网页中改为 `host.docker.internal`（或宿主机可从
+Docker 访问的地址）。
 
 没有代理时（Java 和 Chromium 都直连）：
 

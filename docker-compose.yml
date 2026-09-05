@@ -17,7 +17,7 @@ services:
       OPENAI_PORT: "60000"
       PROXY_ENABLED: "${PROXY_ENABLED:-true}"
       PROXY_TYPE: "${PROXY_TYPE:-http}"
-      PROXY_HOST: "${PROXY_HOST:-host.docker.internal}"
+      PROXY_HOST: "${PROXY_HOST:-127.0.0.1}"
       PROXY_PORT: "${PROXY_PORT:-7890}"
       GEMINI_COOKIE_ENABLED: "true"
       GEMINI_COOKIE_LAUNCH_CHROME: "false"

@@ -23,23 +23,36 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 final class OpenAiApiServer {
+    interface ProxySettingsBackend {
+        String getJson();
+
+        String update(String body) throws Exception;
+    }
+
     private final String host;
     private final int port;
     private final List<String> models;
     private final String defaultModel;
     private final ChatBackend backend;
     private final ClaudeCookieStore claudeCookieStore;
+    private final ProxySettingsBackend proxySettingsBackend;
     private HttpServer server;
     private ExecutorService executor;
 
     OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
                     ClaudeCookieStore claudeCookieStore) {
+        this(host, port, models, defaultModel, backend, claudeCookieStore, null);
+    }
+
+    OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
+                    ClaudeCookieStore claudeCookieStore, ProxySettingsBackend proxySettingsBackend) {
         this.host = host;
         this.port = port;
         this.defaultModel = defaultModel == null || defaultModel.isBlank() ? "Gemini-web" : defaultModel;
         this.models = models == null || models.isEmpty() ? List.of(this.defaultModel) : List.copyOf(models);
         this.backend = backend;
         this.claudeCookieStore = claudeCookieStore;
+        this.proxySettingsBackend = proxySettingsBackend;
     }
 
     void start() throws IOException {
@@ -49,6 +62,7 @@ final class OpenAiApiServer {
         server.createContext("/v1/models", this::handleModels);
         server.createContext("/debug/openai-logs", this::handleOpenAiLogs);
         server.createContext("/debug/claude-cookies", this::handleClaudeCookies);
+        server.createContext("/debug/proxy", this::handleProxySettings);
         server.createContext("/", this::handleStatic);
         executor = Executors.newCachedThreadPool();
         server.setExecutor(executor);
@@ -57,6 +71,33 @@ final class OpenAiApiServer {
         System.out.println("前端页面：http://" + host + ":" + port + "/");
         System.out.println("POST /v1/responses");
         System.out.println("POST /v1/chat/completions");
+    }
+
+    private void handleProxySettings(HttpExchange exchange) throws IOException {
+        addCorsHeaders(exchange, "GET, POST, OPTIONS");
+        if (handleCorsPreflight(exchange)) {
+            return;
+        }
+        if (proxySettingsBackend == null) {
+            sendJson(exchange, 500, errorJson("代理设置未初始化"));
+            return;
+        }
+        try {
+            if (isMethod(exchange, "GET")) {
+                sendJson(exchange, 200, proxySettingsBackend.getJson());
+                return;
+            }
+            if (isMethod(exchange, "POST")) {
+                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                sendJson(exchange, 200, proxySettingsBackend.update(body));
+                return;
+            }
+            sendMethodNotAllowed(exchange, "GET, POST, OPTIONS");
+        } catch (IllegalArgumentException e) {
+            sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
+        } catch (Exception e) {
+            sendJson(exchange, 500, errorJson(e.getMessage()));
+        }
     }
 
     void stop() {

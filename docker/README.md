@@ -15,10 +15,11 @@ credentials.
 VNC_PASSWD='a-strong-password' docker compose up -d --build
 ```
 
-The Compose file uses an isolated bridge network and reaches the host HTTP
-proxy through `host.docker.internal:7890`. The proxy must allow connections
-from the Docker bridge; otherwise use a host-side relay or disable it with
-`PROXY_ENABLED=false`.
+The Compose file uses an isolated bridge network. The default proxy shown in
+the Web UI is `127.0.0.1:7890`; in bridge mode that points at the container.
+To reach a proxy on the host, open the API page's "代理设置" tab and change
+the host to `host.docker.internal` (the proxy must allow Docker bridge clients),
+or disable it with `PROXY_ENABLED=false`.
 
 Open `http://localhost:6082` and complete the Google/Gemini login in the
 visible Chromium window. The profile is persisted in the `webtoapi-data`

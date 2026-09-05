@@ -312,9 +312,32 @@
       max-height: 180px;
     }
 
-    .logs, .cookies {
+    .logs, .cookies, .proxy-settings {
       overflow: auto;
       padding: 22px;
+    }
+
+    .proxy-form {
+      max-width: 680px;
+      display: grid;
+      gap: 16px;
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .proxy-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 150px;
+      gap: 12px;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
     }
 
     .log-toolbar, .cookie-toolbar {
@@ -431,7 +454,7 @@
         padding: 12px 16px;
       }
 
-      .messages, .logs, .cookies {
+      .messages, .logs, .cookies, .proxy-settings {
         padding: 16px;
       }
 
@@ -440,6 +463,10 @@
       }
 
       .composer-row {
+        grid-template-columns: 1fr;
+      }
+
+      .proxy-grid {
         grid-template-columns: 1fr;
       }
     }
@@ -493,6 +520,7 @@
         <button class="tab" :class="{ active: view === 'chat' }" @click="view = 'chat'">聊天</button>
         <button class="tab" :class="{ active: view === 'logs' }" @click="openLogs">日志</button>
         <button class="tab" :class="{ active: view === 'cookies' }" @click="openCookies">Claude Cookie</button>
+        <button class="tab" :class="{ active: view === 'proxy' }" @click="openProxy">代理设置</button>
       </div>
     </header>
 
@@ -528,7 +556,7 @@
       </div>
     </section>
 
-    <section v-else class="cookies">
+    <section v-else-if="view === 'cookies'" class="cookies">
       <div class="cookie-form">
         <textarea v-model="claudeCurlInput" placeholder="粘贴 Claude completion curl，服务端只会提取 cookie 并存入 SQLite"></textarea>
         <div class="cookie-toolbar">
@@ -562,6 +590,41 @@
       </div>
     </section>
 
+    <section v-else class="proxy-settings">
+      <div class="proxy-form">
+        <label class="toggle">
+          <span>启用代理</span>
+          <input type="checkbox" v-model="proxy.enabled" :disabled="loadingProxy || savingProxy">
+        </label>
+        <div class="proxy-grid">
+          <div class="field">
+            <label>代理地址</label>
+            <input v-model.trim="proxy.host" placeholder="127.0.0.1">
+          </div>
+          <div class="field">
+            <label>端口</label>
+            <input v-model.number="proxy.port" type="number" min="1" max="65535" placeholder="7890">
+          </div>
+        </div>
+        <div class="field">
+          <label>代理类型</label>
+          <select v-model="proxy.type">
+            <option value="http">HTTP</option>
+            <option value="socks">SOCKS5</option>
+          </select>
+        </div>
+        <div class="hint">
+          默认值为 127.0.0.1:7890。Docker bridge 网络中，127.0.0.1 指向容器自身；访问宿主机代理通常填写 host.docker.internal（或宿主机可从 Docker 访问的地址）。保存后 Java 请求立即使用新配置，Chromium 会在容器重启后使用新配置。
+        </div>
+        <div class="cookie-toolbar">
+          <button class="btn primary" @click="saveProxySettings" :disabled="loadingProxy || savingProxy">
+            {{ savingProxy ? '保存中' : '保存代理设置' }}
+          </button>
+          <button class="btn" @click="loadProxySettings" :disabled="loadingProxy || savingProxy">刷新</button>
+        </div>
+      </div>
+    </section>
+
     <footer v-if="view === 'chat'" class="composer">
       <div class="composer-row">
         <textarea
@@ -589,6 +652,8 @@ createApp({
       loadingLogs: false,
       loadingClaudeCookies: false,
       savingClaudeCookie: false,
+      loadingProxy: false,
+      savingProxy: false,
       sending: false,
       stream: true,
       view: 'chat',
@@ -598,6 +663,12 @@ createApp({
       systemPrompt: '',
       draft: '',
       claudeCurlInput: '',
+      proxy: {
+        enabled: true,
+        type: 'http',
+        host: '127.0.0.1',
+        port: 7890
+      },
       messages: [],
       logs: [],
       claudeCookies: [],
@@ -612,6 +683,9 @@ createApp({
       if (this.view === 'cookies') {
         return 'Claude Cookie';
       }
+      if (this.view === 'proxy') {
+        return '代理设置';
+      }
       return '聊天';
     },
     subtitle() {
@@ -620,6 +694,9 @@ createApp({
       }
       if (this.view === 'cookies') {
         return `${this.claudeCookies.length} 个账号 Cookie`;
+      }
+      if (this.view === 'proxy') {
+        return `${this.proxy.enabled ? '已启用' : '已停用'} · ${this.proxy.type}://${this.proxy.host}:${this.proxy.port}`;
       }
       return `${this.selectedModel || '未加载模型'} · ${this.stream ? 'stream' : 'json'} · ${this.sessionId}`;
     }
@@ -802,6 +879,59 @@ createApp({
     async openCookies() {
       this.view = 'cookies';
       await this.loadClaudeCookies();
+    },
+    async openProxy() {
+      this.view = 'proxy';
+      await this.loadProxySettings();
+    },
+    async loadProxySettings() {
+      this.loadingProxy = true;
+      this.error = '';
+      try {
+        const response = await fetch('/debug/proxy');
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data?.error?.message || `代理接口失败：${response.status}`);
+        }
+        this.proxy = {
+          enabled: data.enabled !== false,
+          type: data.type === 'socks' ? 'socks' : 'http',
+          host: data.host || '127.0.0.1',
+          port: Number(data.port) || 7890
+        };
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.loadingProxy = false;
+      }
+    },
+    async saveProxySettings() {
+      if (this.savingProxy) {
+        return;
+      }
+      this.savingProxy = true;
+      this.error = '';
+      try {
+        const response = await fetch('/debug/proxy', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(this.proxy)
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          throw new Error(data?.error?.message || `保存失败：${response.status}`);
+        }
+        this.proxy = {
+          enabled: data.enabled !== false,
+          type: data.type === 'socks' ? 'socks' : 'http',
+          host: data.host || '127.0.0.1',
+          port: Number(data.port) || 7890
+        };
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.savingProxy = false;
+      }
     },
     async loadClaudeCookies() {
       this.loadingClaudeCookies = true;
