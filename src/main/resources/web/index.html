@@ -520,6 +520,7 @@
         <button class="tab" :class="{ active: view === 'chat' }" @click="view = 'chat'">聊天</button>
         <button class="tab" :class="{ active: view === 'logs' }" @click="openLogs">日志</button>
         <button class="tab" :class="{ active: view === 'cookies' }" @click="openCookies">Claude Cookie</button>
+        <button class="tab" :class="{ active: view === 'chatgpt' }" @click="openChatGpt">ChatGPT Curl</button>
         <button class="tab" :class="{ active: view === 'proxy' }" @click="openProxy">代理设置</button>
       </div>
     </header>
@@ -590,6 +591,31 @@
       </div>
     </section>
 
+    <section v-else-if="view === 'chatgpt'" class="cookies">
+      <div class="cookie-form">
+        <textarea v-model="chatgptCurlInput" placeholder="粘贴 ChatGPT conversation curl，服务端会提取 URL、Header、Cookie 和 JSON body 并存入 SQLite"></textarea>
+        <div class="cookie-toolbar">
+          <button class="btn primary" @click="saveChatGptCurl" :disabled="savingChatGptCurl || !chatgptCurlInput.trim()">
+            {{ savingChatGptCurl ? '保存中' : '保存 Curl' }}
+          </button>
+          <button class="btn" @click="loadChatGptCurls" :disabled="loadingChatGptCurls">刷新</button>
+        </div>
+      </div>
+      <div v-if="chatgptCurls.length === 0" class="empty">还没有 ChatGPT curl。请从 DevTools 复制包含 authorization、sentinel 和 conduit token 的 conversation 请求。</div>
+      <div v-else class="cookie-list">
+        <article v-for="curl in chatgptCurls" :key="curl.id" class="cookie-item">
+          <div class="cookie-head">
+            <span class="pill">{{ curl.label }}</span>
+            <span class="pill">{{ curl.active ? 'active' : 'disabled' }}</span>
+            <span class="pill">fail {{ curl.failure_count }}</span>
+            <span class="pill">len {{ curl.curl_length }}</span>
+            <button class="btn danger" @click="deleteChatGptCurl(curl.id)" :disabled="loadingChatGptCurls">删除</button>
+          </div>
+          <div class="error" v-if="curl.last_error">{{ curl.last_error }}</div>
+        </article>
+      </div>
+    </section>
+
     <section v-else class="proxy-settings">
       <div class="proxy-form">
         <label class="toggle">
@@ -652,6 +678,8 @@ createApp({
       loadingLogs: false,
       loadingClaudeCookies: false,
       savingClaudeCookie: false,
+      loadingChatGptCurls: false,
+      savingChatGptCurl: false,
       loadingProxy: false,
       savingProxy: false,
       sending: false,
@@ -663,6 +691,7 @@ createApp({
       systemPrompt: '',
       draft: '',
       claudeCurlInput: '',
+      chatgptCurlInput: '',
       proxy: {
         enabled: true,
         type: 'http',
@@ -672,6 +701,7 @@ createApp({
       messages: [],
       logs: [],
       claudeCookies: [],
+      chatgptCurls: [],
       error: ''
     };
   },
@@ -682,6 +712,9 @@ createApp({
       }
       if (this.view === 'cookies') {
         return 'Claude Cookie';
+      }
+      if (this.view === 'chatgpt') {
+        return 'ChatGPT Curl';
       }
       if (this.view === 'proxy') {
         return '代理设置';
@@ -694,6 +727,9 @@ createApp({
       }
       if (this.view === 'cookies') {
         return `${this.claudeCookies.length} 个账号 Cookie`;
+      }
+      if (this.view === 'chatgpt') {
+        return `${this.chatgptCurls.length} 个已保存 Curl`;
       }
       if (this.view === 'proxy') {
         return `${this.proxy.enabled ? '已启用' : '已停用'} · ${this.proxy.type}://${this.proxy.host}:${this.proxy.port}`;
@@ -880,6 +916,10 @@ createApp({
       this.view = 'cookies';
       await this.loadClaudeCookies();
     },
+    async openChatGpt() {
+      this.view = 'chatgpt';
+      await this.loadChatGptCurls();
+    },
     async openProxy() {
       this.view = 'proxy';
       await this.loadProxySettings();
@@ -989,6 +1029,54 @@ createApp({
         this.error = err.message || String(err);
       } finally {
         this.loadingClaudeCookies = false;
+      }
+    },
+    async loadChatGptCurls() {
+      this.loadingChatGptCurls = true;
+      this.error = '';
+      try {
+        const response = await fetch('/debug/chatgpt-curls');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data?.error?.message || `ChatGPT Curl 接口失败：${response.status}`);
+        this.chatgptCurls = data.data || [];
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.loadingChatGptCurls = false;
+      }
+    },
+    async saveChatGptCurl() {
+      if (!this.chatgptCurlInput.trim() || this.savingChatGptCurl) return;
+      this.savingChatGptCurl = true;
+      this.error = '';
+      try {
+        const response = await fetch('/debug/chatgpt-curls', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ curl: this.chatgptCurlInput })
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(data?.error?.message || `保存失败：${response.status}`);
+        this.chatgptCurlInput = '';
+        await this.loadChatGptCurls();
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.savingChatGptCurl = false;
+      }
+    },
+    async deleteChatGptCurl(id) {
+      this.loadingChatGptCurls = true;
+      this.error = '';
+      try {
+        const response = await fetch(`/debug/chatgpt-curls?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(data?.error?.message || `删除失败：${response.status}`);
+        await this.loadChatGptCurls();
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.loadingChatGptCurls = false;
       }
     },
     async loadLogs() {

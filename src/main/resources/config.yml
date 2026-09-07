@@ -11,6 +11,11 @@ openai:
   host: 0.0.0.0
   port: 11434
 
+# ChatGPT 网页端逆向接口。模型会以 chatgpt-web 出现在 /v1/models。
+# 完整 conversation curl 请在 Web 页面“ChatGPT Curl”中粘贴保存。
+chatgpt:
+  model: auto
+
 # Gemini Cookie 与 SNlM0e 自动获取。
 # 程序会自动执行：
 # google-chrome --remote-debugging-port=9222 --user-data-dir="~/.config/google-chrome-debug" --remote-allow-origins="*" --disable-vulkan

@@ -35,23 +35,31 @@ final class OpenAiApiServer {
     private final String defaultModel;
     private final ChatBackend backend;
     private final ClaudeCookieStore claudeCookieStore;
+    private final ChatGptCurlStore chatGptCurlStore;
     private final ProxySettingsBackend proxySettingsBackend;
     private HttpServer server;
     private ExecutorService executor;
 
     OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
                     ClaudeCookieStore claudeCookieStore) {
-        this(host, port, models, defaultModel, backend, claudeCookieStore, null);
+        this(host, port, models, defaultModel, backend, claudeCookieStore, null, null);
     }
 
     OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
                     ClaudeCookieStore claudeCookieStore, ProxySettingsBackend proxySettingsBackend) {
+        this(host, port, models, defaultModel, backend, claudeCookieStore, null, proxySettingsBackend);
+    }
+
+    OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
+                    ClaudeCookieStore claudeCookieStore, ChatGptCurlStore chatGptCurlStore,
+                    ProxySettingsBackend proxySettingsBackend) {
         this.host = host;
         this.port = port;
         this.defaultModel = defaultModel == null || defaultModel.isBlank() ? "Gemini-web" : defaultModel;
         this.models = models == null || models.isEmpty() ? List.of(this.defaultModel) : List.copyOf(models);
         this.backend = backend;
         this.claudeCookieStore = claudeCookieStore;
+        this.chatGptCurlStore = chatGptCurlStore;
         this.proxySettingsBackend = proxySettingsBackend;
     }
 
@@ -62,6 +70,7 @@ final class OpenAiApiServer {
         server.createContext("/v1/models", this::handleModels);
         server.createContext("/debug/openai-logs", this::handleOpenAiLogs);
         server.createContext("/debug/claude-cookies", this::handleClaudeCookies);
+        server.createContext("/debug/chatgpt-curls", this::handleChatGptCurls);
         server.createContext("/debug/proxy", this::handleProxySettings);
         server.createContext("/", this::handleStatic);
         executor = Executors.newCachedThreadPool();
@@ -208,6 +217,47 @@ final class OpenAiApiServer {
             sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
         } catch (Exception e) {
             sendJson(exchange, 500, errorJson(e.getMessage()));
+        }
+    }
+
+    private void handleChatGptCurls(HttpExchange exchange) throws IOException {
+        addCorsHeaders(exchange, "GET, POST, DELETE, OPTIONS");
+        if (handleCorsPreflight(exchange)) return;
+        if (chatGptCurlStore == null) {
+            sendJson(exchange, 500, errorJson("ChatGPT curl 存储未初始化"));
+            return;
+        }
+        try {
+            if (isMethod(exchange, "GET")) {
+                List<ChatGptCurlStore.CurlRecord> records = chatGptCurlStore.list();
+                StringBuilder out = new StringBuilder("{\"data\":[");
+                for (int i = 0; i < records.size(); i++) {
+                    if (i > 0) out.append(',');
+                    out.append(records.get(i).publicJson());
+                }
+                sendJson(exchange, 200, out.append("]}").toString());
+                return;
+            }
+            if (isMethod(exchange, "POST")) {
+                Object parsed = SimpleJson.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+                String raw = parsed instanceof Map<?, ?> map ? stringValue(map.get("curl"), "") : "";
+                ChatGptCurlStore.CurlRecord record = chatGptCurlStore.addFromCurl(raw);
+                sendJson(exchange, 200, "{\"ok\":true,\"curl\":" + record.publicJson() + "}");
+                return;
+            }
+            if (isMethod(exchange, "DELETE")) {
+                String id = queryValue(exchange.getRequestURI().getRawQuery(), "id");
+                if (id == null || id.isBlank()) {
+                    sendJson(exchange, 400, errorJson("缺少 id", "invalid_request_error"));
+                    return;
+                }
+                chatGptCurlStore.delete(id);
+                sendJson(exchange, 200, "{\"ok\":true}");
+                return;
+            }
+            sendMethodNotAllowed(exchange, "GET, POST, DELETE, OPTIONS");
+        } catch (Exception e) {
+            sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
         }
     }
 

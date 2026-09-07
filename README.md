@@ -73,6 +73,14 @@ PROXY_ENABLED=true PROXY_HOST=host.docker.internal PROXY_PORT=7890 \
 VNC_PASSWD='修改成强密码' docker compose up -d --build
 ```
 
+源码、Java 类或前端页面更新后，必须重新构建镜像；单独执行 `docker compose up -d`
+会复用旧镜像，不会自动编译最新源码：
+
+```bash
+sudo docker compose build --no-cache webtoapi
+sudo docker compose up -d --force-recreate webtoapi
+```
+
 查看启动日志：
 
 ```bash
@@ -125,6 +133,15 @@ curl http://localhost:60000/v1/chat/completions \
     "stream": false
   }'
 ```
+
+### ChatGPT 网页端模型
+
+项目也实现了文章 `111.html` 中描述的 ChatGPT 网页端链路。打开首页的
+“ChatGPT Curl”页，粘贴 DevTools 复制的完整
+`https://chatgpt.com/backend-api/f/conversation` curl，服务端会提取并保存 URL、Header、Cookie 和 JSON body 到 SQLite。模型会以
+`chatgpt-web` 出现在 `/v1/models`。请求时使用 `"model": "chatgpt-web"`。
+
+ChatGPT 的 authorization、sentinel、conduit token 都来自保存的 curl；这些值会过期，返回 401/403 时重新从 DevTools 复制最新 curl 保存即可。
 
 可以通过环境变量选择宿主机空闲端口，例如：
 
