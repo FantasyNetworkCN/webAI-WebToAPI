@@ -3012,7 +3012,7 @@ public class Main {
 
             RequestContext context = new RequestContext(curl.url(), new LinkedHashMap<>(curl.headers()));
             Bootstrap bootstrap = bootstrap(context);
-            Sentinel sentinel = sentinel(context, bootstrap);
+            Sentinel sentinel = sentinel(context, bootstrap, header(context.headers, "openai-sentinel-turnstile-token"));
             String freshConduit = refreshConduit(context, body, message, parentMessageId);
 
             Request.Builder builder = new Request.Builder().url(curl.url())
@@ -3099,7 +3099,7 @@ public class Main {
             }
         }
 
-        private Sentinel sentinel(RequestContext context, Bootstrap bootstrap) throws IOException {
+        private Sentinel sentinel(RequestContext context, Bootstrap bootstrap, String copiedTurnstile) throws IOException {
             String userAgent = header(context.headers, "user-agent");
             String p = requirementsToken(userAgent, bootstrap);
             String preparePath = "/backend-api/sentinel/chat-requirements/prepare";
@@ -3116,7 +3116,19 @@ public class Main {
             Map<?, ?> turnstile = map.get("turnstile") instanceof Map<?, ?> value ? value : Map.of();
             String turnstileToken = "";
             if (Boolean.TRUE.equals(turnstile.get("required"))) {
-                turnstileToken = solveTurnstile(stringValue(turnstile.get("dx")), p);
+                String dx = stringValue(turnstile.get("dx"));
+                String[] turnstileKeys = {prepareToken, p, stringValue(map.get("token")), stringValue(map.get("requirements_token"))};
+                for (String candidate : turnstileKeys) {
+                    if (candidate.isBlank()) continue;
+                    turnstileToken = solveTurnstile(dx, candidate);
+                    if (Boolean.getBoolean("chatgpt.debug.turnstile")) System.err.println("ChatGPT Turnstile candidate_result_chars=" + turnstileToken.length());
+                    if (!turnstileToken.isBlank()) break;
+                }
+                if (turnstileToken.isBlank()) {
+                    // A DevTools curl may contain a browser-solved token whose dx
+                    // instructions cannot be replayed outside that browser VM.
+                    turnstileToken = copiedTurnstile == null ? "" : copiedTurnstile.trim();
+                }
                 if (turnstileToken.isBlank()) {
                     throw new IOException("ChatGPT 要求 Turnstile，dx VM 未返回 token；请在同一浏览器中重新复制 curl 后重试");
                 }
@@ -3291,12 +3303,17 @@ public class Main {
         private static String solveTurnstile(String dx, String key) {
             if (dx == null || dx.isBlank() || key == null || key.isBlank()) return "";
             try {
+                boolean debug = Boolean.getBoolean("chatgpt.debug.turnstile");
                 byte[] encoded;
                 try { encoded = Base64.getDecoder().decode(dx); }
                 catch (IllegalArgumentException e) { encoded = Base64.getUrlDecoder().decode(dx); }
                 String decoded = xor(new String(encoded, StandardCharsets.UTF_8), key);
                 Object parsed = SimpleJson.parse(decoded);
-                if (!(parsed instanceof List<?> instructions)) return "";
+                if (!(parsed instanceof List<?> instructions)) {
+                    if (debug) System.err.println("ChatGPT Turnstile dx parsed value is not an array; dx_chars=" + dx.length() + ", key_chars=" + key.length());
+                    return "";
+                }
+                if (debug) System.err.println("ChatGPT Turnstile dx instructions=" + instructions.size());
                 Map<Integer, Object> values = new LinkedHashMap<>();
                 values.put(3, "__fn3");
                 values.put(9, instructions);
@@ -3349,8 +3366,12 @@ public class Main {
                     }
                     if (System.nanoTime() - started > 500_000_000L) break;
                 }
+                if (debug) System.err.println("ChatGPT Turnstile VM result_chars=" + result[0].length());
                 return result[0];
             } catch (Exception ignored) {
+                if (Boolean.getBoolean("chatgpt.debug.turnstile")) {
+                    System.err.println("ChatGPT Turnstile dx VM exception=" + ignored.getClass().getSimpleName());
+                }
                 return "";
             }
         }
