@@ -141,7 +141,23 @@ curl http://localhost:60000/v1/chat/completions \
 `https://chatgpt.com/backend-api/f/conversation` curl，服务端会提取并保存 URL、Header、Cookie 和 JSON body 到 SQLite。模型会以
 `chatgpt-web` 出现在 `/v1/models`。请求时使用 `"model": "chatgpt-web"`。
 
-ChatGPT 的 authorization、sentinel、conduit token 都来自保存的 curl；这些值会过期，返回 401/403 时重新从 DevTools 复制最新 curl 保存即可。
+保存的 curl 只作为登录上下文和请求模板。每一轮请求都会先访问首页并生成新的
+requirements/PoW/Turnstile（如需要）和 conduit token；保存 curl 中旧的
+`openai-sentinel-*`、`x-conduit-token` 不会被重放。若浏览器会话本身过期或 ChatGPT
+仍返回 401/403，请在同一浏览器和网络中重新复制最新 conversation curl 后保存。
+
+可以用本地刚复制的 curl 做一次 live smoke test（不会把 curl 写入仓库）：
+
+```bash
+rm -rf /tmp/webtoapi-classes && mkdir -p /tmp/webtoapi-classes
+javac -cp "$(find ~/.m2/repository -name '*.jar' -printf '%p:' 2>/dev/null)" \
+  -d /tmp/webtoapi-classes src/main/java/*.java test/*.java
+java -cp "/tmp/webtoapi-classes:$(find ~/.m2/repository -name '*.jar' -printf '%p:' 2>/dev/null)" \
+  ChatGptCurlLiveTest /path/to/fresh-conversation-curl.txt
+```
+
+测试只输出响应字符数；不要把 curl 提交到 Git 或日志。`ChatGptTokenTest` 是不联网的
+dx VM 回归测试。
 
 可以通过环境变量选择宿主机空闲端口，例如：
 

@@ -2999,32 +2999,42 @@ public class Main {
                 throw new IOException("ChatGPT curl body 不是 JSON");
             }
             @SuppressWarnings("unchecked") Map<String, Object> body = (Map<String, Object>) rawMap;
-            if (conversation.parentMessageId.isBlank()) {
-                conversation.conversationId = stringValue(body.get("conversation_id"));
-                conversation.parentMessageId = stringValue(body.get("parent_message_id"));
-            }
-            body.put("messages", java.util.List.of(chatMessage(prompt)));
+            String parentMessageId = conversation.parentMessageId.isBlank()
+                    ? "client-created-root" : conversation.parentMessageId;
+            Map<String, Object> message = chatMessage(prompt);
+            body.put("messages", java.util.List.of(message));
             if (!conversation.conversationId.isBlank()) body.put("conversation_id", conversation.conversationId);
-            if (!conversation.parentMessageId.isBlank()) body.put("parent_message_id", conversation.parentMessageId);
+            else body.remove("conversation_id");
+            body.put("parent_message_id", parentMessageId);
             String path = curl.url().encodedPath();
             if (path.isBlank()) path = "/backend-api/f/conversation";
             body.put("client_prepare_state", "success");
 
+            RequestContext context = new RequestContext(curl.url(), new LinkedHashMap<>(curl.headers()));
+            Bootstrap bootstrap = bootstrap(context);
+            Sentinel sentinel = sentinel(context, bootstrap);
+            String freshConduit = refreshConduit(context, body, message, parentMessageId);
+
             Request.Builder builder = new Request.Builder().url(curl.url())
                     .post(RequestBody.create(jsonStringify(body), JSON_MEDIA_TYPE));
-            curl.headers().forEach((name, value) -> {
-                String lower = name.toLowerCase(Locale.ROOT);
-                if (!lower.equals("host") && !lower.equals("content-length") && !lower.equals("content-type")) {
-                    builder.header(name, value);
-                }
-            });
-            builder.header("content-type", "application/json")
+            applyBaseHeaders(builder, context, path);
+            builder.header("x-conduit-token", freshConduit)
+                    .header("openai-sentinel-chat-requirements-token", sentinel.token())
+                    .header("content-type", "application/json")
                     .header("accept", "text/event-stream")
                     .header("x-openai-target-path", path)
                     .header("x-openai-target-route", path);
+            builder.header("x-oai-turn-trace-id", UUID.randomUUID().toString());
+            if (!sentinel.proofToken().isBlank()) builder.header("openai-sentinel-proof-token", sentinel.proofToken());
+            if (!sentinel.turnstileToken().isBlank()) builder.header("openai-sentinel-turnstile-token", sentinel.turnstileToken());
+            if (!sentinel.soToken().isBlank()) builder.header("openai-sentinel-so-token", sentinel.soToken());
             try (Response response = client.newCall(builder.build()).execute()) {
                 if (!response.isSuccessful() || response.body() == null) {
                     String error = response.body() == null ? "" : response.body().string();
+                    if (response.code() == 401 || response.code() == 403) {
+                        throw new IOException("ChatGPT curl 凭据已过期或触发设备风控（HTTP " + response.code()
+                                + "）。请在同一浏览器/网络中重新复制最新 conversation curl 后保存；不要复用旧的 conduit/sentinel token。响应=" + preview(error));
+                    }
                     throw new IOException("ChatGPT curl 请求失败，HTTP 状态=" + response.code() + "，响应=" + preview(error));
                 }
                 String text = "";
@@ -3040,8 +3050,7 @@ public class Main {
                     String cid = stringValue(map.get("conversation_id"));
                     if (cid.isBlank()) cid = nestedString(map, "conversation_id");
                     if (!cid.isBlank()) conversationId = cid;
-                    String messageId = nestedString(map, "message_id");
-                    if (messageId.isBlank()) messageId = nestedString(map, "id");
+                    String messageId = assistantMessageId(map);
                     String next = extractChatGptText(map, text);
                     if (!next.equals(text)) {
                         String delta = next.startsWith(text) ? next.substring(text.length()) : next;
@@ -3052,9 +3061,383 @@ public class Main {
                 }
                 if (text.isBlank()) throw new IOException("ChatGPT SSE 未返回文本");
                 conversation.conversationId = conversationId;
+                conversation.parentMessageId = conversation.parentMessageId.isBlank()
+                        ? parentMessageId : conversation.parentMessageId;
                 return new GeminiResult(text, conversationId, "", conversation.parentMessageId);
             }
         }
+
+        private Bootstrap bootstrap(RequestContext context) throws IOException {
+            String path = "/";
+            Request.Builder builder = new Request.Builder().url(context.url.newBuilder().encodedPath(path).build())
+                    .get();
+            applyBaseHeaders(builder, context, path);
+            builder.header("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+            builder.header("sec-fetch-dest", "document")
+                    .header("sec-fetch-mode", "navigate")
+                    .header("sec-fetch-site", "none")
+                    .header("sec-fetch-user", "?1")
+                    .header("upgrade-insecure-requests", "1");
+            try (Response response = client.newCall(builder.build()).execute()) {
+                if (!response.isSuccessful() || response.body() == null) throw httpError("ChatGPT 首页", response);
+                String html = response.body().string();
+                java.util.ArrayList<String> scripts = new java.util.ArrayList<>();
+                Matcher matcher = Pattern.compile("<script[^>]+src=[\\\"']([^\\\"']+)", Pattern.CASE_INSENSITIVE).matcher(html);
+                while (matcher.find()) {
+                    String source = matcher.group(1);
+                    if (source.startsWith("/")) source = context.url.scheme() + "://" + context.url.host() + source;
+                    scripts.add(source);
+                }
+                Matcher build = Pattern.compile("(?:data-build|buildId)=[\\\"']([^\\\"']+)", Pattern.CASE_INSENSITIVE).matcher(html);
+                String dataBuild = build.find() ? build.group(1) : "";
+                if (dataBuild.isBlank()) {
+                    Matcher scriptBuild = Pattern.compile("/c/([^/]+)/_", Pattern.CASE_INSENSITIVE).matcher(html);
+                    if (scriptBuild.find()) dataBuild = scriptBuild.group(1);
+                }
+                if (dataBuild.isBlank()) dataBuild = header(context.headers, "oai-client-version");
+                return new Bootstrap(scripts, dataBuild);
+            }
+        }
+
+        private Sentinel sentinel(RequestContext context, Bootstrap bootstrap) throws IOException {
+            String userAgent = header(context.headers, "user-agent");
+            String p = requirementsToken(userAgent, bootstrap);
+            String preparePath = "/backend-api/sentinel/chat-requirements/prepare";
+            String prepareBody = postJson(context, preparePath, "{\"p\":" + SimpleJson.quote(p) + "}", "application/json");
+            Object parsed = SimpleJson.parse(prepareBody);
+            if (!(parsed instanceof Map<?, ?> map)) throw new IOException("ChatGPT requirements 响应不是 JSON：" + preview(prepareBody));
+            String prepareToken = stringValue(map.get("prepare_token"));
+            if (prepareToken.isBlank()) throw new IOException("ChatGPT requirements 缺少 prepare_token：" + preview(prepareBody));
+            Map<?, ?> proof = map.get("proofofwork") instanceof Map<?, ?> value ? value : Map.of();
+            String proofToken = "";
+            if (Boolean.TRUE.equals(proof.get("required"))) {
+                proofToken = proofToken(stringValue(proof.get("seed")), stringValue(proof.get("difficulty")), userAgent, bootstrap);
+            }
+            Map<?, ?> turnstile = map.get("turnstile") instanceof Map<?, ?> value ? value : Map.of();
+            String turnstileToken = "";
+            if (Boolean.TRUE.equals(turnstile.get("required"))) {
+                turnstileToken = solveTurnstile(stringValue(turnstile.get("dx")), p);
+                if (turnstileToken.isBlank()) {
+                    throw new IOException("ChatGPT 要求 Turnstile，dx VM 未返回 token；请在同一浏览器中重新复制 curl 后重试");
+                }
+            }
+            String finalize = "{\"prepare_token\":" + SimpleJson.quote(prepareToken)
+                    + ",\"proof_token\":" + SimpleJson.quote(proofToken)
+                    + ",\"turnstile_token\":" + SimpleJson.quote(turnstileToken) + "}";
+            String finalBody = postJson(context, "/backend-api/sentinel/chat-requirements/finalize", finalize, "application/json");
+            Object finalParsed = SimpleJson.parse(finalBody);
+            if (!(finalParsed instanceof Map<?, ?> finalMap)) throw new IOException("ChatGPT requirements finalize 响应无效：" + preview(finalBody));
+            String requirements = stringValue(finalMap.get("token"));
+            if (requirements.isBlank()) throw new IOException("ChatGPT requirements finalize 缺少 token：" + preview(finalBody));
+            return new Sentinel(requirements, proofToken, turnstileToken, stringValue(finalMap.get("so_token")));
+        }
+
+        private String refreshConduit(RequestContext context, Map<String, Object> conversationBody,
+                                      Map<String, Object> message, String parentMessageId) throws IOException {
+            String path = "/backend-api/f/conversation/prepare";
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("action", "next");
+            body.put("fork_from_shared_post", false);
+            body.put("parent_message_id", parentMessageId);
+            body.put("model", conversationBody.getOrDefault("model", "auto"));
+            body.put("client_prepare_state", "none");
+            body.put("timezone_offset_min", conversationBody.getOrDefault("timezone_offset_min", -480));
+            body.put("timezone", conversationBody.getOrDefault("timezone", "Asia/Shanghai"));
+            body.put("conversation_mode", conversationBody.getOrDefault("conversation_mode", Map.of("kind", "primary_assistant")));
+            body.put("system_hints", conversationBody.getOrDefault("system_hints", List.of()));
+            body.put("partial_query", message);
+            body.put("supports_buffering", conversationBody.getOrDefault("supports_buffering", true));
+            body.put("supported_encodings", conversationBody.getOrDefault("supported_encodings", List.of("v1")));
+            body.put("client_contextual_info", conversationBody.getOrDefault("client_contextual_info", Map.of("app_name", "chatgpt.com")));
+            String raw = jsonStringify(body);
+            Request.Builder builder = new Request.Builder().url(context.url.newBuilder().encodedPath(path).build())
+                    .post(RequestBody.create(raw, JSON_MEDIA_TYPE));
+            applyBaseHeaders(builder, context, path);
+            builder.header("accept", "application/json")
+                    .header("content-type", "application/json")
+                    .header("x-conduit-token", "no-token")
+                    .header("x-openai-target-path", path)
+                    .header("x-openai-target-route", path);
+            try (Response response = client.newCall(builder.build()).execute()) {
+                if (!response.isSuccessful() || response.body() == null) {
+                    String error = response.body() == null ? "" : response.body().string();
+                    throw new IOException("ChatGPT conversation/prepare 请求失败，HTTP 状态=" + response.code() + "，响应=" + preview(error));
+                }
+                Object parsed = SimpleJson.parse(response.body().string());
+                String conduit = parsed instanceof Map<?, ?> map ? stringValue(map.get("conduit_token")) : "";
+                if (conduit.isBlank()) throw new IOException("ChatGPT conversation/prepare 缺少 conduit_token");
+                return conduit;
+            }
+        }
+
+        private String postJson(RequestContext context, String path, String body, String accept) throws IOException {
+            Request.Builder builder = new Request.Builder().url(context.url.newBuilder().encodedPath(path).build())
+                    .post(RequestBody.create(body, JSON_MEDIA_TYPE));
+            applyBaseHeaders(builder, context, path);
+            builder.header("accept", accept).header("content-type", "application/json")
+                    .header("x-openai-target-path", path).header("x-openai-target-route", path);
+            if (path.endsWith("/conversation/prepare")) builder.header("x-conduit-token", "no-token");
+            try (Response response = client.newCall(builder.build()).execute()) {
+                if (!response.isSuccessful() || response.body() == null) throw httpError(path, response);
+                return response.body().string();
+            }
+        }
+
+        private static void applyBaseHeaders(Request.Builder builder, RequestContext context, String path) {
+            context.headers.forEach((name, value) -> {
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (lower.equals("host") || lower.equals("content-length") || lower.equals("content-type")
+                        || lower.equals("accept") || lower.equals("x-conduit-token")
+                        || lower.equals("x-openai-target-path") || lower.equals("x-openai-target-route")
+                        || lower.startsWith("openai-sentinel-") || lower.equals("x-oai-is-client-observation")
+                        || lower.equals("x-oai-turn-trace-id")) return;
+                builder.header(name, value);
+            });
+        }
+
+        private static String header(Map<String, String> headers, String name) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                if (entry.getKey().equalsIgnoreCase(name)) return entry.getValue();
+            }
+            return "";
+        }
+
+        private static String requirementsToken(String userAgent, Bootstrap bootstrap) {
+            long started = System.nanoTime();
+            java.util.ArrayList<Object> values = powConfig(userAgent, bootstrap);
+            values.set(3, 1);
+            values.set(9, (System.nanoTime() - started) / 1_000_000.0);
+            return "gAAAAAC" + Base64.getEncoder().encodeToString(jsonStringify(values).getBytes(StandardCharsets.UTF_8));
+        }
+
+        private static String proofToken(String seed, String difficulty, String userAgent, Bootstrap bootstrap) throws IOException {
+            java.util.ArrayList<Object> values = powConfig(userAgent, bootstrap);
+            byte[] target;
+            try {
+                target = java.util.HexFormat.of().parseHex(difficulty.replaceFirst("^0x", ""));
+            } catch (IllegalArgumentException e) {
+                throw new IOException("PoW difficulty 无效", e);
+            }
+            byte[] seedBytes = seed.getBytes(StandardCharsets.UTF_8);
+            int prefixLength = Math.max(0, target.length);
+            for (int i = 0; i < 2_000_000; i++) {
+                String prefix = jsonStringify(values.subList(0, 3));
+                prefix = prefix.substring(0, prefix.length() - 1) + ",";
+                String middle = jsonStringify(values.subList(4, 9));
+                middle = "," + middle.substring(1, middle.length() - 1) + ",";
+                String suffix = jsonStringify(values.subList(10, values.size()));
+                suffix = "," + suffix.substring(1);
+                String encodedText = prefix + i + middle + (i >> 1) + suffix;
+                byte[] encoded = Base64.getEncoder().encode(encodedText.getBytes(StandardCharsets.UTF_8));
+                byte[] digest;
+                try {
+                    digest = java.security.MessageDigest.getInstance("SHA3-512").digest(join(seedBytes, encoded));
+                } catch (NoSuchAlgorithmException e) {
+                    throw new IOException("JDK 不支持 SHA3-512", e);
+                }
+                if (lessOrEqual(digest, target, prefixLength)) {
+                    return "gAAAAAB" + new String(encoded, StandardCharsets.US_ASCII) + "~S";
+                }
+            }
+            throw new IOException("ChatGPT PoW 在 2000000 次尝试内未完成");
+        }
+
+        private static java.util.ArrayList<Object> powConfig(String userAgent, Bootstrap bootstrap) {
+            java.util.ArrayList<Object> values = new java.util.ArrayList<>();
+            int[][] screens = {{1920, 1080}, {1440, 900}, {2560, 1440}, {3840, 2160}};
+            int[] screen = screens[ThreadLocalRandom.current().nextInt(screens.length)];
+            values.add(screen[0] + screen[1]);
+            values.add(new java.text.SimpleDateFormat("EEE MMM dd yyyy HH:mm:ss 'GMT-0500 (Eastern Standard Time)'", Locale.US).format(new java.util.Date()));
+            values.add(4294705152L);
+            values.add(1);
+            values.add(userAgent == null || userAgent.isBlank() ? "Mozilla/5.0" : userAgent);
+            List<String> scripts = bootstrap.scripts();
+            values.add(scripts.isEmpty() ? "https://chatgpt.com/backend-api/sentinel/sdk.js" : scripts.get(ThreadLocalRandom.current().nextInt(scripts.size())));
+            values.add(bootstrap.dataBuild());
+            values.add("zh-CN");
+            values.add("zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7");
+            values.add(Math.random());
+            String[] navigatorKeys = {"vendor−Google Inc.", "language−zh-CN", "webdriver−false", "cookieEnabled−true", "hardwareConcurrency−32", "platform−Linux x86_64"};
+            String[] documentKeys = {"__reactContainer$fzelfjyxej8", "_reactListening5dehydibo78", "location"};
+            String[] windowKeys = {"window", "document", "location", "navigator", "performance", "crypto", "localStorage", "fetch", "setTimeout"};
+            values.add(navigatorKeys[ThreadLocalRandom.current().nextInt(navigatorKeys.length)]);
+            values.add(documentKeys[ThreadLocalRandom.current().nextInt(documentKeys.length)]);
+            values.add(windowKeys[ThreadLocalRandom.current().nextInt(windowKeys.length)]);
+            values.add(System.nanoTime() / 1_000_000.0);
+            values.add(UUID.randomUUID().toString());
+            values.add("");
+            values.add(new int[]{8, 16, 24, 32}[ThreadLocalRandom.current().nextInt(4)]);
+            values.add(System.currentTimeMillis() * 1.0 - System.nanoTime() / 1_000_000.0);
+            values.add(0); values.add(0); values.add(0); values.add(0); values.add(0); values.add(0); values.add(0);
+            return values;
+        }
+
+        private static byte[] join(byte[] a, byte[] b) {
+            byte[] out = java.util.Arrays.copyOf(a, a.length + b.length);
+            System.arraycopy(b, 0, out, a.length, b.length);
+            return out;
+        }
+
+        private static boolean lessOrEqual(byte[] a, byte[] b, int count) {
+            for (int i = 0; i < count; i++) {
+                int left = a[i] & 255, right = b[i] & 255;
+                if (left < right) return true;
+                if (left > right) return false;
+            }
+            return true;
+        }
+
+        /** Small interpreter for the dx instruction format documented in 111.html. */
+        private static String solveTurnstile(String dx, String key) {
+            if (dx == null || dx.isBlank() || key == null || key.isBlank()) return "";
+            try {
+                byte[] encoded;
+                try { encoded = Base64.getDecoder().decode(dx); }
+                catch (IllegalArgumentException e) { encoded = Base64.getUrlDecoder().decode(dx); }
+                String decoded = xor(new String(encoded, StandardCharsets.UTF_8), key);
+                Object parsed = SimpleJson.parse(decoded);
+                if (!(parsed instanceof List<?> instructions)) return "";
+                Map<Integer, Object> values = new LinkedHashMap<>();
+                values.put(3, "__fn3");
+                values.put(9, instructions);
+                values.put(10, "window");
+                values.put(16, key);
+                String[] result = {""};
+                long started = System.nanoTime();
+                for (Object item : instructions) {
+                    if (!(item instanceof List<?> token) || token.isEmpty()) continue;
+                    int op = number(token.get(0));
+                    try {
+                        switch (op) {
+                            case 1 -> values.put(number(token.get(1)), xor(jsString(values.get(number(token.get(1)))), jsString(values.get(number(token.get(2))))));
+                            case 2 -> values.put(number(token.get(1)), token.size() > 2 ? token.get(2) : null);
+                            case 3 -> result[0] = Base64.getEncoder().encodeToString(jsString(token.get(1)).getBytes(StandardCharsets.UTF_8));
+                            case 5 -> {
+                                Object left = values.get(number(token.get(1))), right = values.get(number(token.get(2)));
+                                if (left instanceof List<?> list) { java.util.ArrayList<Object> out = new java.util.ArrayList<>(list); out.add(right); values.put(number(token.get(1)), out); }
+                                else values.put(number(token.get(1)), jsString(left) + jsString(right));
+                            }
+                            case 6 -> {
+                                String path = jsString(values.get(number(token.get(2)))) + "." + jsString(values.get(number(token.get(3))));
+                                values.put(number(token.get(1)), "window.document.location".equals(path) ? "https://chatgpt.com" : path);
+                            }
+                            case 7 -> invoke(values, token, result);
+                            case 8 -> values.put(number(token.get(1)), values.get(number(token.get(2))));
+                            case 14 -> values.put(number(token.get(1)), SimpleJson.parse(jsString(values.get(number(token.get(2))))));
+                            case 15 -> values.put(number(token.get(1)), jsonStringify(values.get(number(token.get(2)))));
+                            case 17 -> invokeFunction(values, token, started, result);
+                            case 18 -> {
+                                byte[] raw = Base64.getDecoder().decode(jsString(values.get(number(token.get(1)))));
+                                values.put(number(token.get(1)), new String(raw, StandardCharsets.UTF_8));
+                            }
+                            case 19 -> values.put(number(token.get(1)), Base64.getEncoder().encodeToString(jsString(values.get(number(token.get(1)))).getBytes(StandardCharsets.UTF_8)));
+                            case 20 -> {
+                                if (Objects.equals(values.get(number(token.get(1))), values.get(number(token.get(2))))) {
+                                    invokeFunctionAt(values, token, 3, started, result);
+                                }
+                            }
+                            case 21 -> { }
+                            case 23 -> { if (values.get(number(token.get(1))) != null) invokeFunctionAt(values, token, 2, started, result); }
+                            case 24 -> {
+                                String path = jsString(values.get(number(token.get(1)))) + "." + jsString(values.get(number(token.get(2))));
+                                values.put(number(token.get(1)), path);
+                            }
+                            default -> { }
+                        }
+                    } catch (RuntimeException ignored) {
+                        // The browser VM ignores an individual malformed instruction.
+                    }
+                    if (System.nanoTime() - started > 500_000_000L) break;
+                }
+                return result[0];
+            } catch (Exception ignored) {
+                return "";
+            }
+        }
+
+        private static void invoke(Map<Integer, Object> values, List<?> token, String[] result) {
+            Object target = values.get(number(token.get(1)));
+            if ("window.Reflect.set".equals(target) && token.size() > 4) {
+                Object object = values.get(number(token.get(2)));
+                if (object instanceof Map<?, ?> map) {
+                    @SuppressWarnings("unchecked") Map<Object, Object> writable = (Map<Object, Object>) map;
+                    writable.put(values.get(number(token.get(3))), values.get(number(token.get(4))));
+                }
+            } else if ("__fn3".equals(target) && token.size() > 2) {
+                result[0] = Base64.getEncoder().encodeToString(jsString(values.get(number(token.get(2)))).getBytes(StandardCharsets.UTF_8));
+            }
+        }
+
+        private static void invokeFunction(Map<Integer, Object> values, List<?> token, long started, String[] result) {
+            if (token.size() < 3) return;
+            Object target = values.get(number(token.get(2)));
+            if (!(target instanceof String name)) return;
+            if ("window.performance.now".equals(name)) values.put(number(token.get(1)), (System.nanoTime() - started) / 1_000_000.0);
+            else if ("window.Math.random".equals(name)) values.put(number(token.get(1)), Math.random());
+            else if ("window.Object.create".equals(name)) values.put(number(token.get(1)), new LinkedHashMap<>());
+            else if ("window.Object.keys".equals(name)) values.put(number(token.get(1)), List.of(
+                    "STATSIG_LOCAL_STORAGE_INTERNAL_STORE_V4", "STATSIG_LOCAL_STORAGE_STABLE_ID",
+                    "client-correlated-secret", "oai/apps/capExpiresAt", "oai-did",
+                    "STATSIG_LOCAL_STORAGE_LOGGING_REQUEST", "UiState.isNavigationCollapsed.1"));
+        }
+
+        private static void invokeFunctionAt(Map<Integer, Object> values, List<?> token, int targetIndex, long started, String[] result) {
+            if (token.size() <= targetIndex) return;
+            Object target = values.get(number(token.get(targetIndex)));
+            if (target instanceof String name && name.startsWith("__fn")) {
+                if ("__fn3".equals(name) && token.size() > targetIndex + 1) {
+                    Object argument = values.get(number(token.get(targetIndex + 1)));
+                    result[0] = Base64.getEncoder().encodeToString(jsString(argument).getBytes(StandardCharsets.UTF_8));
+                    return;
+                }
+                List<Object> copy = new java.util.ArrayList<>();
+                copy.add(17); copy.add(token.get(0)); copy.add(target);
+                invokeFunction(values, copy, started, result);
+            }
+        }
+
+        private static int number(Object value) {
+            return value instanceof Number n ? n.intValue() : Integer.parseInt(String.valueOf(value));
+        }
+
+        private static String xor(String text, String key) {
+            StringBuilder out = new StringBuilder(text.length());
+            for (int i = 0; i < text.length(); i++) out.append((char) (text.charAt(i) ^ key.charAt(i % key.length())));
+            return out.toString();
+        }
+
+        private static String jsString(Object value) {
+            if (value == null) return "undefined";
+            if (value instanceof String string) {
+                return switch (string) {
+                    case "window.Math" -> "[object Math]";
+                    case "window.Reflect" -> "[object Reflect]";
+                    case "window.performance" -> "[object Performance]";
+                    case "window.localStorage" -> "[object Storage]";
+                    case "window.Object" -> "function Object() { [native code] }";
+                    case "window.Reflect.set" -> "function set() { [native code] }";
+                    case "window.performance.now" -> "function () { [native code] }";
+                    case "window.Object.create" -> "function create() { [native code] }";
+                    case "window.Object.keys" -> "function keys() { [native code] }";
+                    case "window.Math.random" -> "function random() { [native code] }";
+                    default -> string;
+                };
+            }
+            if (value instanceof List<?> list && list.stream().allMatch(item -> item instanceof String)) {
+                return list.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+            }
+            if (value instanceof Double d && d == Math.rint(d)) return Long.toString(d.longValue());
+            return String.valueOf(value);
+        }
+
+        private static IOException httpError(String operation, Response response) throws IOException {
+            String body = response.body() == null ? "" : response.body().string();
+            return new IOException(operation + " 请求失败，HTTP 状态=" + response.code() + "，响应=" + preview(body));
+        }
+
+        private record RequestContext(HttpUrl url, Map<String, String> headers) {}
+        private record Bootstrap(java.util.List<String> scripts, String dataBuild) {}
+        private record Sentinel(String token, String proofToken, String turnstileToken, String soToken) {}
 
         private static Map<String, Object> chatMessage(String text) {
             Map<String, Object> message = new LinkedHashMap<>();
@@ -3062,7 +3445,14 @@ public class Main {
             message.put("author", Map.of("role", "user"));
             message.put("create_time", System.currentTimeMillis() / 1000.0);
             message.put("content", Map.of("content_type", "text", "parts", List.of(text)));
-            message.put("metadata", Map.of("submission_mode", "manual_send", "__internal", Map.of("search_settings", Map.of())));
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            metadata.put("developer_mode_connector_ids", List.of());
+            metadata.put("selected_sources", List.of());
+            metadata.put("selected_github_repos", List.of());
+            metadata.put("selected_all_github_repos", false);
+            metadata.put("serialization_metadata", Map.of("custom_symbol_offsets", List.of()));
+            metadata.put("submission_mode", "manual_send");
+            message.put("metadata", metadata);
             return message;
         }
 
@@ -3074,6 +3464,32 @@ public class Main {
                     String found = nestedString(nested, key);
                     if (!found.isBlank()) return found;
                 }
+            }
+            return "";
+        }
+
+        private static String assistantMessageId(Object value) {
+            if (value instanceof List<?> list) {
+                for (Object child : list) {
+                    String found = assistantMessageId(child);
+                    if (!found.isBlank()) return found;
+                }
+                return "";
+            }
+            if (!(value instanceof Map<?, ?> map)) return "";
+            Object message = map.get("message");
+            if (message instanceof Map<?, ?> messageMap) {
+                Object author = messageMap.get("author");
+                if (author instanceof Map<?, ?> authorMap && "assistant".equals(stringValue(authorMap.get("role")))) {
+                    String id = stringValue(messageMap.get("id"));
+                    if (!id.isBlank()) return id;
+                }
+            }
+            String direct = stringValue(map.get("message_id"));
+            if (!direct.isBlank()) return direct;
+            for (Object child : map.values()) {
+                String found = assistantMessageId(child);
+                if (!found.isBlank()) return found;
             }
             return "";
         }
@@ -3393,8 +3809,13 @@ public class Main {
                         && msg.get("author") instanceof Map<?, ?> author
                         && "assistant".equals(stringValue(author.get("role")))) {
                     Object content = msg.get("content");
-                    if (content instanceof Map<?, ?> contentMap && contentMap.get("parts") instanceof java.util.List<?> parts) {
-                        StringBuilder out = new StringBuilder(); for (Object part : parts) if (part instanceof String s) out.append(s); if (!out.isEmpty()) return out.toString();
+                    if (content instanceof Map<?, ?> contentMap) {
+                        if (contentMap.get("text") instanceof String text && !text.isBlank()) return text;
+                        if (contentMap.get("parts") instanceof java.util.List<?> parts) {
+                            StringBuilder out = new StringBuilder();
+                            for (Object part : parts) if (part instanceof String s) out.append(s);
+                            if (!out.isEmpty()) return out.toString();
+                        }
                     }
                 }
             }
