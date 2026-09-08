@@ -3042,20 +3042,31 @@ public class Main {
                 while (true) {
                     String line = response.body().source().readUtf8Line();
                     if (line == null) break;
-                    if (!line.startsWith("data:")) continue;
-                    String data = line.substring(5).trim();
+                    String sseLine = line.stripLeading();
+                    if (!sseLine.startsWith("data:")) continue;
+                    String data = sseLine.substring(5).trim();
                     if (data.isBlank() || "[DONE]".equals(data)) continue;
-                    Object event = SimpleJson.parse(data);
+                    Object event;
+                    try {
+                        event = SimpleJson.parse(data);
+                    } catch (RuntimeException malformedEvent) {
+                        // A malformed/non-JSON SSE control line must not discard the
+                        // text already collected from the stream.
+                        continue;
+                    }
                     if (!(event instanceof Map<?, ?> map)) continue;
                     String cid = stringValue(map.get("conversation_id"));
                     if (cid.isBlank()) cid = nestedString(map, "conversation_id");
                     if (!cid.isBlank()) conversationId = cid;
                     String messageId = assistantMessageId(map);
                     String next = extractChatGptText(map, text);
-                    if (!next.equals(text)) {
-                        String delta = next.startsWith(text) ? next.substring(text.length()) : next;
+                    String merged = mergeChatGptSnapshot(text, next);
+                    if (merged.length() > text.length()) {
+                        String delta = merged.startsWith(text) ? merged.substring(text.length()) : merged;
                         if (!delta.isBlank() && deltaSink != null) deltaSink.accept(delta);
-                        text = next;
+                        // ChatGPT occasionally emits a stale snapshot after a patch.
+                        // Never let it replace a longer response with a shorter one.
+                        text = merged;
                     }
                     if (!messageId.isBlank() && messageId.length() > 20) conversation.parentMessageId = messageId;
                 }
@@ -3517,30 +3528,88 @@ public class Main {
 
         private static String extractChatGptText(Object value, String current) {
             if (!(value instanceof Map<?, ?> map)) return current;
+            String result = current;
             for (Object candidate : new Object[]{map, map.get("v")}) {
                 if (!(candidate instanceof Map<?, ?> nested)) continue;
+                if (nested != map && (nested.containsKey("p") || nested.containsKey("o"))) {
+                    result = extractChatGptText(nested, result);
+                }
                 Object message = nested.get("message");
                 if (message instanceof Map<?, ?> msg && msg.get("author") instanceof Map<?, ?> author
                         && "assistant".equals(stringValue(author.get("role")))) {
                     Object content = msg.get("content");
-                    if (content instanceof Map<?, ?> cm && cm.get("parts") instanceof List<?> parts) {
-                        StringBuilder out = new StringBuilder();
-                        for (Object part : parts) if (part instanceof String s) out.append(s);
-                        if (!out.isEmpty()) return out.toString();
+                    String snapshot = chatGptContentText(content);
+                    result = mergeChatGptSnapshot(result, snapshot);
+                }
+            }
+            String operation = stringValue(map.get("o"));
+            if ("patch".equalsIgnoreCase(operation) && map.get("v") instanceof List<?> list) {
+                for (Object item : list) result = extractChatGptText(item, result);
+            }
+            String path = stringValue(map.get("p"));
+            if (path.startsWith("/message/content/parts/") || path.startsWith("/message/content/text")) {
+                String valueText = chatGptPatchValue(map.get("v"));
+                if (valueText.isEmpty()) return result;
+                if ("append".equalsIgnoreCase(operation) || "add".equalsIgnoreCase(operation)) {
+                    return appendChatGptText(result, valueText);
+                }
+                if ("replace".equalsIgnoreCase(operation) || "set".equalsIgnoreCase(operation)) {
+                    // Part 0 is the assistant answer. Other part indexes are
+                    // metadata/citations and must not replace the answer.
+                    if (path.contains("/parts/0") || path.endsWith("/text")) {
+                        result = valueText.length() >= result.length() ? valueText : result;
                     }
                 }
             }
-            if ("/message/content/parts/0".equals(stringValue(map.get("p")))) {
-                String valueText = stringValue(map.get("v"));
-                if ("append".equals(stringValue(map.get("o")))) return current + valueText;
-                if ("replace".equals(stringValue(map.get("o")))) return valueText;
-            }
-            if ("patch".equals(stringValue(map.get("o"))) && map.get("v") instanceof List<?> list) {
-                String out = current;
-                for (Object item : list) out = extractChatGptText(item, out);
-                return out;
-            }
+            return result;
+        }
+
+        private static String appendChatGptText(String current, String addition) {
+            if (addition.isEmpty()) return current;
+            // Whitespace-only deltas (especially Markdown blank lines) are valid
+            // output even when the accumulated text already ends in whitespace.
+            if (!addition.isBlank() && current.endsWith(addition)) return current;
+            if (addition.startsWith(current)) return addition;
+            return current + addition;
+        }
+
+        private static String mergeChatGptSnapshot(String current, String snapshot) {
+            if (snapshot.isEmpty() || snapshot.equals(current)) return current;
+            if (current.isEmpty() || snapshot.startsWith(current)) return snapshot;
+            // A stale/partial or unrelated snapshot must never discard text.
             return current;
+        }
+
+        private static String chatGptContentText(Object content) {
+            if (content instanceof String text) return text;
+            if (!(content instanceof Map<?, ?> map)) return "";
+            String direct = stringValue(map.get("text"));
+            if (!direct.isEmpty()) return direct;
+            Object partsValue = map.get("parts");
+            if (!(partsValue instanceof List<?> parts)) return "";
+            StringBuilder out = new StringBuilder();
+            for (Object part : parts) {
+                if (part instanceof String text) out.append(text);
+                else if (part instanceof Map<?, ?> partMap) {
+                    String text = firstNonBlank(stringValue(partMap.get("text")), stringValue(partMap.get("value")));
+                    if (!text.isEmpty()) out.append(text);
+                }
+            }
+            return out.toString();
+        }
+
+        private static String chatGptPatchValue(Object value) {
+            if (value instanceof String text) return text;
+            if (value instanceof List<?> list) {
+                StringBuilder out = new StringBuilder();
+                for (Object item : list) out.append(chatGptPatchValue(item));
+                return out.toString();
+            }
+            if (value instanceof Map<?, ?> map) {
+                return firstNonBlank(stringValue(map.get("text")), stringValue(map.get("value")),
+                        chatGptContentText(map));
+            }
+            return "";
         }
 
         private static String jsonStringify(Object value) {
@@ -3719,18 +3788,25 @@ public class Main {
                 while (true) {
                     String line = response.body().source().readUtf8Line();
                     if (line == null) break;
-                    if (!line.startsWith("data:")) continue;
-                    String data = line.substring(5).trim();
+                    String sseLine = line.stripLeading();
+                    if (!sseLine.startsWith("data:")) continue;
+                    String data = sseLine.substring(5).trim();
                     if (data.isBlank() || "[DONE]".equals(data)) continue;
-                    Object event = SimpleJson.parse(data);
+                    Object event;
+                    try {
+                        event = SimpleJson.parse(data);
+                    } catch (RuntimeException malformedEvent) {
+                        continue;
+                    }
                     if (!(event instanceof Map<?, ?> map)) continue;
                     String cid = stringValue(map.get("conversation_id"));
                     if (!cid.isBlank()) conversationId = cid;
                     String next = extractChatGptText(event, current);
-                    if (!next.equals(current)) {
-                        String delta = next.startsWith(current) ? next.substring(current.length()) : next;
+                    String merged = mergeChatGptSnapshot(current, next);
+                    if (merged.length() > current.length()) {
+                        String delta = merged.startsWith(current) ? merged.substring(current.length()) : merged;
                         if (!delta.isBlank() && deltaSink != null) deltaSink.accept(delta);
-                        current = next;
+                        current = merged;
                     }
                 }
                 if (current.isBlank()) throw new IOException("ChatGPT SSE 未返回文本");
@@ -3823,32 +3899,79 @@ public class Main {
 
         private static String extractChatGptText(Object value, String current) {
             if (!(value instanceof Map<?, ?> map)) return current;
+            String result = current;
             for (Object candidate : new Object[]{map, map.get("v")}) {
                 if (!(candidate instanceof Map<?, ?> nested)) continue;
+                if (nested != map && (nested.containsKey("p") || nested.containsKey("o"))) {
+                    result = extractChatGptText(nested, result);
+                }
                 Object message = nested.get("message");
                 if (message instanceof Map<?, ?> msg
                         && msg.get("author") instanceof Map<?, ?> author
                         && "assistant".equals(stringValue(author.get("role")))) {
                     Object content = msg.get("content");
-                    if (content instanceof Map<?, ?> contentMap) {
-                        if (contentMap.get("text") instanceof String text && !text.isBlank()) return text;
-                        if (contentMap.get("parts") instanceof java.util.List<?> parts) {
-                            StringBuilder out = new StringBuilder();
-                            for (Object part : parts) if (part instanceof String s) out.append(s);
-                            if (!out.isEmpty()) return out.toString();
-                        }
-                    }
+                    String snapshot = chatGptContentText(content);
+                    result = mergeChatGptSnapshot(result, snapshot);
                 }
             }
-            if ("/message/content/parts/0".equals(stringValue(map.get("p")))) {
-                String valueText = stringValue(map.get("v"));
-                if ("append".equals(stringValue(map.get("o")))) return current + valueText;
-                if ("replace".equals(stringValue(map.get("o")))) return valueText;
+            String operation = stringValue(map.get("o"));
+            if ("patch".equalsIgnoreCase(operation) && map.get("v") instanceof java.util.List<?> list) {
+                for (Object item : list) result = extractChatGptText(item, result);
             }
-            if ("patch".equals(stringValue(map.get("o"))) && map.get("v") instanceof java.util.List<?> list) {
-                String out = current; for (Object item : list) out = extractChatGptText(item, out); return out;
+            String path = stringValue(map.get("p"));
+            if (path.startsWith("/message/content/parts/") || path.startsWith("/message/content/text")) {
+                String valueText = chatGptPatchValue(map.get("v"));
+                if (valueText.isEmpty()) return result;
+                if ("append".equalsIgnoreCase(operation) || "add".equalsIgnoreCase(operation)) return appendChatGptText(result, valueText);
+                if (("replace".equalsIgnoreCase(operation) || "set".equalsIgnoreCase(operation))
+                        && (path.contains("/parts/0") || path.endsWith("/text"))
+                        && valueText.length() >= result.length()) return valueText;
             }
+            return result;
+        }
+
+        private static String appendChatGptText(String current, String addition) {
+            if (addition.isEmpty()) return current;
+            if (!addition.isBlank() && current.endsWith(addition)) return current;
+            if (addition.startsWith(current)) return addition;
+            return current + addition;
+        }
+
+        private static String mergeChatGptSnapshot(String current, String snapshot) {
+            if (snapshot.isEmpty() || snapshot.equals(current)) return current;
+            if (current.isEmpty() || snapshot.startsWith(current)) return snapshot;
             return current;
+        }
+
+        private static String chatGptContentText(Object content) {
+            if (content instanceof String text) return text;
+            if (!(content instanceof Map<?, ?> map)) return "";
+            String direct = stringValue(map.get("text"));
+            if (!direct.isEmpty()) return direct;
+            Object partsValue = map.get("parts");
+            if (!(partsValue instanceof java.util.List<?> parts)) return "";
+            StringBuilder out = new StringBuilder();
+            for (Object part : parts) {
+                if (part instanceof String text) out.append(text);
+                else if (part instanceof Map<?, ?> partMap) {
+                    String text = firstNonBlank(stringValue(partMap.get("text")), stringValue(partMap.get("value")));
+                    if (!text.isEmpty()) out.append(text);
+                }
+            }
+            return out.toString();
+        }
+
+        private static String chatGptPatchValue(Object value) {
+            if (value instanceof String text) return text;
+            if (value instanceof java.util.List<?> list) {
+                StringBuilder out = new StringBuilder();
+                for (Object item : list) out.append(chatGptPatchValue(item));
+                return out.toString();
+            }
+            if (value instanceof Map<?, ?> map) {
+                return firstNonBlank(stringValue(map.get("text")), stringValue(map.get("value")), chatGptContentText(map));
+            }
+            return "";
         }
 
         private static String jsonStringify(Object value) {
@@ -3920,9 +4043,9 @@ public class Main {
         }
 
         private static String isolatedPrompt(String transcript) {
-            return "当前对话正在通过 OpenAI 兼容网关回答。如果用户让你生成图片请你正常生成。图片生成请不要使用任何工具(如果你不是gemini请忽略图片相关)\n"
+            return "当前对话正在通过 OpenAI 兼容网关回答。如果用户让你生成图片请你正常生成。图片生成请不要使用任何工具(如你不是gemini请忽略)\n"
                     + "下面的“当前会话上下文”是唯一允许使用的上下文。\n"
-                    + "如果上层客户端提供了工具，工具只能由 OpenAI 兼容客户端执行；你不能在 Claude 自己的环境、容器、浏览器、终端或内置工具里执行这些工具。\n"
+                    + "工具调用(铁律)：工具调用请直接把工具的调用链通过对话输出出来，不要在自己的容器中执行工具调用(如有)。并且单次工具调用输出后请直接[done]对话等待工具调用结果返回\n"
                     + "当前会话上下文：\n"
                     + transcript;
         }
