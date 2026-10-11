@@ -166,6 +166,44 @@ OPENAI_HOST_PORT=16000 NOVNC_PORT=16082 VNC_PORT=15910 \
   docker compose up -d --build
 ```
 
+### DeepSeek 网页端模型
+
+项目也实现了 chat.deepseek.com 网页端链路。打开首页的“DeepSeek Curl”页，粘贴
+DevTools 复制的 `https://chat.deepseek.com/api/v0/chat/completion` 完整 curl（含
+`authorization: Bearer …` 与 `cookie`），服务端会提取 URL、Header 和 body 并存入
+`data/deepseek-curls.sqlite`。模型会以 `deepseek-web` 与 `deepseek-reasoner` 出现在
+`/v1/models`。
+
+- `deepseek-web`：`model_type=default`，关闭思考，等价于网页快速模式。
+- `deepseek-reasoner`：`model_type=expert`，开启 `thinking_enabled`。思维链（THINK
+  片段）会作为 `reasoning_content` 返回：`/v1/chat/completions` 的流式 chunk 与
+  非流式 message 都带该字段；`/v1/responses` 会输出
+  `response.reasoning_text.delta` / `.done` 事件，并在 `output` 里附带一个
+  `reasoning` 条目。支持 `reasoning_content` 的客户端（OpenWebUI、LobeChat、
+  Cherry Studio、Chatbox 等）会自动折叠显示思考过程。
+
+图片（`image_url` / `input_image`）也支持：服务端会走 DeepSeek 的
+`/api/v0/file/upload_file`（每次上传单独解一次 PoW），拿到文件 id 后放进 completion
+的 `ref_file_ids`。单张图片上传失败会被跳过并提示模型不要臆测，不影响文字回答。
+
+每次业务请求前，服务端都会先调用 `/api/v0/chat/create_pow_challenge` 取回一次性
+挑战，在本地用 DeepSeekHashV1 求解后把答案放进 `X-DS-PoW-Response` 头。挑战带随机
+salt 与有效期且一次性消费，无法复用，因此不需要（也不应该）重放旧的
+`x-ds-pow-response`；保存的 curl 只作为登录上下文和请求模板。多轮对话会复用同一个
+DeepSeek 会话，并按 `response_message_id` 串接 `parent_message_id`。
+
+`DeepSeekHashV1` 为纯 Java 实现（`src/main/java/DeepSeekHash.java`）：Keccak-f[1600]
+海绵，rate=136 字节、输出 256 bit，填充与 SHA3-256 相同（0x06 + 0x80），但置换只跑
+23 轮并使用 `RC[1..23]`（跳过 `RC[0]`），等价于“SHA3-256 少跑一轮”。自检向量：
+
+```text
+H("")    = e594808bc5b7151ac160c6d39a02e0a8e261ed588578403099e3561dc40c26b3
+H("abc") = f841106c601ce9be9bc38525e90d4178d47f21dd8eb9f238fc55ffaa4ca94506
+```
+
+若 DeepSeek 返回 401/403 或 `biz_data` 为空（登录过期），请在同一浏览器/网络中重新
+复制最新 completion curl 后保存。
+
 ## 常用命令
 
 ```bash

@@ -36,23 +36,24 @@ final class OpenAiApiServer {
     private final ChatBackend backend;
     private final ClaudeCookieStore claudeCookieStore;
     private final ChatGptCurlStore chatGptCurlStore;
+    private final DeepSeekCurlStore deepSeekCurlStore;
     private final ProxySettingsBackend proxySettingsBackend;
     private HttpServer server;
     private ExecutorService executor;
 
     OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
                     ClaudeCookieStore claudeCookieStore) {
-        this(host, port, models, defaultModel, backend, claudeCookieStore, null, null);
+        this(host, port, models, defaultModel, backend, claudeCookieStore, null, null, null);
     }
 
     OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
                     ClaudeCookieStore claudeCookieStore, ProxySettingsBackend proxySettingsBackend) {
-        this(host, port, models, defaultModel, backend, claudeCookieStore, null, proxySettingsBackend);
+        this(host, port, models, defaultModel, backend, claudeCookieStore, null, null, proxySettingsBackend);
     }
 
     OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
                     ClaudeCookieStore claudeCookieStore, ChatGptCurlStore chatGptCurlStore,
-                    ProxySettingsBackend proxySettingsBackend) {
+                    DeepSeekCurlStore deepSeekCurlStore, ProxySettingsBackend proxySettingsBackend) {
         this.host = host;
         this.port = port;
         this.defaultModel = defaultModel == null || defaultModel.isBlank() ? "Gemini-web" : defaultModel;
@@ -60,6 +61,7 @@ final class OpenAiApiServer {
         this.backend = backend;
         this.claudeCookieStore = claudeCookieStore;
         this.chatGptCurlStore = chatGptCurlStore;
+        this.deepSeekCurlStore = deepSeekCurlStore;
         this.proxySettingsBackend = proxySettingsBackend;
     }
 
@@ -71,6 +73,7 @@ final class OpenAiApiServer {
         server.createContext("/debug/openai-logs", this::handleOpenAiLogs);
         server.createContext("/debug/claude-cookies", this::handleClaudeCookies);
         server.createContext("/debug/chatgpt-curls", this::handleChatGptCurls);
+        server.createContext("/debug/deepseek-curls", this::handleDeepSeekCurls);
         server.createContext("/debug/proxy", this::handleProxySettings);
         server.createContext("/", this::handleStatic);
         executor = Executors.newCachedThreadPool();
@@ -261,6 +264,47 @@ final class OpenAiApiServer {
         }
     }
 
+    private void handleDeepSeekCurls(HttpExchange exchange) throws IOException {
+        addCorsHeaders(exchange, "GET, POST, DELETE, OPTIONS");
+        if (handleCorsPreflight(exchange)) return;
+        if (deepSeekCurlStore == null) {
+            sendJson(exchange, 500, errorJson("DeepSeek curl 存储未初始化"));
+            return;
+        }
+        try {
+            if (isMethod(exchange, "GET")) {
+                List<DeepSeekCurlStore.CurlRecord> records = deepSeekCurlStore.list();
+                StringBuilder out = new StringBuilder("{\"data\":[");
+                for (int i = 0; i < records.size(); i++) {
+                    if (i > 0) out.append(',');
+                    out.append(records.get(i).publicJson());
+                }
+                sendJson(exchange, 200, out.append("]}").toString());
+                return;
+            }
+            if (isMethod(exchange, "POST")) {
+                Object parsed = SimpleJson.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+                String raw = parsed instanceof Map<?, ?> map ? stringValue(map.get("curl"), "") : "";
+                DeepSeekCurlStore.CurlRecord record = deepSeekCurlStore.addFromCurl(raw);
+                sendJson(exchange, 200, "{\"ok\":true,\"curl\":" + record.publicJson() + "}");
+                return;
+            }
+            if (isMethod(exchange, "DELETE")) {
+                String id = queryValue(exchange.getRequestURI().getRawQuery(), "id");
+                if (id == null || id.isBlank()) {
+                    sendJson(exchange, 400, errorJson("缺少 id", "invalid_request_error"));
+                    return;
+                }
+                deepSeekCurlStore.delete(id);
+                sendJson(exchange, 200, "{\"ok\":true}");
+                return;
+            }
+            sendMethodNotAllowed(exchange, "GET, POST, DELETE, OPTIONS");
+        } catch (Exception e) {
+            sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
+        }
+    }
+
     private String claudeCookieListJson() throws IOException {
         List<ClaudeCookieStore.CookieRecord> records = claudeCookieStore.list();
         StringBuilder out = new StringBuilder("{\"data\":[");
@@ -355,10 +399,11 @@ final class OpenAiApiServer {
                 return;
             }
 
-            String text = backend.complete(chatRequest, null);
+            CollectedDeltas deltas = new CollectedDeltas();
+            String text = backend.complete(chatRequest, deltas);
             ToolCallResult toolCall = parseToolCallResult(text);
             sendJson(exchange, 200, toolCall == null
-                    ? completionJson(model, text)
+                    ? completionJson(model, text, deltas.reasoning())
                     : toolCompletionJson(model, toolCall));
         } catch (IllegalArgumentException e) {
             sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
@@ -413,10 +458,11 @@ final class OpenAiApiServer {
                 return;
             }
 
-            String text = backend.complete(chatRequest, null);
+            CollectedDeltas deltas = new CollectedDeltas();
+            String text = backend.complete(chatRequest, deltas);
             ToolCallResult toolCall = parseToolCallResult(text);
             sendJson(exchange, 200, toolCall == null
-                    ? responseJson(model, text)
+                    ? responseJson(model, text, deltas.reasoning())
                     : toolResponseJson(model, toolCall));
         } catch (IllegalArgumentException e) {
             sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
@@ -438,7 +484,7 @@ final class OpenAiApiServer {
             started = true;
             final OutputStream streamOut = out;
             if (request.hasTools()) {
-                String text = backend.complete(request, null);
+                String text = backend.complete(request, NOOP_DELTAS);
                 ToolCallResult toolCall = parseToolCallResult(text);
                 if (toolCall == null) {
                     if (!text.isEmpty()) {
@@ -454,13 +500,15 @@ final class OpenAiApiServer {
                 return;
             }
 
-            backend.complete(request, delta -> {
-                try {
-                    if (!delta.isEmpty()) {
-                        sendSse(streamOut, chunkJson(id, request.model(), created, delta, false));
-                    }
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
+            backend.complete(request, new DeltaSink() {
+                @Override
+                public void content(String delta) {
+                    sseChunk(streamOut, id, request.model(), created, "content", delta);
+                }
+
+                @Override
+                public void reasoning(String delta) {
+                    sseChunk(streamOut, id, request.model(), created, "reasoning_content", delta);
                 }
             });
             sendSse(streamOut, chunkJson(id, request.model(), created, "", true));
@@ -497,7 +545,7 @@ final class OpenAiApiServer {
             final OutputStream streamOut = out;
             sendResponseSse(streamOut, responseCreatedEvent(id, request.model(), created));
             if (request.hasTools()) {
-                String text = backend.complete(request, null);
+                String text = backend.complete(request, NOOP_DELTAS);
                 ToolCallResult toolCall = parseToolCallResult(text);
                 if (toolCall == null) {
                     String outputId = responseMessageId();
@@ -522,23 +570,46 @@ final class OpenAiApiServer {
             }
 
             StringBuilder text = new StringBuilder();
+            StringBuilder reasoning = new StringBuilder();
             String outputId = responseMessageId();
+            String reasoningItemId = "rs_" + UUID.randomUUID().toString().replace("-", "");
             sendResponseSse(streamOut, responseOutputItemAddedEvent(id, outputId));
             sendResponseSse(streamOut, responseContentPartAddedEvent(id, outputId));
-            backend.complete(request, delta -> {
-                try {
-                    if (!delta.isEmpty()) {
-                        text.append(delta);
-                        sendResponseSse(streamOut, responseTextDeltaEvent(id, delta));
+            backend.complete(request, new DeltaSink() {
+                @Override
+                public void content(String delta) {
+                    if (delta == null || delta.isEmpty()) {
+                        return;
                     }
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
+                    text.append(delta);
+                    try {
+                        sendResponseSse(streamOut, responseTextDeltaEvent(id, delta));
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+
+                @Override
+                public void reasoning(String delta) {
+                    if (delta == null || delta.isEmpty()) {
+                        return;
+                    }
+                    reasoning.append(delta);
+                    try {
+                        sendResponseSse(streamOut, responseReasoningDeltaEvent(id, reasoningItemId, delta));
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
                 }
             });
+            if (!reasoning.isEmpty()) {
+                sendResponseSse(streamOut, responseReasoningDoneEvent(id, reasoningItemId, reasoning.toString()));
+            }
             sendResponseSse(streamOut, responseTextDoneEvent(id, text.toString()));
             sendResponseSse(streamOut, responseContentPartDoneEvent(id, outputId, text.toString()));
             sendResponseSse(streamOut, responseOutputItemDoneEvent(id, outputId, text.toString()));
-            sendResponseSse(streamOut, responseCompletedEvent(id, request.model(), created, outputId, text.toString()));
+            sendResponseSse(streamOut, responseCompletedEvent(id, request.model(), created, outputId, text.toString(),
+                    reasoning.toString()));
             streamOut.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
             streamOut.flush();
         } catch (Main.BardRpcException e) {
@@ -1583,15 +1654,22 @@ final class OpenAiApiServer {
     }
 
     private static String completionJson(String model, String text) {
+        return completionJson(model, text, "");
+    }
+
+    private static String completionJson(String model, String text, String reasoning) {
         String id = "chatcmpl-" + UUID.randomUUID();
         long created = Instant.now().getEpochSecond();
+        String message = "{\"role\":\"assistant\",\"content\":" + SimpleJson.quote(text)
+                + (reasoning == null || reasoning.isBlank()
+                ? "" : ",\"reasoning_content\":" + SimpleJson.quote(reasoning))
+                + "}";
         return "{"
                 + "\"id\":" + SimpleJson.quote(id) + ","
                 + "\"object\":\"chat.completion\","
                 + "\"created\":" + created + ","
                 + "\"model\":" + SimpleJson.quote(model) + ","
-                + "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":"
-                + SimpleJson.quote(text) + "},\"finish_reason\":\"stop\"}],"
+                + "\"choices\":[{\"index\":0,\"message\":" + message + ",\"finish_reason\":\"stop\"}],"
                 + "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}"
                 + "}";
     }
@@ -1612,9 +1690,21 @@ final class OpenAiApiServer {
     }
 
     private static String responseJson(String model, String text) {
+        return responseJson(model, text, "");
+    }
+
+    private static String responseJson(String model, String text, String reasoning) {
         String id = "resp_" + UUID.randomUUID().toString().replace("-", "");
         long created = Instant.now().getEpochSecond();
         String outputId = "msg_" + UUID.randomUUID().toString().replace("-", "");
+        StringBuilder output = new StringBuilder();
+        if (reasoning != null && !reasoning.isBlank()) {
+            String reasoningId = "rs_" + UUID.randomUUID().toString().replace("-", "");
+            output.append(responseReasoningItemJson(reasoningId, reasoning)).append(',');
+        }
+        output.append("{\"id\":").append(SimpleJson.quote(outputId))
+                .append(",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":")
+                .append(SimpleJson.quote(text)).append(",\"annotations\":[]}]}");
         return "{"
                 + "\"id\":" + SimpleJson.quote(id) + ","
                 + "\"object\":\"response\","
@@ -1622,9 +1712,7 @@ final class OpenAiApiServer {
                 + "\"status\":\"completed\","
                 + "\"model\":" + SimpleJson.quote(model) + ","
                 + "\"output_text\":" + SimpleJson.quote(text) + ","
-                + "\"output\":[{\"id\":" + SimpleJson.quote(outputId)
-                + ",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":"
-                + SimpleJson.quote(text) + ",\"annotations\":[]}]}],"
+                + "\"output\":[" + output + "],"
                 + "\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}"
                 + "}";
     }
@@ -1644,14 +1732,29 @@ final class OpenAiApiServer {
                 + "}";
     }
 
+    private static void sseChunk(OutputStream out, String id, String model, long created, String field, String delta) {
+        if (delta == null || delta.isEmpty()) {
+            return;
+        }
+        try {
+            sendSse(out, chunkJson(id, model, created, field, delta, false));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private static String chunkJson(String id, String model, long created, String delta, boolean done) {
+        return chunkJson(id, model, created, "content", delta, done);
+    }
+
+    private static String chunkJson(String id, String model, long created, String field, String delta, boolean done) {
         return "{"
                 + "\"id\":" + SimpleJson.quote(id) + ","
                 + "\"object\":\"chat.completion.chunk\","
                 + "\"created\":" + created + ","
                 + "\"model\":" + SimpleJson.quote(model) + ","
                 + "\"choices\":[{\"index\":0,\"delta\":"
-                + (done ? "{}" : "{\"content\":" + SimpleJson.quote(delta) + "}")
+                + (done ? "{}" : "{\"" + field + "\":" + SimpleJson.quote(delta) + "}")
                 + ",\"finish_reason\":" + (done ? "\"stop\"" : "null") + "}]"
                 + "}";
     }
@@ -1718,6 +1821,33 @@ final class OpenAiApiServer {
                 + "}";
     }
 
+    private static String responseReasoningItemJson(String itemId, String text) {
+        return "{\"id\":" + SimpleJson.quote(itemId) + ",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":"
+                + SimpleJson.quote(text) + "}]}";
+    }
+
+    private static String responseReasoningDeltaEvent(String id, String itemId, String delta) {
+        return "{"
+                + "\"type\":\"response.reasoning_text.delta\","
+                + "\"response_id\":" + SimpleJson.quote(id) + ","
+                + "\"item_id\":" + SimpleJson.quote(itemId) + ","
+                + "\"output_index\":0,"
+                + "\"content_index\":0,"
+                + "\"delta\":" + SimpleJson.quote(delta)
+                + "}";
+    }
+
+    private static String responseReasoningDoneEvent(String id, String itemId, String text) {
+        return "{"
+                + "\"type\":\"response.reasoning_text.done\","
+                + "\"response_id\":" + SimpleJson.quote(id) + ","
+                + "\"item_id\":" + SimpleJson.quote(itemId) + ","
+                + "\"output_index\":0,"
+                + "\"content_index\":0,"
+                + "\"text\":" + SimpleJson.quote(text)
+                + "}";
+    }
+
     private static String responseContentPartDoneEvent(String responseId, String outputId, String text) {
         return "{"
                 + "\"type\":\"response.content_part.done\","
@@ -1739,9 +1869,14 @@ final class OpenAiApiServer {
     }
 
     private static String responseCompletedEvent(String id, String model, long created, String outputId, String text) {
+        return responseCompletedEvent(id, model, created, outputId, text, "");
+    }
+
+    private static String responseCompletedEvent(String id, String model, long created, String outputId, String text,
+                                                 String reasoning) {
         return "{"
                 + "\"type\":\"response.completed\","
-                + "\"response\":" + responseJsonWithId(id, model, created, outputId, text)
+                + "\"response\":" + responseJsonWithId(id, model, created, outputId, text, reasoning)
                 + "}";
     }
 
@@ -1771,6 +1906,19 @@ final class OpenAiApiServer {
     }
 
     private static String responseJsonWithId(String id, String model, long created, String outputId, String text) {
+        return responseJsonWithId(id, model, created, outputId, text, "");
+    }
+
+    private static String responseJsonWithId(String id, String model, long created, String outputId, String text,
+                                             String reasoning) {
+        StringBuilder output = new StringBuilder();
+        if (reasoning != null && !reasoning.isBlank()) {
+            String reasoningId = "rs_" + UUID.randomUUID().toString().replace("-", "");
+            output.append(responseReasoningItemJson(reasoningId, reasoning)).append(',');
+        }
+        output.append("{\"id\":").append(SimpleJson.quote(outputId))
+                .append(",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":")
+                .append(SimpleJson.quote(text)).append(",\"annotations\":[]}]}");
         return "{"
                 + "\"id\":" + SimpleJson.quote(id) + ","
                 + "\"object\":\"response\","
@@ -1778,9 +1926,7 @@ final class OpenAiApiServer {
                 + "\"status\":\"completed\","
                 + "\"model\":" + SimpleJson.quote(model) + ","
                 + "\"output_text\":" + SimpleJson.quote(text) + ","
-                + "\"output\":[{\"id\":" + SimpleJson.quote(outputId)
-                + ",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":"
-                + SimpleJson.quote(text) + ",\"annotations\":[]}]}],"
+                + "\"output\":[" + output + "],"
                 + "\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}"
                 + "}";
     }
@@ -1979,9 +2125,54 @@ final class OpenAiApiServer {
         throw new IllegalArgumentException("未知模型：" + requested + "。可用模型：" + String.join(", ", models));
     }
 
+    interface DeltaSink {
+        void content(String delta);
+
+        void reasoning(String delta);
+    }
+
+    /** No-op sink for callers that do not aggregate deltas (tool calls). */
+    private static final DeltaSink NOOP_DELTAS = new DeltaSink() {
+        @Override
+        public void content(String delta) {
+        }
+
+        @Override
+        public void reasoning(String delta) {
+        }
+    };
+
+    /** Collects content and reasoning deltas so non-stream responses can include both. */
+    private static final class CollectedDeltas implements DeltaSink {
+        private final StringBuilder content = new StringBuilder();
+        private final StringBuilder reasoning = new StringBuilder();
+
+        @Override
+        public void content(String delta) {
+            if (delta != null) {
+                content.append(delta);
+            }
+        }
+
+        @Override
+        public void reasoning(String delta) {
+            if (delta != null) {
+                reasoning.append(delta);
+            }
+        }
+
+        private String content() {
+            return content.toString();
+        }
+
+        private String reasoning() {
+            return reasoning.toString();
+        }
+    }
+
     @FunctionalInterface
     interface ChatBackend {
-        String complete(ChatRequest request, Consumer<String> deltaSink) throws IOException;
+        String complete(ChatRequest request, DeltaSink deltaSink) throws IOException;
     }
 
     record ChatRequest(String model, String sessionKey, boolean explicitSession, String fullPrompt,

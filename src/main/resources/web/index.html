@@ -521,6 +521,7 @@
         <button class="tab" :class="{ active: view === 'logs' }" @click="openLogs">日志</button>
         <button class="tab" :class="{ active: view === 'cookies' }" @click="openCookies">Claude Cookie</button>
         <button class="tab" :class="{ active: view === 'chatgpt' }" @click="openChatGpt">ChatGPT Curl</button>
+        <button class="tab" :class="{ active: view === 'deepseek' }" @click="openDeepSeek">DeepSeek Curl</button>
         <button class="tab" :class="{ active: view === 'proxy' }" @click="openProxy">代理设置</button>
       </div>
     </header>
@@ -616,6 +617,31 @@
       </div>
     </section>
 
+    <section v-else-if="view === 'deepseek'" class="cookies">
+      <div class="cookie-form">
+        <textarea v-model="deepseekCurlInput" placeholder="粘贴 chat.deepseek.com 的 completion curl（含 authorization 与 cookie），服务端会提取 URL/Header/body 并存入 SQLite，每次请求自动完成 PoW 挑战"></textarea>
+        <div class="cookie-toolbar">
+          <button class="btn primary" @click="saveDeepSeekCurl" :disabled="savingDeepSeekCurl || !deepseekCurlInput.trim()">
+            {{ savingDeepSeekCurl ? '保存中' : '保存 Curl' }}
+          </button>
+          <button class="btn" @click="loadDeepSeekCurls" :disabled="loadingDeepSeekCurls">刷新</button>
+        </div>
+      </div>
+      <div v-if="deepseekCurls.length === 0" class="empty">还没有 DeepSeek curl。请在 DevTools 的 Network 面板复制一条 chat.deepseek.com/api/v0/chat/completion 请求（Copy as cURL）。</div>
+      <div v-else class="cookie-list">
+        <article v-for="curl in deepseekCurls" :key="curl.id" class="cookie-item">
+          <div class="cookie-head">
+            <span class="pill">{{ curl.label }}</span>
+            <span class="pill">{{ curl.active ? 'active' : 'disabled' }}</span>
+            <span class="pill">fail {{ curl.failure_count }}</span>
+            <span class="pill">len {{ curl.curl_length }}</span>
+            <button class="btn danger" @click="deleteDeepSeekCurl(curl.id)" :disabled="loadingDeepSeekCurls">删除</button>
+          </div>
+          <div class="error" v-if="curl.last_error">{{ curl.last_error }}</div>
+        </article>
+      </div>
+    </section>
+
     <section v-else class="proxy-settings">
       <div class="proxy-form">
         <label class="toggle">
@@ -680,6 +706,8 @@ createApp({
       savingClaudeCookie: false,
       loadingChatGptCurls: false,
       savingChatGptCurl: false,
+      loadingDeepSeekCurls: false,
+      savingDeepSeekCurl: false,
       loadingProxy: false,
       savingProxy: false,
       sending: false,
@@ -692,6 +720,7 @@ createApp({
       draft: '',
       claudeCurlInput: '',
       chatgptCurlInput: '',
+      deepseekCurlInput: '',
       proxy: {
         enabled: true,
         type: 'http',
@@ -702,6 +731,7 @@ createApp({
       logs: [],
       claudeCookies: [],
       chatgptCurls: [],
+      deepseekCurls: [],
       error: ''
     };
   },
@@ -715,6 +745,9 @@ createApp({
       }
       if (this.view === 'chatgpt') {
         return 'ChatGPT Curl';
+      }
+      if (this.view === 'deepseek') {
+        return 'DeepSeek Curl';
       }
       if (this.view === 'proxy') {
         return '代理设置';
@@ -730,6 +763,9 @@ createApp({
       }
       if (this.view === 'chatgpt') {
         return `${this.chatgptCurls.length} 个已保存 Curl`;
+      }
+      if (this.view === 'deepseek') {
+        return `${this.deepseekCurls.length} 个已保存 Curl`;
       }
       if (this.view === 'proxy') {
         return `${this.proxy.enabled ? '已启用' : '已停用'} · ${this.proxy.type}://${this.proxy.host}:${this.proxy.port}`;
@@ -920,6 +956,10 @@ createApp({
       this.view = 'chatgpt';
       await this.loadChatGptCurls();
     },
+    async openDeepSeek() {
+      this.view = 'deepseek';
+      await this.loadDeepSeekCurls();
+    },
     async openProxy() {
       this.view = 'proxy';
       await this.loadProxySettings();
@@ -1077,6 +1117,54 @@ createApp({
         this.error = err.message || String(err);
       } finally {
         this.loadingChatGptCurls = false;
+      }
+    },
+    async loadDeepSeekCurls() {
+      this.loadingDeepSeekCurls = true;
+      this.error = '';
+      try {
+        const response = await fetch('/debug/deepseek-curls');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data?.error?.message || `DeepSeek Curl 接口失败：${response.status}`);
+        this.deepseekCurls = data.data || [];
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.loadingDeepSeekCurls = false;
+      }
+    },
+    async saveDeepSeekCurl() {
+      if (!this.deepseekCurlInput.trim() || this.savingDeepSeekCurl) return;
+      this.savingDeepSeekCurl = true;
+      this.error = '';
+      try {
+        const response = await fetch('/debug/deepseek-curls', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ curl: this.deepseekCurlInput })
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(data?.error?.message || `保存失败：${response.status}`);
+        this.deepseekCurlInput = '';
+        await this.loadDeepSeekCurls();
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.savingDeepSeekCurl = false;
+      }
+    },
+    async deleteDeepSeekCurl(id) {
+      this.loadingDeepSeekCurls = true;
+      this.error = '';
+      try {
+        const response = await fetch(`/debug/deepseek-curls?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(data?.error?.message || `删除失败：${response.status}`);
+        await this.loadDeepSeekCurls();
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.loadingDeepSeekCurls = false;
       }
     },
     async loadLogs() {

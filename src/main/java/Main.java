@@ -48,6 +48,8 @@ public class Main {
     private static final String DEFAULT_MODEL = "gemini-3.6-Flash";
     private static final String CLAUDE_MODEL = "claude-sonnet-4-6";
     private static final String CHATGPT_MODEL = "chatgpt-web";
+    private static final String DEEPSEEK_MODEL = "deepseek-web";
+    private static final String DEEPSEEK_REASONER_MODEL = "deepseek-reasoner";
     private static final int GEMINI_RPC_MAX_ATTEMPTS = 3;
     private static final Pattern CLAUDE_RESETS_AT_PATTERN = Pattern.compile("\\\"resetsAt\\\"\\s*:\\s*(\\d+)");
     private static final Pattern BARD_ERROR_PATTERN = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]");
@@ -67,6 +69,7 @@ public class Main {
             ClaudeCookieStore claudeCookieStore = new ClaudeCookieStore(Path.of("data", "claude-cookies.sqlite"));
             config.claudeCookieStore = claudeCookieStore;
             config.chatGptCurlStore = new ChatGptCurlStore(Path.of("data", "chatgpt-curls.sqlite"));
+            config.deepSeekCurlStore = new DeepSeekCurlStore(Path.of("data", "deepseek-curls.sqlite"));
 
             if (args.length > 1 && "--parse-file".equals(args[0])) {
                 GeminiResult result = parseGeminiResultOrThrow(Files.readString(Path.of(args[1])));
@@ -124,6 +127,7 @@ public class Main {
                 new ApiChatBackend(config, clientRef),
                 claudeCookieStore,
                 config.chatGptCurlStore,
+                config.deepSeekCurlStore,
                 proxySettings);
         server.start();
         return server;
@@ -188,12 +192,23 @@ public class Main {
     private static GeminiResult sendInternal(AppConfig config, OkHttpClient client, String model, String prompt,
                                              java.util.List<OpenAiApiServer.ImageInput> images,
                                              ConversationState conversation, Consumer<String> deltaSink) throws IOException {
+        return sendInternal(config, client, model, prompt, images, conversation, deltaSink, null);
+    }
+
+    private static GeminiResult sendInternal(AppConfig config, OkHttpClient client, String model, String prompt,
+                                             java.util.List<OpenAiApiServer.ImageInput> images,
+                                             ConversationState conversation, Consumer<String> deltaSink,
+                                             Consumer<String> reasoningSink) throws IOException {
         ModelProfile profile = modelProfile(model);
         if (profile.provider() == ModelProvider.CLAUDE) {
             return sendClaudeInternal(config, client, profile, prompt, images, deltaSink);
         }
         if (profile.provider() == ModelProvider.CHATGPT) {
             return sendChatGptInternal(config, client, profile, prompt, deltaSink, conversation.chatGptConversation());
+        }
+        if (profile.provider() == ModelProvider.DEEPSEEK) {
+            return sendDeepSeekInternal(config, client, profile, prompt, images, deltaSink, reasoningSink,
+                    conversation.chatGptConversation());
         }
 
         BardRpcException lastRetryableError = null;
@@ -311,6 +326,17 @@ public class Main {
             throw new IOException("ChatGPT curl 存储未初始化");
         }
         return new ChatGptCurlClient(config.chatGptCurlStore, client).complete(prompt, deltaSink, conversation);
+    }
+
+    private static GeminiResult sendDeepSeekInternal(AppConfig config, OkHttpClient client, ModelProfile profile,
+                                                     String prompt, java.util.List<OpenAiApiServer.ImageInput> images,
+                                                     Consumer<String> deltaSink, Consumer<String> reasoningSink,
+                                                     ChatGptConversation conversation) throws IOException {
+        if (config.deepSeekCurlStore == null) {
+            throw new IOException("DeepSeek curl 存储未初始化");
+        }
+        return new DeepSeekCurlClient(config.deepSeekCurlStore, client)
+                .complete(profile, prompt, images, deltaSink, reasoningSink, conversation);
     }
 
     private static Instant claudeRateLimitResetAt(String body) {
@@ -604,6 +630,8 @@ public class Main {
                 6));
         profiles.put(CLAUDE_MODEL, new ModelProfile(CLAUDE_MODEL, ModelProvider.CLAUDE, null, null, null, null));
         profiles.put(CHATGPT_MODEL, new ModelProfile(CHATGPT_MODEL, ModelProvider.CHATGPT, null, null, null, null));
+        profiles.put(DEEPSEEK_MODEL, new ModelProfile(DEEPSEEK_MODEL, ModelProvider.DEEPSEEK, null, null, null, null));
+        profiles.put(DEEPSEEK_REASONER_MODEL, new ModelProfile(DEEPSEEK_REASONER_MODEL, ModelProvider.DEEPSEEK, null, null, null, null));
         return java.util.Collections.unmodifiableMap(profiles);
     }
 
@@ -1593,6 +1621,7 @@ public class Main {
         private String chatGptAccessToken = "";
         private String chatGptModel = "auto";
         private ChatGptCurlStore chatGptCurlStore;
+        private DeepSeekCurlStore deepSeekCurlStore;
 
         private static AppConfig load(Path path) throws IOException {
             if (!Files.exists(path)) {
@@ -3657,6 +3686,556 @@ public class Main {
         }
     }
 
+    /**
+     * Replays a pasted chat.deepseek.com completion curl. Every request needs a
+     * fresh one-time proof-of-work answer, so this client first asks the server
+     * for a challenge, solves it locally with {@link DeepSeekHash}, then sends
+     * the result in the {@code X-DS-PoW-Response} header. The upstream chat
+     * session id and last response message id are cached so multi-turn calls
+     * continue the same DeepSeek chat.
+     */
+    private static final class DeepSeekCurlClient {
+        private static final String COMPLETION_PATH = "/api/v0/chat/completion";
+        private static final String CHALLENGE_PATH = "/api/v0/chat/create_pow_challenge";
+        private static final String SESSION_PATH = "/api/v0/chat_session/create";
+        private static final String UPLOAD_PATH = "/api/v0/file/upload_file";
+        private static final String FETCH_FILES_PATH = "/api/v0/file/fetch_files";
+
+        private final DeepSeekCurlStore store;
+        private final OkHttpClient client;
+
+        private DeepSeekCurlClient(DeepSeekCurlStore store, OkHttpClient client) {
+            this.store = store;
+            this.client = client;
+        }
+
+        private GeminiResult complete(ModelProfile profile, String prompt, List<OpenAiApiServer.ImageInput> images,
+                                      Consumer<String> deltaSink, Consumer<String> reasoningSink,
+                                      ChatGptConversation conversation) throws IOException {
+            List<DeepSeekCurlStore.CurlRecord> records = store.active();
+            if (records.isEmpty()) {
+                throw new IOException("没有可用 DeepSeek curl。请在前端粘贴 chat.deepseek.com 的 completion curl。");
+            }
+            IOException last = null;
+            for (DeepSeekCurlStore.CurlRecord record : records) {
+                try {
+                    GeminiResult result = request(profile, record, prompt, images, deltaSink, reasoningSink, conversation);
+                    store.markSuccess(record.id());
+                    return result;
+                } catch (IOException e) {
+                    last = e;
+                    store.markFailure(record.id(), e.getMessage());
+                }
+            }
+            throw last == null ? new IOException("DeepSeek curl 请求失败") : last;
+        }
+
+        private GeminiResult request(ModelProfile profile, DeepSeekCurlStore.CurlRecord record, String prompt,
+                                     List<OpenAiApiServer.ImageInput> images, Consumer<String> deltaSink,
+                                     Consumer<String> reasoningSink, ChatGptConversation conversation)
+                throws IOException {
+            ParsedDeepSeekCurl curl = ParsedDeepSeekCurl.parse(record.curl());
+            HttpUrl base = curl.url();
+            Map<String, String> headers = new LinkedHashMap<>(curl.headers());
+
+            if (conversation.conversationId.isBlank()) {
+                conversation.conversationId = createSession(base, headers, curl.body());
+                conversation.parentMessageId = "";
+            }
+            String parent = normalizedMessageId(conversation.parentMessageId);
+            String powHeader = solveChallenge(base, headers, COMPLETION_PATH);
+
+            boolean thinking = profile.name().toLowerCase(Locale.ROOT).contains("reasoner");
+            List<String> refFileIds = uploadImages(base, headers, images);
+            String effectivePrompt = deepSeekPromptWithUploadResult(prompt, images, refFileIds.size());
+            String body = completionBody(conversation.conversationId, parent,
+                    thinking ? "expert" : "default", effectivePrompt, thinking, refFileIds);
+
+            Request.Builder builder = new Request.Builder()
+                    .url(base.newBuilder().encodedPath(COMPLETION_PATH).build())
+                    .post(RequestBody.create(body, JSON_MEDIA_TYPE));
+            applyHeaders(builder, headers, "text/event-stream", null);
+            builder.header("x-ds-pow-response", powHeader);
+            try (Response response = client.newCall(builder.build()).execute()) {
+                if (!response.isSuccessful() || response.body() == null) {
+                    String error = response.body() == null ? "" : response.body().string();
+                    if (response.code() == 401 || response.code() == 403) {
+                        throw new IOException("DeepSeek 凭据已过期或触发风控（HTTP " + response.code()
+                                + "）。请重新登录 chat.deepseek.com 并在同一浏览器/网络中复制最新 completion curl 后保存。响应="
+                                + preview(error));
+                    }
+                    throw new IOException("DeepSeek completion 请求失败，HTTP 状态=" + response.code()
+                            + "，响应=" + preview(error));
+                }
+                return streamDeepSeekText(response, deltaSink, reasoningSink, conversation);
+            }
+        }
+
+        private String createSession(HttpUrl base, Map<String, String> headers, String fallbackBody)
+                throws IOException {
+            String failure = "DeepSeek 会话创建失败";
+            try {
+                Request.Builder builder = new Request.Builder()
+                        .url(base.newBuilder().encodedPath(SESSION_PATH).build())
+                        .post(RequestBody.create("{}", JSON_MEDIA_TYPE));
+                applyHeaders(builder, headers, "application/json", "application/json");
+                try (Response response = client.newCall(builder.build()).execute()) {
+                    String text = response.body() == null ? "" : response.body().string();
+                    if (response.isSuccessful()) {
+                        String id = deepSeekSessionId(SimpleJson.parse(text));
+                        if (!id.isBlank()) {
+                            return id;
+                        }
+                    }
+                    failure = "DeepSeek 会话创建失败，HTTP 状态=" + response.code() + "，响应=" + preview(text);
+                }
+            } catch (IOException e) {
+                failure = "DeepSeek 会话创建失败：" + e.getMessage();
+            }
+            String fallback = jsonStringField(fallbackBody, "chat_session_id");
+            if (!fallback.isBlank()) {
+                return fallback;
+            }
+            throw new IOException(failure);
+        }
+
+        private String solveChallenge(HttpUrl base, Map<String, String> headers, String targetPath)
+                throws IOException {
+            String requestBody = "{\"target_path\":" + SimpleJson.quote(targetPath) + "}";
+            String text;
+            Request.Builder builder = new Request.Builder()
+                    .url(base.newBuilder().encodedPath(CHALLENGE_PATH).build())
+                    .post(RequestBody.create(requestBody, JSON_MEDIA_TYPE));
+            applyHeaders(builder, headers, "application/json", "application/json");
+            try (Response response = client.newCall(builder.build()).execute()) {
+                text = response.body() == null ? "" : response.body().string();
+                if (!response.isSuccessful()) {
+                    throw new IOException("DeepSeek PoW 挑战请求失败，HTTP 状态=" + response.code()
+                            + "，响应=" + preview(text));
+                }
+            }
+            Map<?, ?> challenge = deepSeekChallenge(SimpleJson.parse(text));
+            if (challenge == null) {
+                throw new IOException("DeepSeek 未返回 PoW 挑战（登录可能已过期）：" + preview(text));
+            }
+            String algorithm = stringValue(challenge.get("algorithm"));
+            String challengeHex = stringValue(challenge.get("challenge"));
+            String salt = stringValue(challenge.get("salt"));
+            String signature = stringValue(challenge.get("signature"));
+            long expireAt = deepSeekLong(challenge.get("expire_at"));
+            long difficulty = deepSeekLong(challenge.get("difficulty"));
+            String headerTargetPath = firstNonBlank(stringValue(challenge.get("target_path")), targetPath);
+            if (challengeHex.isBlank() || salt.isBlank() || difficulty <= 0) {
+                throw new IOException("DeepSeek PoW 挑战字段不完整：" + preview(text));
+            }
+            long answer = DeepSeekPow.solve(challengeHex, salt + "_" + expireAt + "_", difficulty);
+            return DeepSeekPow.responseHeader(algorithm, challengeHex, salt, answer, signature, headerTargetPath);
+        }
+
+        private static String completionBody(String sessionId, String parent, String modelType, String prompt,
+                                             boolean thinking, List<String> refFileIds) {
+            StringBuilder files = new StringBuilder("[");
+            if (refFileIds != null) {
+                for (int i = 0; i < refFileIds.size(); i++) {
+                    if (i > 0) {
+                        files.append(',');
+                    }
+                    files.append(SimpleJson.quote(refFileIds.get(i)));
+                }
+            }
+            files.append(']');
+            return "{"
+                    + "\"chat_session_id\":" + SimpleJson.quote(sessionId) + ","
+                    + "\"parent_message_id\":" + (parent == null ? "null" : parent) + ","
+                    + "\"model_type\":" + SimpleJson.quote(modelType) + ","
+                    + "\"prompt\":" + SimpleJson.quote(prompt) + ","
+                    + "\"ref_file_ids\":" + files + ","
+                    + "\"thinking_enabled\":" + thinking + ","
+                    + "\"search_enabled\":false,"
+                    + "\"action\":null,"
+                    + "\"preempt\":false"
+                    + "}";
+        }
+
+        private static void applyHeaders(Request.Builder builder, Map<String, String> headers, String accept,
+                                         String contentType) {
+            headers.forEach((name, value) -> {
+                String lower = name.toLowerCase(Locale.ROOT);
+                if ("host".equals(lower) || "content-length".equals(lower) || "content-type".equals(lower)
+                        || "accept".equals(lower) || "x-ds-pow-response".equals(lower)
+                        || "x-ds-guest-pow-response".equals(lower)) {
+                    return;
+                }
+                builder.header(name, value);
+            });
+            if (contentType != null) {
+                builder.header("content-type", contentType);
+            }
+            builder.header("accept", accept);
+        }
+
+        private static GeminiResult streamDeepSeekText(Response response, Consumer<String> deltaSink,
+                                                       Consumer<String> reasoningSink,
+                                                       ChatGptConversation conversation) throws IOException {
+            StringBuilder text = new StringBuilder();
+            StringBuilder reasoning = new StringBuilder();
+            StringBuilder all = new StringBuilder();
+            String fragmentType = "RESPONSE";
+
+            while (true) {
+                String line = response.body().source().readUtf8Line();
+                if (line == null) {
+                    break;
+                }
+                all.append(line).append('\n');
+                String trimmed = line.trim();
+                if (trimmed.isEmpty()) {
+                    continue;
+                }
+                if (!trimmed.startsWith("data:")) {
+                    continue;
+                }
+                String data = trimmed.substring("data:".length()).trim();
+                if (data.isEmpty() || "[DONE]".equals(data)) {
+                    continue;
+                }
+                Object parsed = SimpleJson.parse(data);
+                if (!(parsed instanceof Map<?, ?> map)) {
+                    continue;
+                }
+                String error = deepSeekEventError(map);
+                if (error != null) {
+                    throw new IOException("DeepSeek 返回错误：" + error);
+                }
+
+                Object responseMessageId = map.get("response_message_id");
+                if (responseMessageId != null) {
+                    long id = deepSeekLong(responseMessageId);
+                    if (id > 0) {
+                        conversation.parentMessageId = Long.toString(id);
+                    }
+                }
+
+                String path = stringValue(map.get("p"));
+                String op = stringValue(map.get("o"));
+                Object value = map.get("v");
+
+                Map<?, ?> valueMap = deepSeekMap(value);
+                if (valueMap != null && valueMap.get("response") != null) {
+                    Map<?, ?> resp = deepSeekMap(valueMap.get("response"));
+                    if (resp != null) {
+                        Object fragments = resp.get("fragments");
+                        if (fragments instanceof List<?> list && !list.isEmpty()) {
+                            Map<?, ?> first = deepSeekMap(list.get(0));
+                            if (first != null) {
+                                fragmentType = stringValue(first.get("type"));
+                                emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(first.get("content")));
+                            }
+                        } else {
+                            emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(resp.get("content")));
+                        }
+                    }
+                    continue;
+                }
+
+                if ("response/fragments/-1/content".equals(path) && (op.isEmpty() || "APPEND".equals(op))) {
+                    emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(value));
+                    continue;
+                }
+                if ("response/fragments".equals(path) && "APPEND".equals(op)) {
+                    if (value instanceof List<?> list && !list.isEmpty()) {
+                        Map<?, ?> first = deepSeekMap(list.get(0));
+                        if (first != null) {
+                            fragmentType = stringValue(first.get("type"));
+                            emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(first.get("content")));
+                        }
+                    }
+                    continue;
+                }
+                if ("response/content".equals(path) && (op.isEmpty() || "APPEND".equals(op))) {
+                    emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(value));
+                    continue;
+                }
+                if (path.isBlank() && op.isBlank() && value instanceof String string) {
+                    emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, string);
+                }
+            }
+
+            dumpRawResponseIfRequested(all.toString());
+            if (text.isEmpty() && reasoning.isEmpty()) {
+                String error = deepSeekBodyError(all.toString());
+                if (error != null) {
+                    throw new IOException("DeepSeek 返回错误：" + error);
+                }
+                throw new IOException("DeepSeek 响应里没有可解析的正文：" + preview(all.toString()));
+            }
+            return new GeminiResult(text.toString(), "", "", "");
+        }
+
+        private static void emitDeepSeekDelta(StringBuilder text, StringBuilder reasoning, Consumer<String> deltaSink,
+                                              Consumer<String> reasoningSink, String fragmentType, String delta) {
+            if (delta == null || delta.isEmpty()) {
+                return;
+            }
+            if ("THINK".equals(fragmentType)) {
+                reasoning.append(delta);
+                if (reasoningSink != null) {
+                    reasoningSink.accept(delta);
+                }
+                return;
+            }
+            text.append(delta);
+            if (deltaSink != null) {
+                deltaSink.accept(delta);
+            }
+        }
+
+        private static String deepSeekEventError(Map<?, ?> map) {
+            String type = stringValue(map.get("type"));
+            if ("error".equalsIgnoreCase(type)) {
+                return firstNonBlank(stringValue(map.get("content")), stringValue(map.get("msg")), preview(map.toString()));
+            }
+            Map<?, ?> value = deepSeekMap(map.get("v"));
+            if (value != null && "error".equalsIgnoreCase(stringValue(value.get("type")))) {
+                return firstNonBlank(stringValue(value.get("content")), stringValue(value.get("msg")), preview(value.toString()));
+            }
+            Map<?, ?> toast = deepSeekMap(map.get("toast"));
+            if (toast != null && "error".equalsIgnoreCase(stringValue(toast.get("type")))) {
+                return firstNonBlank(stringValue(toast.get("content")), stringValue(toast.get("msg")), preview(toast.toString()));
+            }
+            return null;
+        }
+
+        private static String deepSeekBodyError(String body) {
+            Object parsed;
+            try {
+                parsed = SimpleJson.parse(body);
+            } catch (RuntimeException e) {
+                return null;
+            }
+            Map<?, ?> map = deepSeekMap(parsed);
+            Map<?, ?> data = map == null ? null : deepSeekMap(map.get("data"));
+            if (data == null) {
+                return null;
+            }
+            String message = firstNonBlank(stringValue(data.get("biz_msg")), stringValue(map.get("msg")));
+            long bizCode = deepSeekLong(data.get("biz_code"));
+            if (!message.isBlank()) {
+                return message;
+            }
+            return bizCode != 0 ? "biz_code=" + bizCode : null;
+        }
+
+        private static Map<?, ?> deepSeekMap(Object value) {
+            return value instanceof Map<?, ?> map ? map : null;
+        }
+
+        private static Map<?, ?> deepSeekChallenge(Object parsed) {
+            Map<?, ?> map = deepSeekMap(parsed);
+            Map<?, ?> data = map == null ? null : deepSeekMap(map.get("data"));
+            Map<?, ?> biz = data == null ? null : deepSeekMap(data.get("biz_data"));
+            if (biz == null) {
+                return null;
+            }
+            Map<?, ?> challenge = deepSeekMap(biz.get("challenge"));
+            return challenge != null ? challenge : deepSeekMap(biz.get("guest_challenge"));
+        }
+
+        private static String deepSeekSessionId(Object parsed) {
+            Map<?, ?> map = deepSeekMap(parsed);
+            Map<?, ?> data = map == null ? null : deepSeekMap(map.get("data"));
+            Map<?, ?> biz = data == null ? null : deepSeekMap(data.get("biz_data"));
+            if (biz == null) {
+                return "";
+            }
+            String direct = stringValue(biz.get("id"));
+            if (!direct.isBlank()) {
+                return direct;
+            }
+            Map<?, ?> session = deepSeekMap(biz.get("chat_session"));
+            return session == null ? "" : stringValue(session.get("id"));
+        }
+
+        private static String jsonStringField(String json, String field) {
+            Map<?, ?> map = deepSeekMap(SimpleJson.parse(json));
+            return map == null ? "" : stringValue(map.get(field));
+        }
+
+        private static String normalizedMessageId(String value) {
+            return value != null && value.matches("\\d+") ? value : null;
+        }
+
+        private static long deepSeekLong(Object value) {
+            if (value instanceof Number number) {
+                return number.longValue();
+            }
+            if (value instanceof String string && string.matches("-?\\d+")) {
+                try {
+                    return Long.parseLong(string);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            return 0L;
+        }
+
+        /**
+         * Uploads images through DeepSeek's file endpoint. Each upload needs its
+         * own one-time PoW challenge (target_path {@code /api/v0/file/upload_file}),
+         * and the resulting file ids are attached to the completion as
+         * {@code ref_file_ids}. Upload failures are logged and skipped so text
+         * still gets answered.
+         */
+        private List<String> uploadImages(HttpUrl base, Map<String, String> headers,
+                                          List<OpenAiApiServer.ImageInput> images) {
+            if (images == null || images.isEmpty()) {
+                return List.of();
+            }
+            java.util.ArrayList<String> ids = new java.util.ArrayList<>();
+            for (OpenAiApiServer.ImageInput image : images) {
+                try {
+                    byte[] bytes = imageBytes(client, image);
+                    String fileId = uploadFile(base, headers, bytes, image.filename(), image.mimeType());
+                    awaitFileReady(base, headers, fileId);
+                    ids.add(fileId);
+                } catch (Exception e) {
+                    String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                    System.err.println("跳过不可用 DeepSeek 图片 " + image.filename() + "：" + reason);
+                }
+            }
+            return List.copyOf(ids);
+        }
+
+        private String uploadFile(HttpUrl base, Map<String, String> headers, byte[] bytes, String filename,
+                                  String mimeType) throws IOException {
+            String safeFilename = filename == null || filename.isBlank()
+                    ? System.currentTimeMillis() + "_image.png"
+                    : filename;
+            String contentType = firstNonBlank(mimeType, mimeFromFilename(safeFilename), "application/octet-stream");
+            RequestBody fileBody = RequestBody.create(bytes, MediaType.get(contentType));
+            MultipartBody multipart = new MultipartBody.Builder()
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("file", safeFilename, fileBody)
+                    .build();
+            String powHeader = solveChallenge(base, headers, UPLOAD_PATH);
+            Request.Builder builder = new Request.Builder()
+                    .url(base.newBuilder().encodedPath(UPLOAD_PATH).build())
+                    .post(multipart);
+            applyHeaders(builder, headers, "*/*", null);
+            builder.header("x-ds-pow-response", powHeader);
+            try (Response response = client.newCall(builder.build()).execute()) {
+                String text = response.body() == null ? "" : response.body().string();
+                if (!response.isSuccessful()) {
+                    throw new IOException("DeepSeek 图片上传失败，HTTP 状态=" + response.code() + "，响应=" + preview(text));
+                }
+                String id = deepSeekFileId(SimpleJson.parse(text));
+                if (id.isBlank()) {
+                    throw new IOException("DeepSeek 图片上传响应缺少 file id：" + preview(text));
+                }
+                return id;
+            }
+        }
+
+        /**
+         * Best-effort wait for DeepSeek to finish processing an uploaded file.
+         * Network/protocol hiccups never fail the request; the completion is
+         * attempted anyway.
+         */
+        private void awaitFileReady(HttpUrl base, Map<String, String> headers, String fileId) {
+            for (int attempt = 0; attempt < 20; attempt++) {
+                try {
+                    HttpUrl url = base.newBuilder().encodedPath(FETCH_FILES_PATH)
+                            .addQueryParameter("file_ids", fileId)
+                            .build();
+                    Request.Builder builder = new Request.Builder().url(url).get();
+                    applyHeaders(builder, headers, "application/json", null);
+                    try (Response response = client.newCall(builder.build()).execute()) {
+                        String text = response.body() == null ? "" : response.body().string();
+                        if (!response.isSuccessful()) {
+                            return;
+                        }
+                        String upper = text.toUpperCase(Locale.ROOT);
+                        if (upper.contains("SUCCESS") || upper.contains("FAIL")) {
+                            return;
+                        }
+                    }
+                } catch (IOException e) {
+                    return;
+                }
+                sleepQuietly(500);
+            }
+        }
+
+        private static String deepSeekFileId(Object parsed) {
+            Map<?, ?> map = deepSeekMap(parsed);
+            Map<?, ?> data = map == null ? null : deepSeekMap(map.get("data"));
+            Map<?, ?> biz = data == null ? null : deepSeekMap(data.get("biz_data"));
+            if (biz == null) {
+                return "";
+            }
+            String id = firstNonBlank(stringValue(biz.get("id")), stringValue(biz.get("file_id")));
+            if (!id.isBlank()) {
+                return id;
+            }
+            Map<?, ?> file = deepSeekMap(biz.get("file"));
+            return file == null ? "" : firstNonBlank(stringValue(file.get("id")), stringValue(file.get("file_id")));
+        }
+
+        private static String deepSeekPromptWithUploadResult(String prompt, List<OpenAiApiServer.ImageInput> images,
+                                                             int uploadedCount) {
+            String base = prompt == null ? "" : prompt;
+            int total = images == null ? 0 : images.size();
+            if (total == 0 || uploadedCount >= total) {
+                return base.isBlank() ? "请根据用户输入回答。" : base;
+            }
+            String notice = "[系统提示：用户提供了 " + total + " 张图片，其中 " + (total - uploadedCount)
+                    + " 张未能上传；请仅基于已成功上传的图片和可见文字回答。]";
+            return base.isBlank() ? notice : base + "\n" + notice;
+        }
+
+        private record ParsedDeepSeekCurl(HttpUrl url, Map<String, String> headers, String body) {
+            static ParsedDeepSeekCurl parse(String raw) throws IOException {
+                List<String> tokens = CurlRequest.shellTokens(raw);
+                HttpUrl url = null;
+                String body = "";
+                Map<String, String> headers = new LinkedHashMap<>();
+                for (int i = 0; i < tokens.size(); i++) {
+                    String token = tokens.get(i);
+                    if (("--url".equals(token) || "-X".equals(token)) && i + 1 < tokens.size()) {
+                        String next = tokens.get(++i);
+                        if (next.startsWith("http")) {
+                            url = HttpUrl.get(next);
+                        }
+                        continue;
+                    }
+                    if (url == null && token.startsWith("http")) {
+                        url = HttpUrl.get(token);
+                        continue;
+                    }
+                    if (("-H".equals(token) || "--header".equals(token)) && i + 1 < tokens.size()) {
+                        String header = tokens.get(++i);
+                        int colon = header.indexOf(':');
+                        if (colon > 0) {
+                            headers.put(header.substring(0, colon).trim(), header.substring(colon + 1).trim());
+                        }
+                        continue;
+                    }
+                    if (("--data-raw".equals(token) || "--data".equals(token) || "--data-binary".equals(token)) && i + 1 < tokens.size()) {
+                        body = tokens.get(++i);
+                    } else if (token.startsWith("--data-raw=") || token.startsWith("--data=")) {
+                        body = token.substring(token.indexOf('=') + 1);
+                    }
+                    if (("-b".equals(token) || "--cookie".equals(token)) && i + 1 < tokens.size()) {
+                        headers.put("Cookie", tokens.get(++i));
+                    }
+                }
+                if (url == null || !url.host().contains("deepseek.com")) {
+                    throw new IOException("DeepSeek curl 缺少 chat.deepseek.com URL");
+                }
+                return new ParsedDeepSeekCurl(url, headers, body);
+            }
+        }
+    }
+
     /** Legacy generated-token client retained for compatibility with older configs. */
     private static final class ChatGptClient {
         private static final String BASE_URL = "https://chatgpt.com";
@@ -4000,7 +4579,7 @@ public class Main {
         }
 
         @Override
-        public String complete(OpenAiApiServer.ChatRequest request, Consumer<String> deltaSink) throws IOException {
+        public String complete(OpenAiApiServer.ChatRequest request, OpenAiApiServer.DeltaSink sink) throws IOException {
             String key = request.model() + ":" + request.sessionKey();
             ApiConversation conversation = conversations.computeIfAbsent(key, ignored -> new ApiConversation());
             synchronized (conversation) {
@@ -4016,8 +4595,12 @@ public class Main {
                 sendInternal(config, clientRef.get(), request.model(), prompt, request.images(),
                         ConversationState.stateless(conversation.chatGptConversation()), delta -> {
                     text.append(delta);
-                    if (deltaSink != null) {
-                        deltaSink.accept(delta);
+                    if (sink != null) {
+                        sink.content(delta);
+                    }
+                }, reasoning -> {
+                    if (sink != null) {
+                        sink.reasoning(reasoning);
                     }
                 });
                 String answer = text.toString();
@@ -4211,7 +4794,8 @@ public class Main {
     private enum ModelProvider {
         GEMINI,
         CLAUDE,
-        CHATGPT
+        CHATGPT,
+        DEEPSEEK
     }
 
     private record ModelProfile(String name, ModelProvider provider, String headerToken, Integer headerMode,
