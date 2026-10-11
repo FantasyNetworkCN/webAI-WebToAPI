@@ -204,6 +204,23 @@ H("abc") = f841106c601ce9be9bc38525e90d4178d47f21dd8eb9f238fc55ffaa4ca94506
 若 DeepSeek 返回 401/403 或 `biz_data` 为空（登录过期），请在同一浏览器/网络中重新
 复制最新 completion curl 后保存。
 
+#### 失败判定与排查
+
+上游生成结束时会下发 `response/status`（`FINISHED` / `INCOMPLETE`）或
+`quasi_status`，发完随即断开连接。服务端以它作为“回答结束”的判据，不再把流正常
+关闭当成生成完成：
+
+- `INCOMPLETE`、`CONTENT_FILTER` 等终态：按失败上报，并附上上游 toast 提示。
+- 有正文但未收到终态就断流（网络中断、风控、读取超时）：按失败上报，不再把半截
+  回答当作成功返回；已输出的部分仍会保留在流里。
+- 上游正常结束但正文为空：报错并附带 `status` 与原始响应，便于定位风控静默。
+- 已经输出过内容时不再轮换到下一份 curl 重试，避免重复/错乱输出掩盖真实原因；
+  失败时创建的会话也会回滚，避免换账号后复用到其他账号的会话。
+
+前端 DeepSeek Curl 页的 `last_error` 会显示最后一次失败原因。需要看上游原始事件
+序列时，加 `-DdumpRaw=/tmp/ds-raw.txt` 把响应落到文件；需要临时恢复旧的宽松行为时
+加 `-Ddeepseek.strictTermination=false`（断流按已收到内容返回）。
+
 ## 常用命令
 
 ```bash

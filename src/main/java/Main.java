@@ -3718,13 +3718,39 @@ public class Main {
             }
             IOException last = null;
             for (DeepSeekCurlStore.CurlRecord record : records) {
+                String sessionBefore = conversation.conversationId;
+                String parentBefore = conversation.parentMessageId;
+                boolean[] emitted = {false};
+                Consumer<String> content = delta -> {
+                    if (delta == null || delta.isEmpty()) {
+                        return;
+                    }
+                    emitted[0] = true;
+                    if (deltaSink != null) {
+                        deltaSink.accept(delta);
+                    }
+                };
+                Consumer<String> thought = delta -> {
+                    if (delta == null || delta.isEmpty()) {
+                        return;
+                    }
+                    emitted[0] = true;
+                    if (reasoningSink != null) {
+                        reasoningSink.accept(delta);
+                    }
+                };
                 try {
-                    GeminiResult result = request(profile, record, prompt, images, deltaSink, reasoningSink, conversation);
+                    GeminiResult result = request(profile, record, prompt, images, content, thought, conversation);
                     store.markSuccess(record.id());
                     return result;
                 } catch (IOException e) {
                     last = e;
                     store.markFailure(record.id(), e.getMessage());
+                    conversation.conversationId = sessionBefore;
+                    conversation.parentMessageId = parentBefore;
+                    if (emitted[0]) {
+                        throw e;
+                    }
                 }
             }
             throw last == null ? new IOException("DeepSeek curl 请求失败") : last;
@@ -3881,6 +3907,11 @@ public class Main {
             StringBuilder reasoning = new StringBuilder();
             StringBuilder all = new StringBuilder();
             String fragmentType = "RESPONSE";
+            boolean sawPatch = false;
+            boolean terminalSeen = false;
+            String terminalFailure = null;
+            String terminalOk = "";
+            String notice = "";
 
             while (true) {
                 String line = response.body().source().readUtf8Line();
@@ -3892,12 +3923,23 @@ public class Main {
                 if (trimmed.isEmpty()) {
                     continue;
                 }
+                if (trimmed.startsWith("event:")) {
+                    String event = trimmed.substring("event:".length()).trim().toLowerCase(Locale.ROOT);
+                    if ("finish".equals(event) || "done".equals(event)) {
+                        terminalSeen = true;
+                    }
+                    continue;
+                }
                 if (!trimmed.startsWith("data:")) {
                     continue;
                 }
                 String data = trimmed.substring("data:".length()).trim();
-                if (data.isEmpty() || "[DONE]".equals(data)) {
+                if (data.isEmpty()) {
                     continue;
+                }
+                if ("[DONE]".equals(data)) {
+                    terminalSeen = true;
+                    break;
                 }
                 Object parsed = SimpleJson.parse(data);
                 if (!(parsed instanceof Map<?, ?> map)) {
@@ -3916,58 +3958,101 @@ public class Main {
                     }
                 }
 
-                String path = stringValue(map.get("p"));
-                String op = stringValue(map.get("o"));
-                Object value = map.get("v");
+                for (DeepSeekPatch patch : deepSeekPatches(map)) {
+                    sawPatch = true;
+                    String path = patch.path();
+                    String op = patch.op();
+                    Object value = patch.value();
 
-                Map<?, ?> valueMap = deepSeekMap(value);
-                if (valueMap != null && valueMap.get("response") != null) {
-                    Map<?, ?> resp = deepSeekMap(valueMap.get("response"));
-                    if (resp != null) {
-                        Object fragments = resp.get("fragments");
-                        if (fragments instanceof List<?> list && !list.isEmpty()) {
+                    String status = deepSeekPatchStatus(path, value);
+                    if (status != null) {
+                        if (deepSeekStatusTerminal(status)) {
+                            terminalSeen = true;
+                            String failure = deepSeekStatusFailure(status);
+                            if (failure != null) {
+                                terminalFailure = failure;
+                                break;
+                            }
+                            terminalOk = status;
+                        }
+                    }
+
+                    if (isDeepSeekToast(path)) {
+                        Map<?, ?> toast = deepSeekMap(value);
+                        if (toast != null) {
+                            String content = firstNonBlank(stringValue(toast.get("content")), stringValue(toast.get("msg")));
+                            if (!content.isBlank()) {
+                                notice = content;
+                            }
+                        }
+                        continue;
+                    }
+
+                    Map<?, ?> valueMap = deepSeekMap(value);
+                    if (valueMap != null && valueMap.get("response") != null) {
+                        Map<?, ?> resp = deepSeekMap(valueMap.get("response"));
+                        if (resp != null) {
+                            Object fragments = resp.get("fragments");
+                            if (fragments instanceof List<?> list && !list.isEmpty()) {
+                                Map<?, ?> first = deepSeekMap(list.get(0));
+                                if (first != null) {
+                                    fragmentType = stringValue(first.get("type"));
+                                    emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(first.get("content")));
+                                }
+                            } else {
+                                emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(resp.get("content")));
+                            }
+                        }
+                        continue;
+                    }
+
+                    if ("response/fragments/-1/content".equals(path) && (op.isEmpty() || "APPEND".equals(op))) {
+                        emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(value));
+                        continue;
+                    }
+                    if ("response/fragments".equals(path) && "APPEND".equals(op)) {
+                        if (value instanceof List<?> list && !list.isEmpty()) {
                             Map<?, ?> first = deepSeekMap(list.get(0));
                             if (first != null) {
                                 fragmentType = stringValue(first.get("type"));
                                 emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(first.get("content")));
                             }
-                        } else {
-                            emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(resp.get("content")));
                         }
+                        continue;
                     }
-                    continue;
-                }
-
-                if ("response/fragments/-1/content".equals(path) && (op.isEmpty() || "APPEND".equals(op))) {
-                    emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(value));
-                    continue;
-                }
-                if ("response/fragments".equals(path) && "APPEND".equals(op)) {
-                    if (value instanceof List<?> list && !list.isEmpty()) {
-                        Map<?, ?> first = deepSeekMap(list.get(0));
-                        if (first != null) {
-                            fragmentType = stringValue(first.get("type"));
-                            emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(first.get("content")));
-                        }
+                    if ("response/content".equals(path) && (op.isEmpty() || "APPEND".equals(op))) {
+                        emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(value));
+                        continue;
                     }
-                    continue;
+                    if (path.isBlank() && op.isBlank() && value instanceof String string) {
+                        emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, string);
+                    }
                 }
-                if ("response/content".equals(path) && (op.isEmpty() || "APPEND".equals(op))) {
-                    emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, stringValue(value));
-                    continue;
-                }
-                if (path.isBlank() && op.isBlank() && value instanceof String string) {
-                    emitDeepSeekDelta(text, reasoning, deltaSink, reasoningSink, fragmentType, string);
+                if (terminalFailure != null) {
+                    break;
                 }
             }
 
             dumpRawResponseIfRequested(all.toString());
+            if (terminalFailure != null) {
+                throw new IOException("DeepSeek 未正常结束（" + terminalFailure + "），已收到 "
+                        + text.length() + " 字符" + deepSeekNoticeSuffix(notice));
+            }
             if (text.isEmpty() && reasoning.isEmpty()) {
                 String error = deepSeekBodyError(all.toString());
                 if (error != null) {
                     throw new IOException("DeepSeek 返回错误：" + error);
                 }
+                if (terminalSeen) {
+                    throw new IOException("DeepSeek 返回了空内容（上游已结束，status="
+                            + firstNonBlank(terminalOk, "UNKNOWN") + "）" + deepSeekNoticeSuffix(notice)
+                            + "。原始响应=" + preview(all.toString()));
+                }
                 throw new IOException("DeepSeek 响应里没有可解析的正文：" + preview(all.toString()));
+            }
+            if (sawPatch && !terminalSeen && deepSeekRequireTerminal()) {
+                throw new IOException("DeepSeek 流式响应被中断：未收到 response/status 完成事件（FINISHED/INCOMPLETE），"
+                        + "已收到 " + text.length() + " 字符，上游可能断流或触发风控" + deepSeekNoticeSuffix(notice));
             }
             return new GeminiResult(text.toString(), "", "", "");
         }
@@ -3988,6 +4073,147 @@ public class Main {
             if (deltaSink != null) {
                 deltaSink.accept(delta);
             }
+        }
+
+        /**
+         * One normalized DeepSeek SSE patch. DeepSeek mixes plain patches
+         * ({@code {"p":..,"o":..,"v":..}}) with batched frames
+         * ({@code {"p":"response","o":"BATCH","v":[{"p":"quasi_status","v":"FINISHED"}]}}),
+         * where a batch item's path is relative to the parent path. Batches also
+         * show up without a parent path, in which case the item paths stand alone.
+         */
+        private record DeepSeekPatch(String path, String op, Object value) {
+        }
+
+        private static final java.util.Set<String> DEEPSEEK_TERMINAL_OK_STATUS =
+                java.util.Set.of("FINISHED", "COMPLETED", "SUCCESS", "DONE");
+        private static final java.util.Set<String> DEEPSEEK_TERMINAL_FAILURE_STATUS =
+                java.util.Set.of("INCOMPLETE", "CONTENT_FILTER", "FAILED", "ERROR", "BANNED", "REJECTED",
+                        "ABORTED", "CANCELED", "CANCELLED", "TIMEOUT");
+
+        private static List<DeepSeekPatch> deepSeekPatches(Map<?, ?> map) {
+            String path = stringValue(map.get("p"));
+            String op = stringValue(map.get("o"));
+            Object value = map.get("v");
+            List<DeepSeekPatch> patches = new java.util.ArrayList<>();
+            if (value instanceof List<?> list && !list.isEmpty()) {
+                boolean batched = true;
+                for (Object item : list) {
+                    Map<?, ?> sub = deepSeekMap(item);
+                    if (sub == null || stringValue(sub.get("p")).isBlank()) {
+                        batched = false;
+                        break;
+                    }
+                }
+                if (batched) {
+                    for (Object item : list) {
+                        Map<?, ?> sub = deepSeekMap(item);
+                        patches.add(new DeepSeekPatch(joinDeepSeekPath(path, stringValue(sub.get("p"))),
+                                stringValue(sub.get("o")), sub.get("v")));
+                    }
+                    return patches;
+                }
+            }
+            patches.add(new DeepSeekPatch(path, op, value));
+            return patches;
+        }
+
+        private static String joinDeepSeekPath(String parent, String child) {
+            if (parent == null || parent.isBlank()) {
+                return child == null ? "" : child;
+            }
+            if (child == null || child.isBlank()) {
+                return parent;
+            }
+            if (child.startsWith(parent + "/") || child.startsWith(parent + "\\")) {
+                return child;
+            }
+            String trimmedParent = parent.endsWith("/") ? parent.substring(0, parent.length() - 1) : parent;
+            String tail = child.startsWith("/") ? child.substring(1) : child;
+            return trimmedParent + "/" + tail;
+        }
+
+        /**
+         * Reads a lifecycle status from a patch. Status patches are named
+         * {@code status} / {@code quasi_status} (e.g. {@code response/status}),
+         * and full response snapshots carry it as {@code v.response.status}.
+         * Non status patches return {@code null}.
+         */
+        private static String deepSeekPatchStatus(String path, Object value) {
+            if (deepSeekPathIsStatus(path)) {
+                String status = deepSeekStatusString(value);
+                if (!status.isBlank()) {
+                    return status;
+                }
+            }
+            Map<?, ?> map = deepSeekMap(value);
+            Map<?, ?> resp = map == null ? null : deepSeekMap(map.get("response"));
+            if (resp != null) {
+                String status = deepSeekStatusString(resp.get("status"));
+                if (!status.isBlank()) {
+                    return status;
+                }
+                status = deepSeekStatusString(resp.get("quasi_status"));
+                if (!status.isBlank()) {
+                    return status;
+                }
+            }
+            return null;
+        }
+
+        private static boolean deepSeekPathIsStatus(String path) {
+            if (path == null || path.isBlank()) {
+                return false;
+            }
+            String tail = path.contains("/") ? path.substring(path.lastIndexOf('/') + 1) : path;
+            return "status".equalsIgnoreCase(tail) || "quasi_status".equalsIgnoreCase(tail);
+        }
+
+        private static String deepSeekStatusString(Object value) {
+            if (value instanceof String string) {
+                return string.trim().toUpperCase(Locale.ROOT);
+            }
+            Map<?, ?> map = deepSeekMap(value);
+            if (map == null) {
+                return "";
+            }
+            for (String key : new String[]{"status", "quasi_status"}) {
+                String status = stringValue(map.get(key));
+                if (!status.isBlank()) {
+                    return status.trim().toUpperCase(Locale.ROOT);
+                }
+            }
+            return "";
+        }
+
+        private static boolean deepSeekStatusTerminal(String status) {
+            return DEEPSEEK_TERMINAL_OK_STATUS.contains(status) || DEEPSEEK_TERMINAL_FAILURE_STATUS.contains(status);
+        }
+
+        private static String deepSeekStatusFailure(String status) {
+            return DEEPSEEK_TERMINAL_FAILURE_STATUS.contains(status) ? status : null;
+        }
+
+        private static boolean isDeepSeekToast(String path) {
+            return path != null && ("toast".equals(path) || path.endsWith("/toast"));
+        }
+
+        private static String deepSeekNoticeSuffix(String notice) {
+            return notice == null || notice.isBlank() ? "" : "，上游提示：" + notice;
+        }
+
+        /**
+         * DeepSeek announces the end of a generation with a
+         * {@code response/status} / {@code quasi_status} patch. Upstream closes
+         * the socket right after it, so an EOF without any terminal status means
+         * the stream was cut off (network, risk control, timeout) -- that must be
+         * reported instead of being returned as a short but "successful" answer.
+         * Set {@code -Ddeepseek.strictTermination=false} to fall back to the old
+         * lenient behaviour.
+         */
+        private static boolean deepSeekRequireTerminal() {
+            String value = System.getProperty("deepseek.strictTermination");
+            return value == null || value.isBlank() || Boolean.parseBoolean(value);
         }
 
         private static String deepSeekEventError(Map<?, ?> map) {
@@ -4627,10 +4853,8 @@ public class Main {
 
         private static String isolatedPrompt(String transcript) {
             return "当前对话正在通过 OpenAI 兼容网关回答。如果用户要求生成图片，请正常生成图片。图片生成应使用模型支持的图片生成能力，不要擅自改用其他工具。\n"
-                    + "上下文隔离规则：下面的“当前会话上下文”是唯一允许使用的对话上下文。不得引用、假设或编造其他会话中的信息。\n"
                     + "工具调用规则：如果需要调用工具，应按照当前网关支持的协议输出工具调用，不要在自己的容器中执行工具调用。发出工具调用后，应立即结束当前轮次并等待工具执行结果；收到工具结果后，再根据结果继续处理。\n"
                     + "禁止输出内部控制标记：工具调用流程中的结束、等待和轮次控制由网关及底层协议负责。严禁在普通文本、最终回答或其他面向用户的内容中输出用于控制流程的内部标记，包括 [done]。不得为了表示工具调用结束、等待结果或回答完成而自行添加此类标记。\n"
-                    + "消息格式规则：默认只输出纯文本，禁止使用 Markdown 格式，包括标题、列表、引用、代码围栏和表格。只有在用户明确要求编写 Markdown 文件时，才允许使用 Markdown。\n"
                     + "当前会话上下文：\n"
                     + transcript;
         }
