@@ -146,6 +146,23 @@ requirements/PoW/Turnstile（如需要）和 conduit token；保存 curl 中旧�
 `openai-sentinel-*`、`x-conduit-token` 不会被重放。若浏览器会话本身过期或 ChatGPT
 仍返回 401/403，请在同一浏览器和网络中重新复制最新 conversation curl 后保存。
 
+#### 文本完整性与失败判定
+
+ChatGPT 网页流按增量下发正文（`{"p":"/message/content/parts/0","o":"append","v":"..."}`
+以及省略路径的 `{"v":"..."}`），结束时给出 `[DONE]` 与 `message_stream_complete`
+（通常伴随 `/message/status = finished_successfully`）。服务端据此处理：
+
+- 裸 `{"v":"..."}` 增量按正文追加，不再被当成控制帧丢弃。
+- 空白增量（Markdown 空行、代码缩进）会原样转发，避免流式输出比实际回答少内容。
+- `append` 按增量语义直接拼接，不做“尾部重复即去重”的猜测，否则模型连续输出相同
+  片段（`好的好的`、代码里连续的 `}` 行、Markdown 表格重复行）会被静默吃掉。
+- 有正文但未收到结束标记就断流：按失败上报，不再把半截回答当成功返回。需要临时
+  恢复旧的宽松行为时加 `-Dchatgpt.strictTermination=false`。
+- 加 `-DdumpRaw=/tmp/gpt-raw.txt` 可把上游原始 SSE 落盘，用于核对真实事件序列。
+
+注意：Pro / 长思考模式的回复可能通过 `stream_handoff` 把后半段交给 WebSocket，
+当前实现只读 HTTP SSE；这种情况会明确报“提前结束”，而不是返回半截回答。
+
 可以用本地刚复制的 curl 做一次 live smoke test（不会把 curl 写入仓库）：
 
 ```bash
