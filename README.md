@@ -221,6 +221,28 @@ H("abc") = f841106c601ce9be9bc38525e90d4178d47f21dd8eb9f238fc55ffaa4ca94506
 若 DeepSeek 返回 401/403 或 `biz_data` 为空（登录过期），请在同一浏览器/网络中重新
 复制最新 completion curl 后保存。
 
+#### PoW 挑战与会话自愈
+
+`create_pow_challenge` 有两种失败形态，服务端区别处理：
+
+- 业务错误（HTTP 200 + `{"code":40002,"msg":"Missing Token"}` 这类响应）：直接按
+  “登录已过期”上报，并带上上游的 `code`/`msg`，不再笼统地说“未返回挑战”。
+- 2xx 但没有 challenge（body 为空、被风控/CDN 静默拦截、上游抖动）：自动重试 3 次
+  （间隔 300/600 ms），重试过程写进容器日志；仍失败则把 `HTTP 状态`、
+  `content-type`、`content-length`、`server` 与响应体长度一起报出来，方便判断是
+  登录过期、风控还是代理返回的空响应。`docker compose logs -f webtoapi` 可以看到
+  `DeepSeek PoW 挑战重试 n/3：…` 的记录。
+
+聊天会话状态会被上游随时作废，这些错误现在都会自动恢复后重试一次，不再直接把
+`status_code=500` 抛给客户端：
+
+- `invalid chat session id`：会话被删/过期/串号，丢弃会话重建一个新的。
+- `invalid message id`：缓存的 `parent_message_id` 已不存在，清空后在同一个 chat 里继续。
+- `达到对话长度上限，请开启新对话`：上游 chat 上下文已满，新建会话后重发。
+
+恢复之所以安全，是因为每次请求都会把完整对话作为 prompt 发出，重建上游会话不会丢
+上下文；另外已经向客户端输出过内容时不做重试，避免出现重复或错乱的回答。
+
 #### 失败判定与排查
 
 上游生成结束时会下发 `response/status`（`FINISHED` / `INCOMPLETE`）或

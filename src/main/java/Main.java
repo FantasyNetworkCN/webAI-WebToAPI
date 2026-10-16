@@ -3773,6 +3773,10 @@ public class Main {
         private static final String SESSION_PATH = "/api/v0/chat_session/create";
         private static final String UPLOAD_PATH = "/api/v0/file/upload_file";
         private static final String FETCH_FILES_PATH = "/api/v0/file/fetch_files";
+        /** create_pow_challenge sometimes answers with an empty body (risk control or a hiccup); retry those. */
+        private static final int DEEPSEEK_POW_ATTEMPTS = 3;
+        /** One retry with a fresh chat session clears a stale/full upstream conversation. */
+        private static final int DEEPSEEK_SESSION_ATTEMPTS = 2;
 
         private final DeepSeekCurlStore store;
         private final OkHttpClient client;
@@ -3837,6 +3841,48 @@ public class Main {
             HttpUrl base = curl.url();
             Map<String, String> headers = new LinkedHashMap<>(curl.headers());
 
+            boolean[] emitted = {false};
+            Consumer<String> content = delta -> {
+                if (delta == null || delta.isEmpty()) {
+                    return;
+                }
+                emitted[0] = true;
+                if (deltaSink != null) {
+                    deltaSink.accept(delta);
+                }
+            };
+            Consumer<String> thought = delta -> {
+                if (delta == null || delta.isEmpty()) {
+                    return;
+                }
+                emitted[0] = true;
+                if (reasoningSink != null) {
+                    reasoningSink.accept(delta);
+                }
+            };
+
+            for (int attempt = 1; ; attempt++) {
+                try {
+                    return requestOnce(profile, curl, base, headers, prompt, images, content, thought, conversation);
+                } catch (DeepSeekSessionRecoveryException e) {
+                    // The cached upstream chat session is gone (chat deleted, session expired)
+                    // or full. Both are recoverable: a new session still receives the whole
+                    // transcript, because the caller sends the complete conversation.
+                    if (emitted[0] || attempt >= DEEPSEEK_SESSION_ATTEMPTS) {
+                        throw new IOException(e.getMessage());
+                    }
+                    e.apply(conversation);
+                    System.err.println("DeepSeek 会话状态失效（" + e.getMessage() + "），已重置会话后重试 "
+                            + (attempt + 1) + "/" + DEEPSEEK_SESSION_ATTEMPTS);
+                }
+            }
+        }
+
+        private GeminiResult requestOnce(ModelProfile profile, ParsedDeepSeekCurl curl, HttpUrl base,
+                                         Map<String, String> headers, String prompt,
+                                         List<OpenAiApiServer.ImageInput> images, Consumer<String> deltaSink,
+                                         Consumer<String> reasoningSink, ChatGptConversation conversation)
+                throws IOException {
             if (conversation.conversationId.isBlank()) {
                 conversation.conversationId = createSession(base, headers, curl.body());
                 conversation.parentMessageId = "";
@@ -3863,8 +3909,14 @@ public class Main {
                                 + "）。请重新登录 chat.deepseek.com 并在同一浏览器/网络中复制最新 completion curl 后保存。响应="
                                 + preview(error));
                     }
-                    throw new IOException("DeepSeek completion 请求失败，HTTP 状态=" + response.code()
-                            + "，响应=" + preview(error));
+                    DeepSeekSessionRecoveryException session =
+                            deepSeekSessionRecovery("DeepSeek 返回错误："
+                                    + firstNonBlank(deepSeekErrorSummary(error), preview(error)));
+                    if (session != null) {
+                        throw session;
+                    }
+                    throw new IOException("DeepSeek completion 请求失败（"
+                            + describeUpstream(response, error) + "）");
                 }
                 return streamDeepSeekText(response, deltaSink, reasoningSink, conversation);
             }
@@ -3886,7 +3938,9 @@ public class Main {
                             return id;
                         }
                     }
-                    failure = "DeepSeek 会话创建失败，HTTP 状态=" + response.code() + "，响应=" + preview(text);
+                    String summary = deepSeekErrorSummary(text);
+                    failure = "DeepSeek 会话创建失败（" + describeUpstream(response, text) + "）"
+                            + (summary.isBlank() ? "" : "，上游错误：" + summary);
                 }
             } catch (IOException e) {
                 failure = "DeepSeek 会话创建失败：" + e.getMessage();
@@ -3900,35 +3954,63 @@ public class Main {
 
         private String solveChallenge(HttpUrl base, Map<String, String> headers, String targetPath)
                 throws IOException {
+            IOException last = null;
+            for (int attempt = 1; attempt <= DEEPSEEK_POW_ATTEMPTS; attempt++) {
+                try {
+                    return solveChallengeOnce(base, headers, targetPath);
+                } catch (DeepSeekChallengeMissingException e) {
+                    last = e;
+                    if (attempt < DEEPSEEK_POW_ATTEMPTS) {
+                        System.err.println("DeepSeek PoW 挑战重试 " + (attempt + 1) + "/"
+                                + DEEPSEEK_POW_ATTEMPTS + "：" + e.getMessage());
+                        sleepQuietly(300L * attempt);
+                    }
+                }
+            }
+            throw last == null ? new IOException("DeepSeek PoW 挑战获取失败") : last;
+        }
+
+        private String solveChallengeOnce(HttpUrl base, Map<String, String> headers, String targetPath)
+                throws IOException {
             String requestBody = "{\"target_path\":" + SimpleJson.quote(targetPath) + "}";
-            String text;
             Request.Builder builder = new Request.Builder()
                     .url(base.newBuilder().encodedPath(CHALLENGE_PATH).build())
                     .post(RequestBody.create(requestBody, JSON_MEDIA_TYPE));
             applyHeaders(builder, headers, "application/json", "application/json");
             try (Response response = client.newCall(builder.build()).execute()) {
-                text = response.body() == null ? "" : response.body().string();
+                String text = response.body() == null ? "" : response.body().string();
                 if (!response.isSuccessful()) {
-                    throw new IOException("DeepSeek PoW 挑战请求失败，HTTP 状态=" + response.code()
-                            + "，响应=" + preview(text));
+                    if (response.code() == 401 || response.code() == 403) {
+                        throw new IOException("DeepSeek 凭据已过期或触发风控（"
+                                + describeUpstream(response, text)
+                                + "）。请重新登录 chat.deepseek.com 并在同一浏览器/网络中复制最新 completion curl 后保存。");
+                    }
+                    throw new IOException("DeepSeek PoW 挑战请求失败（" + describeUpstream(response, text) + "）");
                 }
+                Map<?, ?> challenge = deepSeekChallenge(SimpleJson.parse(text));
+                if (challenge == null) {
+                    String summary = deepSeekErrorSummary(text);
+                    if (!summary.isBlank()) {
+                        throw new IOException("DeepSeek 拒绝发放 PoW 挑战（" + summary + "），登录很可能已过期："
+                                + "请重新登录 chat.deepseek.com 并在同一浏览器/网络中复制最新 completion curl 后保存。"
+                                + describeUpstream(response, text));
+                    }
+                    throw new DeepSeekChallengeMissingException("DeepSeek 未返回 PoW 挑战"
+                            + "（登录可能已过期或触发风控）：" + describeUpstream(response, text));
+                }
+                String algorithm = stringValue(challenge.get("algorithm"));
+                String challengeHex = stringValue(challenge.get("challenge"));
+                String salt = stringValue(challenge.get("salt"));
+                String signature = stringValue(challenge.get("signature"));
+                long expireAt = deepSeekLong(challenge.get("expire_at"));
+                long difficulty = deepSeekLong(challenge.get("difficulty"));
+                String headerTargetPath = firstNonBlank(stringValue(challenge.get("target_path")), targetPath);
+                if (challengeHex.isBlank() || salt.isBlank() || difficulty <= 0) {
+                    throw new IOException("DeepSeek PoW 挑战字段不完整（" + preview(text) + "）");
+                }
+                long answer = DeepSeekPow.solve(challengeHex, salt + "_" + expireAt + "_", difficulty);
+                return DeepSeekPow.responseHeader(algorithm, challengeHex, salt, answer, signature, headerTargetPath);
             }
-            Map<?, ?> challenge = deepSeekChallenge(SimpleJson.parse(text));
-            if (challenge == null) {
-                throw new IOException("DeepSeek 未返回 PoW 挑战（登录可能已过期）：" + preview(text));
-            }
-            String algorithm = stringValue(challenge.get("algorithm"));
-            String challengeHex = stringValue(challenge.get("challenge"));
-            String salt = stringValue(challenge.get("salt"));
-            String signature = stringValue(challenge.get("signature"));
-            long expireAt = deepSeekLong(challenge.get("expire_at"));
-            long difficulty = deepSeekLong(challenge.get("difficulty"));
-            String headerTargetPath = firstNonBlank(stringValue(challenge.get("target_path")), targetPath);
-            if (challengeHex.isBlank() || salt.isBlank() || difficulty <= 0) {
-                throw new IOException("DeepSeek PoW 挑战字段不完整：" + preview(text));
-            }
-            long answer = DeepSeekPow.solve(challengeHex, salt + "_" + expireAt + "_", difficulty);
-            return DeepSeekPow.responseHeader(algorithm, challengeHex, salt, answer, signature, headerTargetPath);
         }
 
         private static String completionBody(String sessionId, String parent, String modelType, String prompt,
@@ -4020,7 +4102,7 @@ public class Main {
                 }
                 String error = deepSeekEventError(map);
                 if (error != null) {
-                    throw new IOException("DeepSeek 返回错误：" + error);
+                    throw deepSeekChatError("DeepSeek 返回错误：" + error);
                 }
 
                 Object responseMessageId = map.get("response_message_id");
@@ -4108,16 +4190,16 @@ public class Main {
 
             dumpRawResponseIfRequested(all.toString());
             if (terminalFailure != null) {
-                throw new IOException("DeepSeek 未正常结束（" + terminalFailure + "），已收到 "
+                throw deepSeekChatError("DeepSeek 未正常结束（" + terminalFailure + "），已收到 "
                         + text.length() + " 字符" + deepSeekNoticeSuffix(notice));
             }
             if (text.isEmpty() && reasoning.isEmpty()) {
                 String error = deepSeekBodyError(all.toString());
                 if (error != null) {
-                    throw new IOException("DeepSeek 返回错误：" + error);
+                    throw deepSeekChatError("DeepSeek 返回错误：" + error);
                 }
                 if (terminalSeen) {
-                    throw new IOException("DeepSeek 返回了空内容（上游已结束，status="
+                    throw deepSeekChatError("DeepSeek 返回了空内容（上游已结束，status="
                             + firstNonBlank(terminalOk, "UNKNOWN") + "）" + deepSeekNoticeSuffix(notice)
                             + "。原始响应=" + preview(all.toString()));
                 }
@@ -4327,6 +4409,124 @@ public class Main {
 
         private static Map<?, ?> deepSeekMap(Object value) {
             return value instanceof Map<?, ?> map ? map : null;
+        }
+
+        /**
+         * {@code create_pow_challenge} answered with a 2xx but without a challenge.
+         * That is worth retrying: upstream does return an empty body when it is
+         * throttling, while an actually expired login answers with a business error
+         * message instead (see {@link #deepSeekErrorSummary}).
+         */
+        private static final class DeepSeekChallengeMissingException extends IOException {
+            private DeepSeekChallengeMissingException(String message) {
+                super(message);
+            }
+        }
+
+        /**
+         * DeepSeek rejects a cached chat session when the chat was deleted upstream,
+         * when the cached {@code parent_message_id} no longer exists, or when the
+         * chat hit its context limit. All three are recoverable: dropping the session
+         * and/or the parent message makes the next attempt start clean, and the
+         * caller resends the whole transcript anyway.
+         */
+        private static final class DeepSeekSessionRecoveryException extends IOException {
+            private final boolean resetSession;
+
+            private DeepSeekSessionRecoveryException(boolean resetSession, String message) {
+                super(message);
+                this.resetSession = resetSession;
+            }
+
+            private void apply(ChatGptConversation conversation) {
+                conversation.parentMessageId = "";
+                if (resetSession) {
+                    conversation.conversationId = "";
+                }
+            }
+        }
+
+        /**
+         * Maps an upstream error onto a recoverable session problem, or {@code null}
+         * when the error is something else (risk control, quota, transport, ...).
+         */
+        private static DeepSeekSessionRecoveryException deepSeekSessionRecovery(String message) {
+            String text = message == null ? "" : message;
+            String lower = text.toLowerCase(Locale.ROOT);
+            if (lower.contains("invalid chat session") || lower.contains("chat session not found")
+                    || lower.contains("session expired") || lower.contains("invalid session")
+                    || lower.contains("会话不存在") || lower.contains("会话已失效")) {
+                return new DeepSeekSessionRecoveryException(true, text);
+            }
+            if (lower.contains("invalid message id") || lower.contains("message not found")) {
+                return new DeepSeekSessionRecoveryException(false, text);
+            }
+            if (lower.contains("对话长度上限") || lower.contains("上下文长度") || lower.contains("context length")
+                    || lower.contains("conversation too long") || lower.contains("too many tokens")) {
+                return new DeepSeekSessionRecoveryException(true, text);
+            }
+            return null;
+        }
+
+        /** Turns an upstream error into a retryable session problem or a plain failure. */
+        private static IOException deepSeekChatError(String message) {
+            DeepSeekSessionRecoveryException recovery = deepSeekSessionRecovery(message);
+            return recovery != null ? recovery : new IOException(message);
+        }
+
+        /** Compact upstream error summary: {@code code} / {@code msg} / {@code biz_msg}. */
+        private static String deepSeekErrorSummary(String body) {
+            if (body == null || body.isBlank()) {
+                return "";
+            }
+            Object parsed;
+            try {
+                parsed = SimpleJson.parse(body);
+            } catch (RuntimeException e) {
+                return "";
+            }
+            Map<?, ?> map = deepSeekMap(parsed);
+            if (map == null) {
+                return "";
+            }
+            Map<?, ?> data = deepSeekMap(map.get("data"));
+            long code = deepSeekLong(map.get("code"));
+            String message = stringValue(map.get("msg"));
+            if (data != null) {
+                long bizCode = deepSeekLong(data.get("biz_code"));
+                if (bizCode != 0) {
+                    code = bizCode;
+                }
+                message = firstNonBlank(stringValue(data.get("biz_msg")), message);
+            }
+            if (message.isBlank()) {
+                return code == 0 ? "" : "code=" + code;
+            }
+            return code == 0 ? message : "code=" + code + "，" + message;
+        }
+
+        /**
+         * Describes the raw upstream reply so "empty body" failures stay debuggable:
+         * status plus whether the body was empty, without leaking credentials.
+         */
+        private static String describeUpstream(Response response, String body) {
+            String text = body == null ? "" : body;
+            String contentType = response.header("content-type", "");
+            String contentLength = response.header("content-length", "");
+            String server = response.header("server", "");
+            StringBuilder out = new StringBuilder("HTTP 状态=").append(response.code())
+                    .append("，content-type=").append(contentType.isBlank() ? "无" : contentType)
+                    .append("，body=").append(text.length()).append("字符");
+            if (!contentLength.isBlank()) {
+                out.append("（content-length=").append(contentLength).append("）");
+            }
+            if (!server.isBlank()) {
+                out.append("，server=").append(server);
+            }
+            if (!text.isBlank()) {
+                out.append("，响应=").append(preview(text));
+            }
+            return out.toString();
         }
 
         private static Map<?, ?> deepSeekChallenge(Object parsed) {
