@@ -134,6 +134,42 @@ curl http://localhost:60000/v1/chat/completions \
   }'
 ```
 
+### 工具调用（Function Calling / MCP）
+
+网页端模型本身不能执行工具，所以 `/v1/chat/completions` 和 `/v1/responses` 会把客户端
+发来的 `tools` schema 原样贴进提示词，再要求模型用固定 JSON 回话。收到这种回话后，
+网关把它翻译成客户端的工具调用：
+
+```json
+{"tool_calls": [{"function": {"name": "工具名", "arguments": {"参数名": "参数值"}}}]}
+```
+
+#### 命名空间工具（MCP）
+
+Codex 这类客户端把 MCP 工具下发成 `type: "namespace"` 的分组，路由时要求
+`namespace` 与 `name` 这一对完全匹配：
+
+```json
+{"type": "namespace", "name": "mcp__nekomusic",
+ "tools": [{"type": "function", "name": "next_track"}]}
+```
+
+网页端模型常常把分隔符改成 `__` / `.`，或者直接丢掉命名空间（`mcp__nekomusic__next_track`、
+`next_track`），客户端路由只认注册名，于是这些调用会被回
+`unsupported call: next_track`。网关做了两件事：
+
+- 提示词里明确要求带 `namespace` 输出，且名字逐字照抄 schema。
+- 按请求里的 `tools` schema 建立别名表，把 `命名空间::工具名`、`命名空间__工具名`、
+  `命名空间.工具名` 以及唯一命中的裸工具名都还原成 `namespace` + `name`，再写出
+  `function_call`：
+
+```json
+{"type": "function_call", "call_id": "call_...", "name": "next_track", "namespace": "mcp__nekomusic", "arguments": "{}"}
+```
+
+如果仍然看到 `unsupported call: xxx`，先确认客户端里该 MCP server 处于 connected
+状态，再确认日志里上一轮请求确实带上了那个 namespace 分组。
+
 ### ChatGPT 网页端模型
 
 项目也实现了文章 `111.html` 中描述的 ChatGPT 网页端链路。打开首页的
@@ -342,3 +378,16 @@ docker compose logs webtoapi
 ```
 
 重点检查 `config.yml` 是否存在，以及 `curl:` 后是否包含完整有效的 `StreamGenerate` 请求。
+
+### 工具调用返回 `unsupported call`
+
+客户端日志里如果出现 `codex_core::tools::router: error=unsupported call: xxx`，说明它收到的
+工具名不是注册名（MCP 工具必须是 `namespace` + `name` 成对）。排查顺序：
+
+```bash
+docker compose logs webtoapi | rg has_tools
+```
+
+- 确认该轮请求的 `tools` 里确实有 `type: "namespace"` 分组，且客户端里 MCP server 为 connected。
+- 确认网关写出了 `namespace` 字段（本仓库已按 schema 别名还原，见「工具调用」一节）。
+- 若模型给出的是裸工具名且两个命名空间同名，别名表不会猜，网关按原样透传，需要模型显式给出 `namespace`。

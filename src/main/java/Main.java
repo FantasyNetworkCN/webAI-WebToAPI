@@ -5198,6 +5198,11 @@ public class Main {
                     + request.toolsText()
                     + "\n\n如果需要调用工具，必须只输出一个 JSON 对象，不要输出任何解释、Markdown、代码块或自然语言。格式：\n"
                     + "{\"tool_calls\":[{\"function\":{\"name\":\"工具名\",\"arguments\":{\"参数名\":\"参数值\"}}}]}\n"
+                    + (request.hasNamespacedTools()
+                    ? "schema 里 type 为 \"namespace\" 的条目是一个「工具命名空间」，它下面的工具必须连命名空间一起给出：\n"
+                    + "{\"tool_calls\":[{\"function\":{\"namespace\":\"命名空间名\",\"name\":\"工具名\",\"arguments\":{\"参数名\":\"参数值\"}}}]}\n"
+                    + "name 与 namespace 必须逐字照抄 schema 中的字符串：不要自己拼接或用 __ 、:: 、. 之类的分隔符加前缀，也不要省略命名空间。\n"
+                    : "")
                     + "禁止声明你已经调用了工具；禁止尝试自己执行工具；禁止把工具调用改写成 shell、Python、浏览器或 Claude 内置工具操作。\n"
                     + "如果不确定参数，先用合理参数请求客户端工具调用，不要自己猜测执行结果。\n"
                     + "如果不需要调用工具，就正常回答。";

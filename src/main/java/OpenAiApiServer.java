@@ -383,6 +383,7 @@ final class OpenAiApiServer {
             String model = resolveModel(request.get("model"));
             SessionKey sessionKey = sessionKey(request, exchange, prompt);
             String toolsText = toolsText(request.get("tools"), request.get("tool_choice"));
+            ToolNameIndex toolNames = ToolNameIndex.of(request.get("tools"));
             logRequest(exchange, body, request, model, stream, sessionKey, prompt, toolsText);
             ChatRequest chatRequest = new ChatRequest(
                     model,
@@ -393,6 +394,7 @@ final class OpenAiApiServer {
                     prompt.messageCount(),
                     prompt.images(),
                     toolsText,
+                    toolNames,
                     wantsNewConversation(request, prompt, sessionKey));
             if (stream) {
                 handleStream(exchange, chatRequest);
@@ -401,7 +403,7 @@ final class OpenAiApiServer {
 
             CollectedDeltas deltas = new CollectedDeltas();
             String text = backend.complete(chatRequest, deltas);
-            ToolCallResult toolCall = parseToolCallResult(text);
+            ToolCallResult toolCall = parseToolCallResult(text, chatRequest.toolNames());
             sendJson(exchange, 200, toolCall == null
                     ? completionJson(model, text, deltas.reasoning())
                     : toolCompletionJson(model, toolCall));
@@ -442,6 +444,7 @@ final class OpenAiApiServer {
             String model = resolveModel(request.get("model"));
             SessionKey sessionKey = sessionKey(request, exchange, prompt);
             String toolsText = responsesToolsText(request.get("tools"), request.get("tool_choice"));
+            ToolNameIndex toolNames = ToolNameIndex.of(request.get("tools"));
             logRequest(exchange, body, request, model, stream, sessionKey, prompt, toolsText);
             ChatRequest chatRequest = new ChatRequest(
                     model,
@@ -452,6 +455,7 @@ final class OpenAiApiServer {
                     prompt.messageCount(),
                     prompt.images(),
                     toolsText,
+                    toolNames,
                     wantsNewConversation(request, prompt, sessionKey));
             if (stream) {
                 handleResponseStream(exchange, chatRequest);
@@ -460,7 +464,7 @@ final class OpenAiApiServer {
 
             CollectedDeltas deltas = new CollectedDeltas();
             String text = backend.complete(chatRequest, deltas);
-            ToolCallResult toolCall = parseToolCallResult(text);
+            ToolCallResult toolCall = parseToolCallResult(text, chatRequest.toolNames());
             sendJson(exchange, 200, toolCall == null
                     ? responseJson(model, text, deltas.reasoning())
                     : toolResponseJson(model, toolCall));
@@ -485,7 +489,7 @@ final class OpenAiApiServer {
             final OutputStream streamOut = out;
             if (request.hasTools()) {
                 String text = backend.complete(request, NOOP_DELTAS);
-                ToolCallResult toolCall = parseToolCallResult(text);
+                ToolCallResult toolCall = parseToolCallResult(text, request.toolNames());
                 if (toolCall == null) {
                     if (!text.isEmpty()) {
                         sendSse(streamOut, chunkJson(id, request.model(), created, text, false));
@@ -546,7 +550,7 @@ final class OpenAiApiServer {
             sendResponseSse(streamOut, responseCreatedEvent(id, request.model(), created));
             if (request.hasTools()) {
                 String text = backend.complete(request, NOOP_DELTAS);
-                ToolCallResult toolCall = parseToolCallResult(text);
+                ToolCallResult toolCall = parseToolCallResult(text, request.toolNames());
                 if (toolCall == null) {
                     String outputId = responseMessageId();
                     sendResponseSse(streamOut, responseOutputItemAddedEvent(id, outputId));
@@ -1575,7 +1579,7 @@ final class OpenAiApiServer {
         return name.isBlank() ? "image.png" : name;
     }
 
-    private static ToolCallResult parseToolCallResult(String text) {
+    private static ToolCallResult parseToolCallResult(String text, ToolNameIndex toolNames) {
         String json = extractJsonObject(text);
         if (json.isBlank()) {
             return null;
@@ -1587,12 +1591,12 @@ final class OpenAiApiServer {
 
         Object callObject = root.get("tool_calls");
         if (callObject instanceof List<?> calls && !calls.isEmpty()) {
-            return toolCallFromObject(calls.get(0));
+            return toolCallFromObject(calls.get(0), toolNames);
         }
-        return toolCallFromObject(root);
+        return toolCallFromObject(root, toolNames);
     }
 
-    private static ToolCallResult toolCallFromObject(Object value) {
+    private static ToolCallResult toolCallFromObject(Object value, ToolNameIndex toolNames) {
         if (!(value instanceof Map<?, ?> map)) {
             return null;
         }
@@ -1601,7 +1605,13 @@ final class OpenAiApiServer {
             String name = stringValue(fn.get("name"), "");
             Object arguments = fn.get("arguments");
             if (!name.isBlank()) {
-                return new ToolCallResult(name, argumentsJson(arguments));
+                return resolveToolCall(name,
+                        firstNonBlank(
+                                stringValue(fn.get("namespace"), ""),
+                                stringValue(fn.get("tool_namespace"), ""),
+                                stringValue(fn.get("ns"), "")),
+                        argumentsJson(arguments),
+                        toolNames);
             }
         }
 
@@ -1613,7 +1623,39 @@ final class OpenAiApiServer {
         if (name.isBlank()) {
             return null;
         }
-        return new ToolCallResult(name, argumentsJson(arguments));
+        return resolveToolCall(name,
+                firstNonBlank(
+                        stringValue(map.get("namespace"), ""),
+                        stringValue(map.get("tool_namespace"), "")),
+                argumentsJson(arguments),
+                toolNames);
+    }
+
+    /**
+     * Maps a model supplied name onto the tool pair the client registered.
+     * Web models routinely rewrite the {@code namespace::tool} separator into
+     * {@code __} or {@code .} (or drop the namespace entirely), and the client
+     * router only accepts the exact pair, so anything that can be traced back
+     * onto a tool of this request is normalized before it is handed back.
+     */
+    private static ToolCallResult resolveToolCall(String rawName, String rawNamespace, String argumentsJson,
+                                                 ToolNameIndex toolNames) {
+        String name = rawName == null ? "" : rawName.trim();
+        if (name.isEmpty()) {
+            return null;
+        }
+        String namespace = rawNamespace == null ? "" : rawNamespace.trim();
+        if (!namespace.isEmpty() && name.startsWith(namespace)) {
+            String rest = name.substring(namespace.length()).replaceFirst("^[:_\\.]+", "");
+            if (!rest.isEmpty()) {
+                name = rest;
+            }
+        }
+        ToolCallTarget target = toolNames.lookup(name);
+        if (target != null) {
+            return new ToolCallResult(target.name(), target.namespace(), argumentsJson);
+        }
+        return new ToolCallResult(name, namespace, argumentsJson);
     }
 
     private static Object firstNonNull(Object... values) {
@@ -1963,8 +2005,21 @@ final class OpenAiApiServer {
                 + "\"status\":\"completed\","
                 + "\"call_id\":" + SimpleJson.quote(call.callId()) + ","
                 + "\"name\":" + SimpleJson.quote(call.name()) + ","
+                + namespaceField(call.namespace())
                 + "\"arguments\":" + SimpleJson.quote(call.argumentsJson())
                 + "}";
+    }
+
+    /**
+     * Clients that group MCP tools under {@code type: "namespace"} entries only
+     * accept {@code namespace} + {@code name} as a pair, so the namespace has to
+     * be carried on the emitted {@code function_call} item.
+     */
+    private static String namespaceField(String namespace) {
+        if (namespace == null || namespace.isBlank()) {
+            return "";
+        }
+        return "\"namespace\":" + SimpleJson.quote(namespace) + ",";
     }
 
     private static String responseToolCallJson(ToolCallResult call) {
@@ -1972,7 +2027,7 @@ final class OpenAiApiServer {
     }
 
     private static String toolResponseSummary(ToolCallResult call) {
-        return "function_call: " + call.name() + "(" + call.argumentsJson() + ")";
+        return "function_call: " + flatToolName(call) + "(" + call.argumentsJson() + ")";
     }
 
     private static String toolCallJson(ToolCallResult call, int index) {
@@ -1980,9 +2035,16 @@ final class OpenAiApiServer {
                 + "\"index\":" + index + ","
                 + "\"id\":" + SimpleJson.quote("call_" + UUID.randomUUID().toString().replace("-", "")) + ","
                 + "\"type\":\"function\","
-                + "\"function\":{\"name\":" + SimpleJson.quote(call.name())
+                + "\"function\":{\"name\":" + SimpleJson.quote(flatToolName(call))
                 + ",\"arguments\":" + SimpleJson.quote(call.argumentsJson()) + "}"
                 + "}";
+    }
+
+    /** Chat Completions has no namespace field, so namespaced tools are flattened back. */
+    private static String flatToolName(ToolCallResult call) {
+        return call.namespace() == null || call.namespace().isBlank()
+                ? call.name()
+                : call.namespace() + "__" + call.name();
     }
 
     private static void sendSse(OutputStream out, String json) throws IOException {
@@ -2177,9 +2239,13 @@ final class OpenAiApiServer {
 
     record ChatRequest(String model, String sessionKey, boolean explicitSession, String fullPrompt,
                        String latestPrompt, int messageCount, List<ImageInput> images,
-                       String toolsText, boolean newConversation) {
+                       String toolsText, ToolNameIndex toolNames, boolean newConversation) {
         boolean hasTools() {
             return toolsText != null && !toolsText.isBlank();
+        }
+
+        boolean hasNamespacedTools() {
+            return toolNames != null && !toolNames.isEmpty();
         }
     }
 
@@ -2211,13 +2277,76 @@ final class OpenAiApiServer {
     private record InputMessage(String role, String text, List<ImageInput> images) {
     }
 
-    private record ToolCallResult(String name, String argumentsJson) {
+    /** A tool the client registered inside a namespace group. */
+    private record ToolCallTarget(String name, String namespace) {
     }
 
-    private record ResponseToolCall(String id, String callId, String name, String argumentsJson) {
+    /**
+     * Indexes the {@code type: "namespace"} tool groups of an incoming request so
+     * that every spelling a model may produce (bare, {@code ns::tool},
+     * {@code ns__tool}, {@code ns.tool}) resolves back to the registered pair.
+     */
+    private record ToolNameIndex(Map<String, ToolCallTarget> aliases) {
+        private static final ToolNameIndex EMPTY = new ToolNameIndex(Map.of());
+
+        private static ToolNameIndex of(Object tools) {
+            if (!(tools instanceof List<?> list) || list.isEmpty()) {
+                return EMPTY;
+            }
+            Map<String, ToolCallTarget> aliases = new java.util.LinkedHashMap<>();
+            Map<String, String> bare = new java.util.LinkedHashMap<>();
+            Map<String, Integer> occurrences = new java.util.LinkedHashMap<>();
+            for (Object item : list) {
+                if (!(item instanceof Map<?, ?> group)
+                        || !"namespace".equalsIgnoreCase(stringValue(group.get("type"), ""))
+                        || !(group.get("tools") instanceof List<?> members)) {
+                    continue;
+                }
+                String namespace = stringValue(group.get("name"), "").trim();
+                if (namespace.isEmpty()) {
+                    continue;
+                }
+                for (Object member : members) {
+                    if (!(member instanceof Map<?, ?> tool)) {
+                        continue;
+                    }
+                    String name = stringValue(tool.get("name"), "").trim();
+                    if (name.isEmpty()) {
+                        continue;
+                    }
+                    ToolCallTarget target = new ToolCallTarget(name, namespace);
+                    aliases.putIfAbsent(namespace + "::" + name, target);
+                    aliases.putIfAbsent(namespace + "__" + name, target);
+                    aliases.putIfAbsent(namespace + "." + name, target);
+                    occurrences.merge(name, 1, Integer::sum);
+                    bare.putIfAbsent(name, namespace);
+                }
+            }
+            for (Map.Entry<String, String> entry : bare.entrySet()) {
+                if (occurrences.get(entry.getKey()) == 1) {
+                    aliases.putIfAbsent(entry.getKey(), new ToolCallTarget(entry.getKey(), entry.getValue()));
+                }
+            }
+            return aliases.isEmpty() ? EMPTY : new ToolNameIndex(Map.copyOf(aliases));
+        }
+
+        private boolean isEmpty() {
+            return aliases.isEmpty();
+        }
+
+        private ToolCallTarget lookup(String name) {
+            return name == null || name.isEmpty() ? null : aliases.get(name);
+        }
+    }
+
+    private record ToolCallResult(String name, String namespace, String argumentsJson) {
+    }
+
+    private record ResponseToolCall(String id, String callId, String name, String namespace, String argumentsJson) {
         private static ResponseToolCall from(ToolCallResult call) {
             String suffix = UUID.randomUUID().toString().replace("-", "");
-            return new ResponseToolCall("fc_" + suffix, "call_" + suffix, call.name(), call.argumentsJson());
+            return new ResponseToolCall("fc_" + suffix, "call_" + suffix,
+                    call.name(), call.namespace(), call.argumentsJson());
         }
     }
 }
