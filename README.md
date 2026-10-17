@@ -65,6 +65,9 @@ PROXY_ENABLED=true PROXY_HOST=host.docker.internal PROXY_PORT=7890 \
 来自 Docker 网关的连接；如果代理只能监听宿主机 `127.0.0.1`，请使用宿主机
 转发端口，或继续使用 host 网络。
 
+DeepSeek 请求不受这里的代理设置影响，始终使用独立客户端直连
+`chat.deepseek.com`，避免国内访问多绕一层代理带来的额外延迟。
+
 ## 启动
 
 在项目根目录执行：
@@ -226,6 +229,9 @@ DevTools 复制的 `https://chat.deepseek.com/api/v0/chat/completion` 完整 cur
 `authorization: Bearer …` 与 `cookie`），服务端会提取 URL、Header 和 body 并存入
 `data/deepseek-curls.sqlite`。模型会以 `deepseek-web` 与 `deepseek-reasoner` 出现在
 `/v1/models`。
+
+DeepSeek 使用独立的直连客户端，不受“代理设置”页影响；代理只用于 Gemini、
+Claude、ChatGPT 的 Java 请求和 Chromium。
 
 - `deepseek-web`：`model_type=default`，关闭思考，等价于网页快速模式。
 - `deepseek-reasoner`：`model_type=expert`，开启 `thinking_enabled`。思维链（THINK

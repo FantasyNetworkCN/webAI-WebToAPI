@@ -57,6 +57,8 @@ public class Main {
     private static final Pattern UUID_PATTERN = Pattern.compile(
             "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}");
     private static final Map<String, ModelProfile> MODEL_PROFILES = modelProfiles();
+    /** DeepSeek is reachable directly; keep it off the shared proxy used by Gemini/Claude/ChatGPT. */
+    private static final OkHttpClient DEEPSEEK_DIRECT_CLIENT = buildDirectHttpClient();
 
     public static void main(String[] args) {
         try {
@@ -207,7 +209,7 @@ public class Main {
             return sendChatGptInternal(config, client, profile, prompt, deltaSink, conversation.chatGptConversation());
         }
         if (profile.provider() == ModelProvider.DEEPSEEK) {
-            return sendDeepSeekInternal(config, client, profile, prompt, images, deltaSink, reasoningSink,
+            return sendDeepSeekInternal(config, profile, prompt, images, deltaSink, reasoningSink,
                     conversation.chatGptConversation());
         }
 
@@ -328,14 +330,14 @@ public class Main {
         return new ChatGptCurlClient(config.chatGptCurlStore, client).complete(prompt, deltaSink, conversation);
     }
 
-    private static GeminiResult sendDeepSeekInternal(AppConfig config, OkHttpClient client, ModelProfile profile,
+    private static GeminiResult sendDeepSeekInternal(AppConfig config, ModelProfile profile,
                                                      String prompt, java.util.List<OpenAiApiServer.ImageInput> images,
                                                      Consumer<String> deltaSink, Consumer<String> reasoningSink,
                                                      ChatGptConversation conversation) throws IOException {
         if (config.deepSeekCurlStore == null) {
             throw new IOException("DeepSeek curl 存储未初始化");
         }
-        return new DeepSeekCurlClient(config.deepSeekCurlStore, client)
+        return new DeepSeekCurlClient(config.deepSeekCurlStore, DEEPSEEK_DIRECT_CLIENT)
                 .complete(profile, prompt, images, deltaSink, reasoningSink, conversation);
     }
 
@@ -701,11 +703,7 @@ public class Main {
     }
 
     private static OkHttpClient buildHttpClient(AppConfig config) {
-        OkHttpClient.Builder builder = new OkHttpClient.Builder()
-                .connectTimeout(Duration.ofSeconds(30))
-                .readTimeout(Duration.ofSeconds(300))
-                .writeTimeout(Duration.ofSeconds(30))
-                .retryOnConnectionFailure(true);
+        OkHttpClient.Builder builder = httpClientBuilder();
 
         if (config.proxyEnabled) {
             Proxy.Type type = "socks".equalsIgnoreCase(config.proxyType)
@@ -715,6 +713,18 @@ public class Main {
         }
 
         return builder.build();
+    }
+
+    private static OkHttpClient buildDirectHttpClient() {
+        return httpClientBuilder().build();
+    }
+
+    private static OkHttpClient.Builder httpClientBuilder() {
+        return new OkHttpClient.Builder()
+                .connectTimeout(Duration.ofSeconds(30))
+                .readTimeout(Duration.ofSeconds(300))
+                .writeTimeout(Duration.ofSeconds(30))
+                .retryOnConnectionFailure(true);
     }
 
     private static ImageUploadResult uploadImages(OkHttpClient client,
