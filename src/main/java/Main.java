@@ -23,6 +23,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -4869,7 +4870,6 @@ public class Main {
                     .post(RequestBody.create(body, JSON_MEDIA_TYPE));
             applyHeaders(builder, parsed.headers());
             builder.header("content-type", "application/json");
-            builder.header("accept", "*/*");
             builder.header("accept-encoding", "identity");
 
             try (Response response = client.newCall(builder.build()).execute()) {
@@ -5006,8 +5006,7 @@ public class Main {
             headers.forEach((name, value) -> {
                 String lower = name.toLowerCase(Locale.ROOT);
                 if ("host".equals(lower) || "content-length".equals(lower) || "content-type".equals(lower)
-                        || "accept".equals(lower) || "accept-encoding".equals(lower)
-                        || "connection".equals(lower)) {
+                        || "accept-encoding".equals(lower) || "connection".equals(lower)) {
                     return;
                 }
                 builder.header(name, value);
@@ -5017,6 +5016,9 @@ public class Main {
             }
             if (headers.keySet().stream().noneMatch(name -> "referer".equalsIgnoreCase(name))) {
                 builder.header("referer", "https://www.doubao.com/");
+            }
+            if (headers.keySet().stream().noneMatch(name -> "accept".equalsIgnoreCase(name))) {
+                builder.header("accept", "*/*");
             }
         }
 
@@ -5057,8 +5059,10 @@ public class Main {
 
             dumpRawResponseIfRequested(state.raw.toString());
             if (state.text.isEmpty()) {
-                throw new IOException("豆包没有返回正文"
-                        + (state.brief.isBlank() ? "" : "，上游预览=" + preview(state.brief)));
+                String events = state.eventTypes.isEmpty() ? "无" : String.join(", ", state.eventTypes);
+                throw new IOException("豆包没有返回正文（SSE 事件=" + events + "）"
+                        + (state.brief.isBlank() ? "" : "，上游预览=" + preview(state.brief))
+                        + "，原始响应=" + preview(state.raw.toString()));
             }
             if (!state.bodyFinished && !state.finalSeen && doubaoRequireTerminal()) {
                 throw new IOException("豆包流在正文完成前结束，已收到 " + state.text.length()
@@ -5075,7 +5079,7 @@ public class Main {
             String rawData = state.data.toString();
             state.event = "";
             state.data.setLength(0);
-            if (event.isBlank() || rawData.isBlank()) {
+            if (rawData.isBlank()) {
                 return;
             }
 
@@ -5089,6 +5093,18 @@ public class Main {
             if (data == null) {
                 return;
             }
+            if (event.isBlank()) {
+                event = firstNonBlank(stringValue(data.get("event_type")),
+                        stringValue(data.get("event")), stringValue(data.get("type")));
+            }
+            if (event.isBlank() && data.get("error_code") != null) {
+                event = "STREAM_ERROR";
+            }
+            if (event.isBlank()) {
+                state.eventTypes.add("(无事件名)");
+                return;
+            }
+            state.eventTypes.add(event);
 
             switch (event) {
                 case "SSE_HEARTBEAT" -> {
@@ -5144,14 +5160,24 @@ public class Main {
                     if (data.get("patch_op") instanceof List<?> ops) {
                         for (Object item : ops) {
                             Map<String, Object> op = doubaoMap(item);
-                            if (op == null || doubaoLong(op.get("patch_object")) != 1) {
+                            if (op == null) {
                                 continue;
                             }
+                            long patchObject = doubaoLong(op.get("patch_object"));
                             Map<String, Object> patchValue = doubaoMap(op.get("patch_value"));
                             if (patchValue == null) {
                                 continue;
                             }
-                            emitDoubaoBlocks(patchValue.get("content_block"), state, deltaSink, reasoningSink);
+                            if (patchObject == 1) {
+                                emitDoubaoBlocks(patchValue.get("content_block"), state, deltaSink, reasoningSink);
+                            } else if (patchObject == 3) {
+                                Map<String, Object> attr = doubaoMap(patchValue.get("msg_finish_attr"));
+                                if (attr != null && state.brief.isBlank()) {
+                                    state.brief = stringValue(attr.get("brief"));
+                                }
+                            } else if (patchObject == 102) {
+                                emitDoubaoTextContent(patchValue.get("content"), state, deltaSink);
+                            }
                         }
                     }
                 }
@@ -5181,6 +5207,34 @@ public class Main {
                 default -> {
                 }
             }
+        }
+
+        private static void emitDoubaoTextContent(Object value, DoubaoStreamState state,
+                                                  Consumer<String> deltaSink) {
+            if (value == null) {
+                return;
+            }
+            if (value instanceof Map<?, ?>) {
+                Map<String, Object> content = doubaoMap(value);
+                String text = content == null ? "" : stringValue(content.get("text"));
+                if (!text.isEmpty()) {
+                    emitDoubaoTarget(state, text, false, deltaSink, null);
+                }
+                return;
+            }
+            if (!(value instanceof String text) || text.isBlank()) {
+                return;
+            }
+            try {
+                Map<String, Object> content = doubaoMap(SimpleJson.parse(text));
+                String parsedText = content == null ? "" : stringValue(content.get("text"));
+                if (!parsedText.isEmpty()) {
+                    emitDoubaoTarget(state, parsedText, false, deltaSink, null);
+                }
+                return;
+            } catch (RuntimeException ignored) {
+            }
+            emitDoubaoTarget(state, text, false, deltaSink, null);
         }
 
         private static void emitDoubaoBlocks(Object value, DoubaoStreamState state,
@@ -5311,6 +5365,7 @@ public class Main {
             private final StringBuilder text = new StringBuilder();
             private final StringBuilder reasoning = new StringBuilder();
             private final StringBuilder data = new StringBuilder();
+            private final LinkedHashSet<String> eventTypes = new LinkedHashSet<>();
             private String event = "";
             private String answerMessageId = "";
             private String brief = "";
