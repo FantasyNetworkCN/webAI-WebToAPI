@@ -65,8 +65,8 @@ PROXY_ENABLED=true PROXY_HOST=host.docker.internal PROXY_PORT=7890 \
 来自 Docker 网关的连接；如果代理只能监听宿主机 `127.0.0.1`，请使用宿主机
 转发端口，或继续使用 host 网络。
 
-DeepSeek 请求不受这里的代理设置影响，始终使用独立客户端直连
-`chat.deepseek.com`，避免国内访问多绕一层代理带来的额外延迟。
+DeepSeek 与豆包请求不受这里的代理设置影响，始终使用独立客户端分别直连
+`chat.deepseek.com`、`www.doubao.com`，避免国内访问多绕一层代理带来的额外延迟。
 
 ## 启动
 
@@ -231,7 +231,7 @@ DevTools 复制的 `https://chat.deepseek.com/api/v0/chat/completion` 完整 cur
 `/v1/models`。
 
 DeepSeek 使用独立的直连客户端，不受“代理设置”页影响；代理只用于 Gemini、
-Claude、ChatGPT 的 Java 请求和 Chromium。
+Claude、ChatGPT 的 Java 请求和 Chromium。豆包同样直连，见下文。
 
 - `deepseek-web`：`model_type=default`，关闭思考，等价于网页快速模式。
 - `deepseek-reasoner`：`model_type=expert`，开启 `thinking_enabled`。思维链（THINK
@@ -301,6 +301,40 @@ H("abc") = f841106c601ce9be9bc38525e90d4178d47f21dd8eb9f238fc55ffaa4ca94506
 前端 DeepSeek Curl 页的 `last_error` 会显示最后一次失败原因。需要看上游原始事件
 序列时，加 `-DdumpRaw=/tmp/ds-raw.txt` 把响应落到文件；需要临时恢复旧的宽松行为时
 加 `-Ddeepseek.strictTermination=false`（断流按已收到内容返回）。
+
+### 豆包网页端模型
+
+打开首页的“豆包 Curl”页，粘贴 DevTools 复制的
+`https://www.doubao.com/chat/completion` 完整 curl（含 `cookie`），服务端会提取 URL、
+Header 和 JSON body 并存入 `data/doubao-curls.sqlite`。模型会以 `doubao-web` 出现在
+`/v1/models`，请求时使用 `"model": "doubao-web"`。
+
+豆包同样使用独立直连客户端，不受“代理设置”页影响；代理只用于 Gemini、Claude、
+ChatGPT 的 Java 请求和 Chromium。
+
+- 保存的 curl 只作为登录上下文和请求模板。每轮会重新生成 `local_message_id`、
+  `block_id`、`unique_key`、`create_time_ms` 等字段，提示词也会替换成当前用户输入。
+- 首轮 `conversation_id` 为空并设置 `need_create_conversation=true`；收到 `SSE_ACK`
+  后复用服务端返回的 `conversation_id`、`section_id` 和消息序号，后续轮次不再重复建会话。
+  `/new` 或切换模型会清空这些状态。
+- 当前沿用 curl 里的 `conversation_init_ext` / `model_config` 档位（例如快速模式与
+  `reasoning_effort`），暂不额外暴露 fast/expert 之类的新模型名。
+- 设备 query 是风控指纹，服务端保留 curl 里的整套设备参数，只移除一次性的
+  `a_bogus` 和 `msToken`。`/chat/completion` 的文本链路不校验这两个签名，重放旧值
+  反而可能触发限流，因此不会实现签名重放。
+- 当前只支持文字。`image_url` / `input_image` 会明确报错，不会静默丢图。
+
+正文可能分散在 `STREAM_MSG_NOTIFY`（首包）、`STREAM_CHUNK` 的
+`patch_object=1`（主通道）和可选的 `CHUNK_DELTA`（逐 token 加速）中，服务端按增量
+拼接并保留换行与空白。`SSE_REPLY_END end_type=1` 表示正文已完整，之后的
+`msg_finish_attr.brief` 只是会话预览，不能覆盖正文；`end_type=3` 才是整轮流结束。
+如果上游在正文完成前断流，默认按失败上报；需要临时放宽时加
+`-Ddoubao.strictTermination=false`。`-DdumpRaw=/tmp/doubao-raw.txt` 可以保存原始 SSE。
+
+`STREAM_ERROR 710022004` 表示豆包要求滑块/安全验证，`710022002` 或 HTTP 429 表示
+限流。这几类错误不会自动切换 curl 或重试，避免加重风控；请先在浏览器完成验证、等待
+一段时间，或在同一浏览器/网络重新登录后复制最新 `chat/completion` curl。HTTP
+401/403 通常表示登录态过期，也应按同样方式更新 curl。
 
 ## 常用命令
 

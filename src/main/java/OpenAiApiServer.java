@@ -37,23 +37,32 @@ final class OpenAiApiServer {
     private final ClaudeCookieStore claudeCookieStore;
     private final ChatGptCurlStore chatGptCurlStore;
     private final DeepSeekCurlStore deepSeekCurlStore;
+    private final DoubaoStore doubaoStore;
     private final ProxySettingsBackend proxySettingsBackend;
     private HttpServer server;
     private ExecutorService executor;
 
     OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
                     ClaudeCookieStore claudeCookieStore) {
-        this(host, port, models, defaultModel, backend, claudeCookieStore, null, null, null);
+        this(host, port, models, defaultModel, backend, claudeCookieStore, null, null, null, null);
     }
 
     OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
                     ClaudeCookieStore claudeCookieStore, ProxySettingsBackend proxySettingsBackend) {
-        this(host, port, models, defaultModel, backend, claudeCookieStore, null, null, proxySettingsBackend);
+        this(host, port, models, defaultModel, backend, claudeCookieStore, null, null, null, proxySettingsBackend);
     }
 
     OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
                     ClaudeCookieStore claudeCookieStore, ChatGptCurlStore chatGptCurlStore,
                     DeepSeekCurlStore deepSeekCurlStore, ProxySettingsBackend proxySettingsBackend) {
+        this(host, port, models, defaultModel, backend, claudeCookieStore, chatGptCurlStore,
+                deepSeekCurlStore, null, proxySettingsBackend);
+    }
+
+    OpenAiApiServer(String host, int port, List<String> models, String defaultModel, ChatBackend backend,
+                    ClaudeCookieStore claudeCookieStore, ChatGptCurlStore chatGptCurlStore,
+                    DeepSeekCurlStore deepSeekCurlStore, DoubaoStore doubaoStore,
+                    ProxySettingsBackend proxySettingsBackend) {
         this.host = host;
         this.port = port;
         this.defaultModel = defaultModel == null || defaultModel.isBlank() ? "Gemini-web" : defaultModel;
@@ -62,6 +71,7 @@ final class OpenAiApiServer {
         this.claudeCookieStore = claudeCookieStore;
         this.chatGptCurlStore = chatGptCurlStore;
         this.deepSeekCurlStore = deepSeekCurlStore;
+        this.doubaoStore = doubaoStore;
         this.proxySettingsBackend = proxySettingsBackend;
     }
 
@@ -74,6 +84,7 @@ final class OpenAiApiServer {
         server.createContext("/debug/claude-cookies", this::handleClaudeCookies);
         server.createContext("/debug/chatgpt-curls", this::handleChatGptCurls);
         server.createContext("/debug/deepseek-curls", this::handleDeepSeekCurls);
+        server.createContext("/debug/doubao-curls", this::handleDoubaoCurls);
         server.createContext("/debug/proxy", this::handleProxySettings);
         server.createContext("/", this::handleStatic);
         executor = Executors.newCachedThreadPool();
@@ -296,6 +307,47 @@ final class OpenAiApiServer {
                     return;
                 }
                 deepSeekCurlStore.delete(id);
+                sendJson(exchange, 200, "{\"ok\":true}");
+                return;
+            }
+            sendMethodNotAllowed(exchange, "GET, POST, DELETE, OPTIONS");
+        } catch (Exception e) {
+            sendJson(exchange, 400, errorJson(e.getMessage(), "invalid_request_error"));
+        }
+    }
+
+    private void handleDoubaoCurls(HttpExchange exchange) throws IOException {
+        addCorsHeaders(exchange, "GET, POST, DELETE, OPTIONS");
+        if (handleCorsPreflight(exchange)) return;
+        if (doubaoStore == null) {
+            sendJson(exchange, 500, errorJson("豆包 curl 存储未初始化"));
+            return;
+        }
+        try {
+            if (isMethod(exchange, "GET")) {
+                List<DoubaoStore.CurlRecord> records = doubaoStore.list();
+                StringBuilder out = new StringBuilder("{\"data\":[");
+                for (int i = 0; i < records.size(); i++) {
+                    if (i > 0) out.append(',');
+                    out.append(records.get(i).publicJson());
+                }
+                sendJson(exchange, 200, out.append("]}").toString());
+                return;
+            }
+            if (isMethod(exchange, "POST")) {
+                Object parsed = SimpleJson.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+                String raw = parsed instanceof Map<?, ?> map ? stringValue(map.get("curl"), "") : "";
+                DoubaoStore.CurlRecord record = doubaoStore.addFromCurl(raw);
+                sendJson(exchange, 200, "{\"ok\":true,\"curl\":" + record.publicJson() + "}");
+                return;
+            }
+            if (isMethod(exchange, "DELETE")) {
+                String id = queryValue(exchange.getRequestURI().getRawQuery(), "id");
+                if (id == null || id.isBlank()) {
+                    sendJson(exchange, 400, errorJson("缺少 id", "invalid_request_error"));
+                    return;
+                }
+                doubaoStore.delete(id);
                 sendJson(exchange, 200, "{\"ok\":true}");
                 return;
             }

@@ -50,6 +50,7 @@ public class Main {
     private static final String CHATGPT_MODEL = "chatgpt-web";
     private static final String DEEPSEEK_MODEL = "deepseek-web";
     private static final String DEEPSEEK_REASONER_MODEL = "deepseek-reasoner";
+    private static final String DOUBAO_MODEL = "doubao-web";
     private static final int GEMINI_RPC_MAX_ATTEMPTS = 3;
     private static final Pattern CLAUDE_RESETS_AT_PATTERN = Pattern.compile("\\\"resetsAt\\\"\\s*:\\s*(\\d+)");
     private static final Pattern BARD_ERROR_PATTERN = Pattern.compile("BardErrorInfo\"\\s*,\\s*\\[(\\d+)]");
@@ -59,6 +60,8 @@ public class Main {
     private static final Map<String, ModelProfile> MODEL_PROFILES = modelProfiles();
     /** DeepSeek is reachable directly; keep it off the shared proxy used by Gemini/Claude/ChatGPT. */
     private static final OkHttpClient DEEPSEEK_DIRECT_CLIENT = buildDirectHttpClient();
+    /** Doubao is also a mainland-China web endpoint; keep it off the shared outbound proxy. */
+    private static final OkHttpClient DOUBAO_DIRECT_CLIENT = buildDirectHttpClient();
 
     public static void main(String[] args) {
         try {
@@ -72,6 +75,7 @@ public class Main {
             config.claudeCookieStore = claudeCookieStore;
             config.chatGptCurlStore = new ChatGptCurlStore(Path.of("data", "chatgpt-curls.sqlite"));
             config.deepSeekCurlStore = new DeepSeekCurlStore(Path.of("data", "deepseek-curls.sqlite"));
+            config.doubaoStore = new DoubaoStore(Path.of("data", "doubao-curls.sqlite"));
 
             if (args.length > 1 && "--parse-file".equals(args[0])) {
                 GeminiResult result = parseGeminiResultOrThrow(Files.readString(Path.of(args[1])));
@@ -130,6 +134,7 @@ public class Main {
                 claudeCookieStore,
                 config.chatGptCurlStore,
                 config.deepSeekCurlStore,
+                config.doubaoStore,
                 proxySettings);
         server.start();
         return server;
@@ -210,6 +215,10 @@ public class Main {
         }
         if (profile.provider() == ModelProvider.DEEPSEEK) {
             return sendDeepSeekInternal(config, profile, prompt, images, deltaSink, reasoningSink,
+                    conversation.chatGptConversation());
+        }
+        if (profile.provider() == ModelProvider.DOUBAO) {
+            return sendDoubaoInternal(config, prompt, images, deltaSink, reasoningSink,
                     conversation.chatGptConversation());
         }
 
@@ -339,6 +348,17 @@ public class Main {
         }
         return new DeepSeekCurlClient(config.deepSeekCurlStore, DEEPSEEK_DIRECT_CLIENT)
                 .complete(profile, prompt, images, deltaSink, reasoningSink, conversation);
+    }
+
+    private static GeminiResult sendDoubaoInternal(AppConfig config, String prompt,
+                                                   java.util.List<OpenAiApiServer.ImageInput> images,
+                                                   Consumer<String> deltaSink, Consumer<String> reasoningSink,
+                                                   ChatGptConversation conversation) throws IOException {
+        if (config.doubaoStore == null) {
+            throw new IOException("豆包 curl 存储未初始化");
+        }
+        return new DoubaoClient(config.doubaoStore, DOUBAO_DIRECT_CLIENT)
+                .complete(prompt, images, deltaSink, reasoningSink, conversation);
     }
 
     private static Instant claudeRateLimitResetAt(String body) {
@@ -634,6 +654,7 @@ public class Main {
         profiles.put(CHATGPT_MODEL, new ModelProfile(CHATGPT_MODEL, ModelProvider.CHATGPT, null, null, null, null));
         profiles.put(DEEPSEEK_MODEL, new ModelProfile(DEEPSEEK_MODEL, ModelProvider.DEEPSEEK, null, null, null, null));
         profiles.put(DEEPSEEK_REASONER_MODEL, new ModelProfile(DEEPSEEK_REASONER_MODEL, ModelProvider.DEEPSEEK, null, null, null, null));
+        profiles.put(DOUBAO_MODEL, new ModelProfile(DOUBAO_MODEL, ModelProvider.DOUBAO, null, null, null, null));
         return java.util.Collections.unmodifiableMap(profiles);
     }
 
@@ -1632,6 +1653,7 @@ public class Main {
         private String chatGptModel = "auto";
         private ChatGptCurlStore chatGptCurlStore;
         private DeepSeekCurlStore deepSeekCurlStore;
+        private DoubaoStore doubaoStore;
 
         private static AppConfig load(Path path) throws IOException {
             if (!Files.exists(path)) {
@@ -2995,10 +3017,16 @@ public class Main {
     private static final class ChatGptConversation {
         private String conversationId = "";
         private String parentMessageId = "";
+        private String localConversationId = "";
+        private String lastSectionId = "";
+        private Integer lastMessageIndex;
 
         private void clear() {
             conversationId = "";
             parentMessageId = "";
+            localConversationId = "";
+            lastSectionId = "";
+            lastMessageIndex = null;
         }
     }
 
@@ -4745,6 +4773,600 @@ public class Main {
         }
     }
 
+    /**
+     * Doubao web chat client.
+     *
+     * <p>The captured device query is a risk-control fingerprint, not something that can be
+     * reduced to a few obvious keys. Keep the whole query, drop the one-shot {@code a_bogus}
+     * and {@code msToken} values, and build a fresh message envelope for every turn. The
+     * {@code /chat/completion} endpoint does not validate those two query signatures on the
+     * text path (verified by the public reverse-engineering notes), while replaying old values
+     * adds noise and can trip rate limiting.</p>
+     */
+    private static final class DoubaoClient {
+        private static final String COMPLETION_PATH = "/chat/completion";
+        private static final String DEFAULT_BOT_ID = "7338286299411103781";
+
+        private final DoubaoStore store;
+        private final OkHttpClient client;
+
+        private DoubaoClient(DoubaoStore store, OkHttpClient client) {
+            this.store = store;
+            this.client = client;
+        }
+
+        private GeminiResult complete(String prompt, List<OpenAiApiServer.ImageInput> images,
+                                      Consumer<String> deltaSink, Consumer<String> reasoningSink,
+                                      ChatGptConversation conversation) throws IOException {
+            if (images != null && !images.isEmpty()) {
+                throw new IOException("豆包网页模型暂不支持图片输入，请改用文字消息。");
+            }
+            List<DoubaoStore.CurlRecord> records = store.active();
+            if (records.isEmpty()) {
+                throw new IOException("没有可用豆包 curl。请在前端粘贴 www.doubao.com/chat/completion 请求。");
+            }
+
+            IOException last = null;
+            for (DoubaoStore.CurlRecord record : records) {
+                String conversationBefore = conversation.conversationId;
+                String sectionBefore = conversation.lastSectionId;
+                String localConversationBefore = conversation.localConversationId;
+                Integer messageIndexBefore = conversation.lastMessageIndex;
+                boolean[] emitted = {false};
+                Consumer<String> content = delta -> {
+                    if (delta == null || delta.isEmpty()) {
+                        return;
+                    }
+                    emitted[0] = true;
+                    if (deltaSink != null) {
+                        deltaSink.accept(delta);
+                    }
+                };
+                Consumer<String> thought = delta -> {
+                    if (delta == null || delta.isEmpty()) {
+                        return;
+                    }
+                    emitted[0] = true;
+                    if (reasoningSink != null) {
+                        reasoningSink.accept(delta);
+                    }
+                };
+                try {
+                    GeminiResult result = request(record, prompt, content, thought, conversation);
+                    store.markSuccess(record.id());
+                    return result;
+                } catch (IOException e) {
+                    last = e;
+                    store.markFailure(record.id(), e.getMessage());
+                    conversation.conversationId = conversationBefore;
+                    conversation.lastSectionId = sectionBefore;
+                    conversation.localConversationId = localConversationBefore;
+                    conversation.lastMessageIndex = messageIndexBefore;
+                    if (e instanceof DoubaoNoRetryException) {
+                        throw e;
+                    }
+                    if (emitted[0]) {
+                        throw e;
+                    }
+                    System.err.println("豆包 curl 调用失败，切换下一个：" + record.label() + "：" + e.getMessage());
+                }
+            }
+            throw last == null ? new IOException("豆包 curl 请求失败") : last;
+        }
+
+        private GeminiResult request(DoubaoStore.CurlRecord record, String prompt,
+                                     Consumer<String> deltaSink, Consumer<String> reasoningSink,
+                                     ChatGptConversation conversation) throws IOException {
+            ParsedDoubaoRequest parsed = ParsedDoubaoRequest.parse(record.curl());
+            HttpUrl url = parsed.url().newBuilder()
+                    .removeAllQueryParameters("a_bogus")
+                    .removeAllQueryParameters("msToken")
+                    .build();
+            String body = requestBody(parsed.body(), prompt, conversation);
+
+            Request.Builder builder = new Request.Builder()
+                    .url(url)
+                    .post(RequestBody.create(body, JSON_MEDIA_TYPE));
+            applyHeaders(builder, parsed.headers());
+            builder.header("content-type", "application/json");
+            builder.header("accept", "*/*");
+            builder.header("accept-encoding", "identity");
+
+            try (Response response = client.newCall(builder.build()).execute()) {
+                if (response.body() == null) {
+                    throw new IOException("豆包返回了空响应");
+                }
+                if (!response.isSuccessful()) {
+                    String error = response.body().string();
+                    if (response.code() == 401 || response.code() == 403) {
+                        throw new IOException("豆包登录凭据已过期或触发风控（HTTP " + response.code()
+                                + "）。请重新登录 www.doubao.com 并复制最新 chat/completion curl。响应="
+                                + preview(error));
+                    }
+                    if (response.code() == 429) {
+                        throw new DoubaoNoRetryException("豆包请求过于频繁（HTTP 429）。请稍后重试。响应="
+                                + preview(error));
+                    }
+                    throw new IOException("豆包 completion 请求失败，HTTP 状态=" + response.code()
+                            + "，响应=" + preview(error));
+                }
+                return streamText(response, deltaSink, reasoningSink, conversation);
+            }
+        }
+
+        private static String requestBody(String templateBody, String prompt,
+                                          ChatGptConversation conversation) throws IOException {
+            Map<String, Object> template;
+            try {
+                template = doubaoMap(SimpleJson.parse(templateBody));
+            } catch (RuntimeException e) {
+                throw new IOException("豆包 curl 的 JSON 请求体无法解析：" + e.getMessage(), e);
+            }
+            if (template == null) {
+                throw new IOException("豆包 curl 的 JSON 请求体无法解析");
+            }
+
+            long now = System.currentTimeMillis();
+            String conversationId = conversation.conversationId == null ? "" : conversation.conversationId;
+            if (conversation.localConversationId == null || conversation.localConversationId.isBlank()) {
+                conversation.localConversationId = newDoubaoLocalConversationId();
+            }
+
+            Map<String, Object> root = new LinkedHashMap<>(template);
+            Map<String, Object> clientMeta = new LinkedHashMap<>();
+            Map<String, Object> templateMeta = doubaoMap(template.get("client_meta"));
+            if (templateMeta != null) {
+                clientMeta.putAll(templateMeta);
+            }
+            clientMeta.put("local_conversation_id", conversation.localConversationId);
+            clientMeta.put("conversation_id", conversationId);
+            clientMeta.put("bot_id", firstNonBlank(stringValue(clientMeta.get("bot_id")), DEFAULT_BOT_ID));
+            clientMeta.put("last_section_id", conversation.lastSectionId == null ? "" : conversation.lastSectionId);
+            clientMeta.put("last_message_index", conversation.lastMessageIndex);
+            if (!(clientMeta.get("local_permissions") instanceof List<?>)) {
+                clientMeta.put("local_permissions", List.of(
+                        Map.of("permission_name", "ACCESS_COARSE_LOCATION", "status", 1),
+                        Map.of("permission_name", "ACCESS_FINE_LOCATION", "status", 1),
+                        Map.of("permission_name", "ACCESS_BACKGROUND_LOCATION", "status", 1)));
+            }
+            root.put("client_meta", clientMeta);
+
+            Map<String, Object> message = new LinkedHashMap<>();
+            message.put("local_message_id", UUID.randomUUID().toString());
+            message.put("content_block", List.of(textBlock(prompt)));
+            message.put("message_status", 0);
+            root.put("messages", List.of(message));
+
+            Map<String, Object> option = new LinkedHashMap<>();
+            Map<String, Object> templateOption = doubaoMap(template.get("option"));
+            if (templateOption != null) {
+                option.putAll(templateOption);
+            }
+            option.put("create_time_ms", now);
+            option.put("unique_key", UUID.randomUUID().toString());
+            option.put("start_seq", 0);
+            option.put("need_create_conversation", conversationId.isBlank());
+            option.put("is_regen", false);
+            option.put("is_replace", false);
+            option.put("resend_for_regen", false);
+            if (!(option.get("conversation_init_option") instanceof Map<?, ?>)) {
+                option.put("conversation_init_option", Map.of("need_ack_conversation", true));
+            }
+            option.put("recovery_option", Map.of(
+                    "is_recovery", false,
+                    "req_create_time_sec", now / 1000,
+                    "append_sse_event_scene", 0));
+            root.put("option", option);
+
+            if (!(root.get("user_context") instanceof List<?>)) {
+                root.put("user_context", List.of());
+            }
+            if (!(root.get("ext") instanceof Map<?, ?>)) {
+                root.put("ext", Map.of(
+                        "agent_mode", "2",
+                        "use_deep_think", "0",
+                        "sub_conv_firstmet_type", "1",
+                        "general_task_param", "{\"server_do_compare\":true}",
+                        "collection_id", "",
+                        "is_finish", "1",
+                        "conversation_init_option", "{\"need_ack_conversation\":true}",
+                        "commerce_credit_config_enable", "0"));
+            }
+            return toJson(root);
+        }
+
+        private static Map<String, Object> textBlock(String prompt) {
+            Map<String, Object> textBlock = new LinkedHashMap<>();
+            textBlock.put("text", prompt == null ? "" : prompt);
+            textBlock.put("icon_url", "");
+            textBlock.put("icon_url_dark", "");
+            textBlock.put("summary", "");
+
+            Map<String, Object> content = new LinkedHashMap<>();
+            content.put("text_block", textBlock);
+            content.put("pc_event_block", "");
+
+            Map<String, Object> block = new LinkedHashMap<>();
+            block.put("block_type", 10000);
+            block.put("content", content);
+            block.put("block_id", UUID.randomUUID().toString());
+            block.put("parent_id", "");
+            block.put("meta_info", List.of());
+            block.put("extra_info", Map.of());
+            block.put("append_fields", List.of());
+            return block;
+        }
+
+        private static String newDoubaoLocalConversationId() {
+            long id = System.currentTimeMillis() * 1000L + ThreadLocalRandom.current().nextInt(1000);
+            return "local_" + id;
+        }
+
+        private static void applyHeaders(Request.Builder builder, Map<String, String> headers) {
+            headers.forEach((name, value) -> {
+                String lower = name.toLowerCase(Locale.ROOT);
+                if ("host".equals(lower) || "content-length".equals(lower) || "content-type".equals(lower)
+                        || "accept".equals(lower) || "accept-encoding".equals(lower)
+                        || "connection".equals(lower)) {
+                    return;
+                }
+                builder.header(name, value);
+            });
+            if (headers.keySet().stream().noneMatch(name -> "origin".equalsIgnoreCase(name))) {
+                builder.header("origin", "https://www.doubao.com");
+            }
+            if (headers.keySet().stream().noneMatch(name -> "referer".equalsIgnoreCase(name))) {
+                builder.header("referer", "https://www.doubao.com/");
+            }
+        }
+
+        private static GeminiResult streamText(Response response, Consumer<String> deltaSink,
+                                               Consumer<String> reasoningSink,
+                                               ChatGptConversation conversation) throws IOException {
+            DoubaoStreamState state = new DoubaoStreamState();
+
+            while (true) {
+                String line = response.body().source().readUtf8Line();
+                if (line == null) {
+                    break;
+                }
+                state.raw.append(line).append('\n');
+                if (line.isEmpty()) {
+                    processDoubaoEvent(state, deltaSink, reasoningSink, conversation);
+                    if (state.finalSeen) {
+                        break;
+                    }
+                    continue;
+                }
+                if (line.startsWith(":")) {
+                    continue;
+                }
+                if (line.startsWith("event:")) {
+                    state.event = line.substring("event:".length()).trim();
+                } else if (line.startsWith("data:")) {
+                    String chunk = line.substring("data:".length()).trim();
+                    if (state.data.length() > 0) {
+                        state.data.append('\n');
+                    }
+                    state.data.append(chunk);
+                }
+            }
+            if (!state.finalSeen && !state.data.isEmpty()) {
+                processDoubaoEvent(state, deltaSink, reasoningSink, conversation);
+            }
+
+            dumpRawResponseIfRequested(state.raw.toString());
+            if (state.text.isEmpty()) {
+                throw new IOException("豆包没有返回正文"
+                        + (state.brief.isBlank() ? "" : "，上游预览=" + preview(state.brief)));
+            }
+            if (!state.bodyFinished && !state.finalSeen && doubaoRequireTerminal()) {
+                throw new IOException("豆包流在正文完成前结束，已收到 " + state.text.length()
+                        + " 字符。可临时加 -Ddoubao.strictTermination=false 放宽判定。");
+            }
+            return new GeminiResult(state.text.toString(), conversation.conversationId,
+                    state.answerMessageId, "");
+        }
+
+        private static void processDoubaoEvent(DoubaoStreamState state, Consumer<String> deltaSink,
+                                               Consumer<String> reasoningSink,
+                                               ChatGptConversation conversation) throws IOException {
+            String event = state.event;
+            String rawData = state.data.toString();
+            state.event = "";
+            state.data.setLength(0);
+            if (event.isBlank() || rawData.isBlank()) {
+                return;
+            }
+
+            Object parsed;
+            try {
+                parsed = SimpleJson.parse(rawData);
+            } catch (RuntimeException e) {
+                throw new IOException("豆包 SSE 数据不是 JSON：" + preview(rawData), e);
+            }
+            Map<String, Object> data = doubaoMap(parsed);
+            if (data == null) {
+                return;
+            }
+
+            switch (event) {
+                case "SSE_HEARTBEAT" -> {
+                }
+                case "SSE_ACK" -> {
+                    Map<String, Object> ack = doubaoMap(data.get("ack_client_meta"));
+                    if (ack != null) {
+                        String conversationId = stringValue(ack.get("conversation_id"));
+                        if (!conversationId.isBlank() && !"0".equals(conversationId)) {
+                            conversation.conversationId = conversationId;
+                        }
+                        String sectionId = stringValue(ack.get("section_id"));
+                        if (!sectionId.isBlank() && !"0".equals(sectionId)) {
+                            conversation.lastSectionId = sectionId;
+                        }
+                        String localConversationId = stringValue(ack.get("local_conversation_id"));
+                        if (!localConversationId.isBlank()) {
+                            conversation.localConversationId = localConversationId;
+                        }
+                        if (data.get("query_list") instanceof List<?> queries && !queries.isEmpty()) {
+                            Map<String, Object> query = doubaoMap(queries.get(0));
+                            Integer messageIndex = query == null ? null : doubaoInteger(query.get("message_index"));
+                            if (messageIndex != null) {
+                                conversation.lastMessageIndex = messageIndex;
+                            }
+                        }
+                    }
+                }
+                case "FULL_MSG_NOTIFY" -> {
+                    Map<String, Object> message = doubaoMap(data.get("message"));
+                    Map<String, Object> meta = message == null ? null : doubaoMap(message.get("meta"));
+                    if (meta != null && !stringValue(meta.get("message_id")).isBlank()) {
+                        state.answerMessageId = stringValue(meta.get("message_id"));
+                    }
+                }
+                case "STREAM_MSG_NOTIFY" -> {
+                    Map<String, Object> content = doubaoMap(data.get("content"));
+                    if (content != null) {
+                        emitDoubaoBlocks(content.get("content_block"), state, deltaSink, reasoningSink);
+                    }
+                    Map<String, Object> meta = doubaoMap(data.get("meta"));
+                    if (meta != null && !stringValue(meta.get("message_id")).isBlank()) {
+                        state.answerMessageId = stringValue(meta.get("message_id"));
+                    }
+                    Integer messageIndex = meta == null ? null : doubaoInteger(meta.get("index_in_conv"));
+                    if (messageIndex != null) {
+                        conversation.lastMessageIndex = messageIndex;
+                    }
+                }
+                case "CHUNK_DELTA" -> emitDoubaoTarget(state, stringValue(data.get("text")),
+                        false, deltaSink, reasoningSink);
+                case "STREAM_CHUNK" -> {
+                    if (data.get("patch_op") instanceof List<?> ops) {
+                        for (Object item : ops) {
+                            Map<String, Object> op = doubaoMap(item);
+                            if (op == null || doubaoLong(op.get("patch_object")) != 1) {
+                                continue;
+                            }
+                            Map<String, Object> patchValue = doubaoMap(op.get("patch_value"));
+                            if (patchValue == null) {
+                                continue;
+                            }
+                            emitDoubaoBlocks(patchValue.get("content_block"), state, deltaSink, reasoningSink);
+                        }
+                    }
+                }
+                case "SSE_REPLY_END" -> {
+                    long endType = doubaoLong(data.get("end_type"));
+                    if (endType == 1) {
+                        state.bodyFinished = true;
+                        Map<String, Object> attr = doubaoMap(data.get("msg_finish_attr"));
+                        if (attr != null) {
+                            state.brief = stringValue(attr.get("brief"));
+                            if (state.answerMessageId.isBlank()) {
+                                state.answerMessageId = stringValue(attr.get("msgid"));
+                            }
+                        }
+                    } else if (endType == 3) {
+                        state.finalSeen = true;
+                    }
+                }
+                case "STREAM_ERROR" -> throw doubaoStreamError(data);
+                case "gateway-error" -> {
+                    String message = stringValue(data.get("message"));
+                    if (message.isBlank()) {
+                        message = rawData;
+                    }
+                    throw new IOException("豆包 gateway-error：" + preview(message));
+                }
+                default -> {
+                }
+            }
+        }
+
+        private static void emitDoubaoBlocks(Object value, DoubaoStreamState state,
+                                             Consumer<String> deltaSink,
+                                             Consumer<String> reasoningSink) {
+            if (!(value instanceof List<?> blocks)) {
+                return;
+            }
+            for (Object item : blocks) {
+                Map<String, Object> block = doubaoMap(item);
+                if (block == null) {
+                    continue;
+                }
+                long blockType = doubaoLong(block.get("block_type"));
+                Map<String, Object> content = doubaoMap(block.get("content"));
+                if (content == null) {
+                    continue;
+                }
+                Map<String, Object> thinkingBlock = doubaoMap(content.get("thinking_block"));
+                String thinking = thinkingBlock == null ? "" : stringValue(thinkingBlock.get("text"));
+                if (!thinking.isEmpty()) {
+                    emitDoubaoTarget(state, thinking, true, deltaSink, reasoningSink);
+                    continue;
+                }
+                Map<String, Object> textBlock = doubaoMap(content.get("text_block"));
+                String text = textBlock == null ? "" : stringValue(textBlock.get("text"));
+                if (!text.isEmpty() && (blockType == 10000 || blockType == 0)) {
+                    emitDoubaoTarget(state, text, false, deltaSink, reasoningSink);
+                }
+            }
+        }
+
+        private static void emitDoubaoTarget(DoubaoStreamState state, String delta, boolean reasoning,
+                                             Consumer<String> deltaSink, Consumer<String> reasoningSink) {
+            if (delta == null || delta.isEmpty()) {
+                return;
+            }
+            if (reasoning) {
+                state.reasoning.append(delta);
+                if (reasoningSink != null) {
+                    reasoningSink.accept(delta);
+                }
+                return;
+            }
+            state.text.append(delta);
+            if (deltaSink != null) {
+                deltaSink.accept(delta);
+            }
+        }
+
+        private static IOException doubaoStreamError(Map<String, Object> data) {
+            long code = doubaoLong(data.get("error_code"));
+            String message = firstNonBlank(stringValue(data.get("error_msg")), "豆包流返回错误");
+            Map<String, Object> extra = doubaoMap(data.get("extra"));
+            String decision = extra == null ? "" : stringValue(extra.get("decision"));
+            String detail = message;
+            if (!decision.isBlank()) {
+                Map<String, Object> decisionMap = null;
+                try {
+                    decisionMap = doubaoMap(SimpleJson.parse(decision));
+                } catch (RuntimeException ignored) {
+                }
+                if (decisionMap != null) {
+                    detail += "（风控验证 type=" + stringValue(decisionMap.get("type"))
+                            + " subtype=" + stringValue(decisionMap.get("subtype")) + "）";
+                }
+            }
+            if (code == 710022004L) {
+                return new DoubaoNoRetryException("豆包返回风控验证 [" + code + "] " + detail
+                        + "；请先在浏览器完成豆包滑块/安全验证，或更换账号后手动重试");
+            } else if (code == 710022002L) {
+                return new DoubaoNoRetryException("豆包返回限流 [" + code + "] " + detail
+                        + "；请稍后手动重试");
+            }
+            return new IOException("豆包返回错误 [" + code + "] " + detail);
+        }
+
+        private static boolean doubaoRequireTerminal() {
+            String value = System.getProperty("doubao.strictTermination");
+            return value == null || value.isBlank() || Boolean.parseBoolean(value);
+        }
+
+        private static Map<String, Object> doubaoMap(Object value) {
+            if (!(value instanceof Map<?, ?> map)) {
+                return null;
+            }
+            Map<String, Object> out = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                out.put(String.valueOf(entry.getKey()), entry.getValue());
+            }
+            return out;
+        }
+
+        private static long doubaoLong(Object value) {
+            if (value instanceof Number number) {
+                return number.longValue();
+            }
+            if (value instanceof String text && text.matches("-?\\d+")) {
+                try {
+                    return Long.parseLong(text);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            return 0L;
+        }
+
+        private static Integer doubaoInteger(Object value) {
+            if (value instanceof Number number) {
+                return number.intValue();
+            }
+            if (value instanceof String text && text.matches("-?\\d+")) {
+                try {
+                    return Integer.parseInt(text);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            return null;
+        }
+
+        private static final class DoubaoNoRetryException extends IOException {
+            private DoubaoNoRetryException(String message) {
+                super(message);
+            }
+        }
+
+        private static final class DoubaoStreamState {
+            private final StringBuilder raw = new StringBuilder();
+            private final StringBuilder text = new StringBuilder();
+            private final StringBuilder reasoning = new StringBuilder();
+            private final StringBuilder data = new StringBuilder();
+            private String event = "";
+            private String answerMessageId = "";
+            private String brief = "";
+            private boolean bodyFinished;
+            private boolean finalSeen;
+        }
+
+        private record ParsedDoubaoRequest(HttpUrl url, Map<String, String> headers, String body) {
+            private static ParsedDoubaoRequest parse(String raw) throws IOException {
+                List<String> tokens = CurlRequest.shellTokens(raw);
+                HttpUrl url = null;
+                String body = "";
+                Map<String, String> headers = new LinkedHashMap<>();
+                for (int i = 0; i < tokens.size(); i++) {
+                    String token = tokens.get(i);
+                    if (("--url".equals(token) || "-X".equals(token)) && i + 1 < tokens.size()) {
+                        String next = tokens.get(++i);
+                        if (next.startsWith("http")) {
+                            url = HttpUrl.get(next);
+                        }
+                        continue;
+                    }
+                    if (url == null && token.startsWith("http")) {
+                        url = HttpUrl.get(token);
+                        continue;
+                    }
+                    if (("-H".equals(token) || "--header".equals(token)) && i + 1 < tokens.size()) {
+                        String header = tokens.get(++i);
+                        int colon = header.indexOf(':');
+                        if (colon > 0) {
+                            headers.put(header.substring(0, colon).trim(), header.substring(colon + 1).trim());
+                        }
+                        continue;
+                    }
+                    if (("--data-raw".equals(token) || "--data".equals(token) || "--data-binary".equals(token))
+                            && i + 1 < tokens.size()) {
+                        body = tokens.get(++i);
+                    } else if (token.startsWith("--data-raw=") || token.startsWith("--data=")) {
+                        body = token.substring(token.indexOf('=') + 1);
+                    }
+                    if (("-b".equals(token) || "--cookie".equals(token)) && i + 1 < tokens.size()) {
+                        headers.put("Cookie", tokens.get(++i));
+                    }
+                }
+                if (url == null || !"www.doubao.com".equals(url.host())
+                        || !COMPLETION_PATH.equals(url.encodedPath())) {
+                    throw new IOException("豆包 curl 缺少 https://www.doubao.com/chat/completion URL");
+                }
+                if (body.isBlank()) {
+                    throw new IOException("豆包 curl 缺少 JSON 请求体");
+                }
+                return new ParsedDoubaoRequest(url, headers, body);
+            }
+        }
+    }
+
     /** Legacy generated-token client retained for compatibility with older configs. */
     private static final class ChatGptClient {
         private static final String BASE_URL = "https://chatgpt.com";
@@ -5364,7 +5986,8 @@ public class Main {
         GEMINI,
         CLAUDE,
         CHATGPT,
-        DEEPSEEK
+        DEEPSEEK,
+        DOUBAO
     }
 
     private record ModelProfile(String name, ModelProvider provider, String headerToken, Integer headerMode,

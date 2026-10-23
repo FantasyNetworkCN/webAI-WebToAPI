@@ -522,6 +522,7 @@
         <button class="tab" :class="{ active: view === 'cookies' }" @click="openCookies">Claude Cookie</button>
         <button class="tab" :class="{ active: view === 'chatgpt' }" @click="openChatGpt">ChatGPT Curl</button>
         <button class="tab" :class="{ active: view === 'deepseek' }" @click="openDeepSeek">DeepSeek Curl</button>
+        <button class="tab" :class="{ active: view === 'doubao' }" @click="openDoubao">豆包 Curl</button>
         <button class="tab" :class="{ active: view === 'proxy' }" @click="openProxy">代理设置</button>
       </div>
     </header>
@@ -642,6 +643,31 @@
       </div>
     </section>
 
+    <section v-else-if="view === 'doubao'" class="cookies">
+      <div class="cookie-form">
+        <textarea v-model="doubaoStoreInput" placeholder="粘贴 www.doubao.com/chat/completion 的完整 curl（含 cookie）。服务端会保留整套设备 query 并重建每轮消息；a_bogus/msToken 不会重放"></textarea>
+        <div class="cookie-toolbar">
+          <button class="btn primary" @click="saveDoubaoCurl" :disabled="savingDoubaoCurl || !doubaoStoreInput.trim()">
+            {{ savingDoubaoCurl ? '保存中' : '保存 Curl' }}
+          </button>
+          <button class="btn" @click="loadDoubaoCurls" :disabled="loadingDoubaoCurls">刷新</button>
+        </div>
+      </div>
+      <div v-if="doubaoStoreCurls.length === 0" class="empty">还没有豆包 curl。请在 DevTools 的 Network 面板复制一条 www.doubao.com/chat/completion 请求（Copy as cURL）。</div>
+      <div v-else class="cookie-list">
+        <article v-for="curl in doubaoStoreCurls" :key="curl.id" class="cookie-item">
+          <div class="cookie-head">
+            <span class="pill">{{ curl.label }}</span>
+            <span class="pill">{{ curl.active ? 'active' : 'disabled' }}</span>
+            <span class="pill">fail {{ curl.failure_count }}</span>
+            <span class="pill">len {{ curl.curl_length }}</span>
+            <button class="btn danger" @click="deleteDoubaoCurl(curl.id)" :disabled="loadingDoubaoCurls">删除</button>
+          </div>
+          <div class="error" v-if="curl.last_error">{{ curl.last_error }}</div>
+        </article>
+      </div>
+    </section>
+
     <section v-else class="proxy-settings">
       <div class="proxy-form">
         <label class="toggle">
@@ -708,6 +734,8 @@ createApp({
       savingChatGptCurl: false,
       loadingDeepSeekCurls: false,
       savingDeepSeekCurl: false,
+      loadingDoubaoCurls: false,
+      savingDoubaoCurl: false,
       loadingProxy: false,
       savingProxy: false,
       sending: false,
@@ -721,6 +749,7 @@ createApp({
       claudeCurlInput: '',
       chatgptCurlInput: '',
       deepseekCurlInput: '',
+      doubaoStoreInput: '',
       proxy: {
         enabled: true,
         type: 'http',
@@ -732,6 +761,7 @@ createApp({
       claudeCookies: [],
       chatgptCurls: [],
       deepseekCurls: [],
+      doubaoStoreCurls: [],
       error: ''
     };
   },
@@ -748,6 +778,9 @@ createApp({
       }
       if (this.view === 'deepseek') {
         return 'DeepSeek Curl';
+      }
+      if (this.view === 'doubao') {
+        return '豆包 Curl';
       }
       if (this.view === 'proxy') {
         return '代理设置';
@@ -766,6 +799,9 @@ createApp({
       }
       if (this.view === 'deepseek') {
         return `${this.deepseekCurls.length} 个已保存 Curl`;
+      }
+      if (this.view === 'doubao') {
+        return `${this.doubaoStoreCurls.length} 个已保存 Curl`;
       }
       if (this.view === 'proxy') {
         return `${this.proxy.enabled ? '已启用' : '已停用'} · ${this.proxy.type}://${this.proxy.host}:${this.proxy.port}`;
@@ -959,6 +995,10 @@ createApp({
     async openDeepSeek() {
       this.view = 'deepseek';
       await this.loadDeepSeekCurls();
+    },
+    async openDoubao() {
+      this.view = 'doubao';
+      await this.loadDoubaoCurls();
     },
     async openProxy() {
       this.view = 'proxy';
@@ -1165,6 +1205,54 @@ createApp({
         this.error = err.message || String(err);
       } finally {
         this.loadingDeepSeekCurls = false;
+      }
+    },
+    async loadDoubaoCurls() {
+      this.loadingDoubaoCurls = true;
+      this.error = '';
+      try {
+        const response = await fetch('/debug/doubao-curls');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data?.error?.message || `豆包 Curl 接口失败：${response.status}`);
+        this.doubaoStoreCurls = data.data || [];
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.loadingDoubaoCurls = false;
+      }
+    },
+    async saveDoubaoCurl() {
+      if (!this.doubaoStoreInput.trim() || this.savingDoubaoCurl) return;
+      this.savingDoubaoCurl = true;
+      this.error = '';
+      try {
+        const response = await fetch('/debug/doubao-curls', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ curl: this.doubaoStoreInput })
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(data?.error?.message || `保存失败：${response.status}`);
+        this.doubaoStoreInput = '';
+        await this.loadDoubaoCurls();
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.savingDoubaoCurl = false;
+      }
+    },
+    async deleteDoubaoCurl(id) {
+      this.loadingDoubaoCurls = true;
+      this.error = '';
+      try {
+        const response = await fetch(`/debug/doubao-curls?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(data?.error?.message || `删除失败：${response.status}`);
+        await this.loadDoubaoCurls();
+      } catch (err) {
+        this.error = err.message || String(err);
+      } finally {
+        this.loadingDoubaoCurls = false;
       }
     },
     async loadLogs() {
