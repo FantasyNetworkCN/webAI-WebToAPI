@@ -29,7 +29,10 @@ if [ "$proxy_enabled" = "true" ]; then
       proxy_url="http://${proxy_host}:${proxy_port}"
       ;;
   esac
-  set -- "--proxy-server=${proxy_url}" "$@"
+  # Doubao is a mainland endpoint and is intentionally direct. Keep the browser's
+  # Doubao tab on that same policy while Gemini/Claude/ChatGPT continue using the proxy.
+  set -- "--proxy-server=${proxy_url}" \
+    "--proxy-bypass-list=*.doubao.com;doubao.com" "$@"
   echo "Chromium proxy: ${proxy_url}" >&2
 fi
 

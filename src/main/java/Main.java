@@ -8,7 +8,10 @@ import okhttp3.Response;
 import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.net.URI;
@@ -63,6 +66,13 @@ public class Main {
     private static final OkHttpClient DEEPSEEK_DIRECT_CLIENT = buildDirectHttpClient();
     /** Doubao is also a mainland-China web endpoint; keep it off the shared outbound proxy. */
     private static final OkHttpClient DOUBAO_DIRECT_CLIENT = buildDirectHttpClient();
+    /** Local CDP only; Chromium itself owns the Doubao proxy/network policy. */
+    private static final OkHttpClient DOUBAO_CDP_CLIENT = new OkHttpClient.Builder()
+            .connectTimeout(Duration.ofSeconds(3))
+            .readTimeout(Duration.ZERO)
+            .writeTimeout(Duration.ofSeconds(10))
+            .proxy(Proxy.NO_PROXY)
+            .build();
 
     public static void main(String[] args) {
         try {
@@ -358,7 +368,12 @@ public class Main {
         if (config.doubaoStore == null) {
             throw new IOException("豆包 curl 存储未初始化");
         }
-        return new DoubaoClient(config.doubaoStore, DOUBAO_DIRECT_CLIENT)
+        DoubaoBrowser browser = config.doubaoBrowserEnabled
+                ? new DoubaoBrowser(DOUBAO_CDP_CLIENT, config.geminiCookieHost, config.geminiCookiePort,
+                config.doubaoBrowserPageUrl, config.doubaoBrowserTimeoutMs)
+                : null;
+        return new DoubaoClient(config.doubaoStore, DOUBAO_DIRECT_CLIENT, browser,
+                config.doubaoBrowserFallbackDirect)
                 .complete(prompt, images, deltaSink, reasoningSink, conversation);
     }
 
@@ -1655,6 +1670,10 @@ public class Main {
         private ChatGptCurlStore chatGptCurlStore;
         private DeepSeekCurlStore deepSeekCurlStore;
         private DoubaoStore doubaoStore;
+        private boolean doubaoBrowserEnabled = true;
+        private boolean doubaoBrowserFallbackDirect = true;
+        private String doubaoBrowserPageUrl = "https://www.doubao.com/chat/";
+        private int doubaoBrowserTimeoutMs = 30_000;
 
         private static AppConfig load(Path path) throws IOException {
             if (!Files.exists(path)) {
@@ -1700,6 +1719,18 @@ public class Main {
             config.geminiCookieUrls = stringValue(
                     sectionValue(text, "gemini_cookie", "cookie_urls"),
                     config.geminiCookieUrls);
+            config.doubaoBrowserEnabled = booleanValue(
+                    sectionValue(text, "doubao", "browser_enabled"),
+                    config.doubaoBrowserEnabled);
+            config.doubaoBrowserFallbackDirect = booleanValue(
+                    sectionValue(text, "doubao", "browser_fallback_direct"),
+                    config.doubaoBrowserFallbackDirect);
+            config.doubaoBrowserPageUrl = stringValue(
+                    sectionValue(text, "doubao", "browser_page_url"),
+                    config.doubaoBrowserPageUrl);
+            config.doubaoBrowserTimeoutMs = intValue(
+                    sectionValue(text, "doubao", "browser_timeout_ms"),
+                    config.doubaoBrowserTimeoutMs);
             // Environment overrides make the browser/CDP sidecar configurable without
             // editing the mounted curl configuration inside a container.
             config.geminiCookieEnabled = booleanEnv("GEMINI_COOKIE_ENABLED", config.geminiCookieEnabled);
@@ -1710,6 +1741,11 @@ public class Main {
             config.geminiCookieHost = stringEnv("GEMINI_COOKIE_DEBUG_HOST", config.geminiCookieHost);
             config.geminiCookiePort = intEnv("GEMINI_COOKIE_DEBUG_PORT", config.geminiCookiePort);
             config.geminiCookiePageUrl = stringEnv("GEMINI_COOKIE_PAGE_URL", config.geminiCookiePageUrl);
+            config.doubaoBrowserEnabled = booleanEnv("DOUBAO_BROWSER_ENABLED", config.doubaoBrowserEnabled);
+            config.doubaoBrowserFallbackDirect = booleanEnv(
+                    "DOUBAO_BROWSER_FALLBACK_DIRECT", config.doubaoBrowserFallbackDirect);
+            config.doubaoBrowserPageUrl = stringEnv("DOUBAO_BROWSER_PAGE_URL", config.doubaoBrowserPageUrl);
+            config.doubaoBrowserTimeoutMs = intEnv("DOUBAO_BROWSER_TIMEOUT_MS", config.doubaoBrowserTimeoutMs);
             config.proxyEnabled = booleanEnv("PROXY_ENABLED", config.proxyEnabled);
             config.proxyType = stringEnv("PROXY_TYPE", config.proxyType);
             config.proxyHost = stringEnv("PROXY_HOST", config.proxyHost);
@@ -4779,10 +4815,9 @@ public class Main {
      *
      * <p>The captured device query is a risk-control fingerprint, not something that can be
      * reduced to a few obvious keys. Keep the whole query, drop the one-shot {@code a_bogus}
-     * and {@code msToken} values, and build a fresh message envelope for every turn. The
-     * {@code /chat/completion} endpoint does not validate those two query signatures on the
-     * text path (verified by the public reverse-engineering notes), while replaying old values
-     * adds noise and can trip rate limiting.</p>
+     * and {@code msToken} values, and build a fresh message envelope for every turn. Browser mode
+     * lets Doubao's own page-side fetch hook generate fresh signatures and CSRF headers; the
+     * Java fallback path keeps the older no-replay behavior.</p>
      */
     private static final class DoubaoClient {
         private static final String COMPLETION_PATH = "/chat/completion";
@@ -4790,10 +4825,15 @@ public class Main {
 
         private final DoubaoStore store;
         private final OkHttpClient client;
+        private final DoubaoBrowser browser;
+        private final boolean browserFallbackDirect;
 
-        private DoubaoClient(DoubaoStore store, OkHttpClient client) {
+        private DoubaoClient(DoubaoStore store, OkHttpClient client, DoubaoBrowser browser,
+                             boolean browserFallbackDirect) {
             this.store = store;
             this.client = client;
+            this.browser = browser;
+            this.browserFallbackDirect = browserFallbackDirect;
         }
 
         private GeminiResult complete(String prompt, List<OpenAiApiServer.ImageInput> images,
@@ -4858,17 +4898,51 @@ public class Main {
         private GeminiResult request(DoubaoStore.CurlRecord record, String prompt,
                                      Consumer<String> deltaSink, Consumer<String> reasoningSink,
                                      ChatGptConversation conversation) throws IOException {
+            if (browser != null) {
+                try {
+                    return requestInBrowser(prompt, deltaSink, reasoningSink, conversation);
+                } catch (DoubaoBrowser.UnavailableException e) {
+                    if (!browserFallbackDirect) {
+                        throw new IOException("豆包浏览器环境不可用：" + e.getMessage()
+                                + "。请启动容器内 Chromium/CDP，或设置 doubao.browser_fallback_direct: true 回退直连。", e);
+                    }
+                    System.err.println("豆包浏览器页面不可用，回退 Java 直连：" + e.getMessage());
+                }
+            }
+
             ParsedDoubaoRequest parsed = ParsedDoubaoRequest.parse(record.curl());
             HttpUrl url = parsed.url().newBuilder()
                     .removeAllQueryParameters("a_bogus")
                     .removeAllQueryParameters("msToken")
                     .build();
             String body = requestBody(parsed.body(), prompt, conversation);
+            return requestDirect(url, parsed.headers(), body, deltaSink, reasoningSink, conversation);
+        }
 
+        private GeminiResult requestInBrowser(String prompt,
+                                              Consumer<String> deltaSink, Consumer<String> reasoningSink,
+                                              ChatGptConversation conversation) throws IOException {
+            try (InputStream bodyStream = browser.openUi(prompt);
+                 BufferedReader reader = new BufferedReader(new InputStreamReader(bodyStream, StandardCharsets.UTF_8))) {
+                return streamText(reader, deltaSink, reasoningSink, conversation);
+            } catch (DoubaoNoRetryException e) {
+                browser.showVerification();
+                throw e;
+            } catch (DoubaoBrowser.HttpException e) {
+                if (e.status() == 401 || e.status() == 403 || e.status() == 429) {
+                    browser.showVerification();
+                }
+                throw doubaoHttpFailure(e.status(), e.responseBody());
+            }
+        }
+
+        private GeminiResult requestDirect(HttpUrl url, Map<String, String> headers, String body,
+                                           Consumer<String> deltaSink, Consumer<String> reasoningSink,
+                                           ChatGptConversation conversation) throws IOException {
             Request.Builder builder = new Request.Builder()
                     .url(url)
                     .post(RequestBody.create(body, JSON_MEDIA_TYPE));
-            applyHeaders(builder, parsed.headers());
+            applyHeaders(builder, headers);
             builder.header("content-type", "application/json");
             builder.header("accept-encoding", "identity");
 
@@ -4878,20 +4952,26 @@ public class Main {
                 }
                 if (!response.isSuccessful()) {
                     String error = response.body().string();
-                    if (response.code() == 401 || response.code() == 403) {
-                        throw new IOException("豆包登录凭据已过期或触发风控（HTTP " + response.code()
-                                + "）。请重新登录 www.doubao.com 并复制最新 chat/completion curl。响应="
-                                + preview(error));
-                    }
-                    if (response.code() == 429) {
-                        throw new DoubaoNoRetryException("豆包请求过于频繁（HTTP 429）。请稍后重试。响应="
-                                + preview(error));
-                    }
-                    throw new IOException("豆包 completion 请求失败，HTTP 状态=" + response.code()
-                            + "，响应=" + preview(error));
+                    throw doubaoHttpFailure(response.code(), error);
                 }
-                return streamText(response, deltaSink, reasoningSink, conversation);
+                try (BufferedReader reader = new BufferedReader(response.body().charStream())) {
+                    return streamText(reader, deltaSink, reasoningSink, conversation);
+                }
             }
+        }
+
+        private static IOException doubaoHttpFailure(int status, String error) {
+            if (status == 401 || status == 403) {
+                return new IOException("豆包登录凭据已过期或触发风控（HTTP " + status
+                        + "）。请重新登录 www.doubao.com 并复制最新 chat/completion curl。响应="
+                        + preview(error));
+            }
+            if (status == 429) {
+                return new DoubaoNoRetryException("豆包请求过于频繁（HTTP 429）。请稍后重试。响应="
+                        + preview(error));
+            }
+            return new IOException("豆包 completion 请求失败，HTTP 状态=" + status
+                    + "，响应=" + preview(error));
         }
 
         private static String requestBody(String templateBody, String prompt,
@@ -5022,13 +5102,13 @@ public class Main {
             }
         }
 
-        private static GeminiResult streamText(Response response, Consumer<String> deltaSink,
+        private static GeminiResult streamText(BufferedReader reader, Consumer<String> deltaSink,
                                                Consumer<String> reasoningSink,
                                                ChatGptConversation conversation) throws IOException {
             DoubaoStreamState state = new DoubaoStreamState();
 
             while (true) {
-                String line = response.body().source().readUtf8Line();
+                String line = reader.readLine();
                 if (line == null) {
                     break;
                 }

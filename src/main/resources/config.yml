@@ -31,6 +31,16 @@ gemini_cookie:
   page_url: https://gemini.google.com/app
   cookie_urls: https://gemini.google.com,https://gemini.google.com/app,https://google.com
 
+# 豆包默认在容器内 Chromium 的真实页面里执行 fetch。
+# 这样会使用完整浏览器的 JS/DOM、TLS、Canvas/WebGL、client hints 和 Cookie 上下文，
+# 而不是只在 Java 里复制几个 User-Agent 请求头。CDP 地址沿用上面的 debug_host/debug_port。
+# 浏览器不可用时默认回退到旧的 Java 直连实现；不想回退可设为 false。
+doubao:
+  browser_enabled: true
+  browser_fallback_direct: true
+  browser_page_url: https://www.doubao.com/chat/
+  browser_timeout_ms: 30000
+
 # 把完整的 StreamGenerate curl 粘到下一行。
 # 不需要按 YAML 缩进；-b Cookie 可以省略，即使保留也会被 gemini_cookie 自动覆盖。
 # --data-raw 里的 at 参数也会自动替换为页面当前 SNlM0e。

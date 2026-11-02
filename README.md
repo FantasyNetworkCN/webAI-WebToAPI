@@ -65,8 +65,9 @@ PROXY_ENABLED=true PROXY_HOST=host.docker.internal PROXY_PORT=7890 \
 来自 Docker 网关的连接；如果代理只能监听宿主机 `127.0.0.1`，请使用宿主机
 转发端口，或继续使用 host 网络。
 
-DeepSeek 与豆包请求不受这里的代理设置影响，始终使用独立客户端分别直连
-`chat.deepseek.com`、`www.doubao.com`，避免国内访问多绕一层代理带来的额外延迟。
+DeepSeek 请求不受这里的代理设置影响，始终使用独立客户端直连
+`chat.deepseek.com`。豆包默认在 Chromium 的真实页面内执行请求，Chromium 启动参数
+会把 `*.doubao.com` 加入代理绕过列表，因此豆包仍然直连，避免国内访问多绕一层代理。
 
 ## 启动
 
@@ -231,7 +232,7 @@ DevTools 复制的 `https://chat.deepseek.com/api/v0/chat/completion` 完整 cur
 `/v1/models`。
 
 DeepSeek 使用独立的直连客户端，不受“代理设置”页影响；代理只用于 Gemini、
-Claude、ChatGPT 的 Java 请求和 Chromium。豆包同样直连，见下文。
+Claude、ChatGPT 的 Java 请求和 Chromium。豆包在 Chromium 页面内请求并绕过代理，见下文。
 
 - `deepseek-web`：`model_type=default`，关闭思考，等价于网页快速模式。
 - `deepseek-reasoner`：`model_type=expert`，开启 `thinking_enabled`。思维链（THINK
@@ -309,8 +310,26 @@ H("abc") = f841106c601ce9be9bc38525e90d4178d47f21dd8eb9f238fc55ffaa4ca94506
 Header 和 JSON body 并存入 `data/doubao-curls.sqlite`。模型会以 `doubao-web` 出现在
 `/v1/models`，请求时使用 `"model": "doubao-web"`。
 
-豆包同样使用独立直连客户端，不受“代理设置”页影响；代理只用于 Gemini、Claude、
-ChatGPT 的 Java 请求和 Chromium。
+默认情况下，豆包请求不是由 Java 直接发出，而是在容器内 Chromium 的真实页面里执行
+`fetch`。因此请求会带上完整浏览器环境：可执行的 JS/DOM、真实 TLS 栈、Canvas/WebGL
+与音频指纹、`navigator`/`window`、client hints、Sec-Fetch-* 头和浏览器 Cookie jar。
+Java 只负责构造 JSON、注入 curl 里的 Cookie、解析回传的 SSE。页面请求通过 CDP
+（沿用 Gemini 的 `debug_host`/`debug_port`）回传，仍然保持逐段流式，不会攒完再返回。
+
+Chromium 的启动参数会把 `*.doubao.com` 加入代理绕过列表，因此豆包仍是直连；代理只
+用于 Gemini、Claude、ChatGPT 的 Java 请求和 Chromium 的其他页面。
+
+相关配置在 `config.yml` 的 `doubao` 段：
+
+```yaml
+doubao:
+  browser_enabled: true          # 使用真实 Chromium 页面执行请求
+  browser_fallback_direct: true  # CDP 不可用时回退到旧的 Java 直连
+  browser_page_url: https://www.doubao.com/chat/
+  browser_timeout_ms: 30000
+```
+
+同一时间豆包浏览器请求会串行使用一个豆包标签页，避免多个 CDP binding 互相污染。
 
 - 保存的 curl 只作为登录上下文和请求模板。每轮会重新生成 `local_message_id`、
   `block_id`、`unique_key`、`create_time_ms` 等字段，提示词也会替换成当前用户输入。
@@ -320,9 +339,14 @@ ChatGPT 的 Java 请求和 Chromium。
 - 当前沿用 curl 里的 `conversation_init_ext` / `model_config` 档位（例如快速模式与
   `reasoning_effort`），暂不额外暴露 fast/expert 之类的新模型名。
 - 设备 query 是风控指纹，服务端保留 curl 里的整套设备参数，只移除一次性的
-  `a_bogus` 和 `msToken`。`/chat/completion` 的文本链路不校验这两个签名，重放旧值
-  反而可能触发限流，因此不会实现签名重放。
+  `a_bogus` 和 `msToken`。浏览器模式下，请求在豆包页面内由 `fetch` 发出，页面自身的
+  前端 hook 会按当前浏览器上下文重新注入签名和 CSRF 头；不会重放 curl 里的旧签名。
+  如果回退到 Java 直连，则沿用旧行为，不重放这两个一次性参数。
 - 当前只支持文字。`image_url` / `input_image` 会明确报错，不会静默丢图。
+
+浏览器模式会复用同一个豆包标签页，并在每次请求前用 curl 里的 Cookie 更新浏览器
+Cookie jar。如果 `browser_fallback_direct` 为 `false`，CDP 或标签页创建失败时会直接
+报错，不会悄悄退回 Java 直连。
 
 正文可能分散在 `STREAM_MSG_NOTIFY`（首包）、`STREAM_CHUNK` 的
 `patch_object=1`（主通道）和可选的 `CHUNK_DELTA`（逐 token 加速）中，服务端按增量

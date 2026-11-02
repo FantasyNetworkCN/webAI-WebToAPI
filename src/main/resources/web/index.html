@@ -645,7 +645,7 @@
 
     <section v-else-if="view === 'doubao'" class="cookies">
       <div class="cookie-form">
-        <textarea v-model="doubaoStoreInput" placeholder="粘贴 www.doubao.com/chat/completion 的完整 curl（含 cookie）。服务端会保留整套设备 query 并重建每轮消息；a_bogus/msToken 不会重放"></textarea>
+        <textarea v-model="doubaoStoreInput" placeholder="粘贴 www.doubao.com/chat/completion 的完整 curl（含 cookie）。服务端会在容器内 Chromium 页面中执行请求并让页面重新注入 a_bogus/msToken，同时保留整套设备 query 并重建每轮消息"></textarea>
         <div class="cookie-toolbar">
           <button class="btn primary" @click="saveDoubaoCurl" :disabled="savingDoubaoCurl || !doubaoStoreInput.trim()">
             {{ savingDoubaoCurl ? '保存中' : '保存 Curl' }}
