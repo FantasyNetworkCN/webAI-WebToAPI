@@ -51,6 +51,8 @@ public class Main {
             MediaType.get("application/json;charset=UTF-8");
     private static final String DEFAULT_MODEL = "gemini-3.6-Flash";
     private static final String CLAUDE_MODEL = "claude-sonnet-4-6";
+    private static final String CLAUDE_SONNET_55_MODEL = "sonnet-5-5";
+    private static final String CLAUDE_HAIKU_55_MODEL = "haiku-5-5";
     private static final String CHATGPT_MODEL = "chatgpt-web";
     private static final String DEEPSEEK_MODEL = "deepseek-web";
     private static final String DEEPSEEK_REASONER_MODEL = "deepseek-reasoner";
@@ -307,7 +309,7 @@ public class Main {
                 ClaudeCurlRequest curl = ClaudeCurlRequest.create(cookie.cookie(), cookie.orgId());
                 ClaudeUploadResult uploadResult = uploadClaudeImages(client, curl, images);
                 String promptToSend = promptWithClaudeUploadResult(prompt, uploadResult);
-                curl.prepare(profile.name(), promptToSend, uploadResult.fileUuids());
+                curl.prepare(claudeUpstreamModel(profile.name()), promptToSend, uploadResult.fileUuids());
 
                 try (Response response = client.newCall(curl.toRequest()).execute()) {
                     if (response.body() == null) {
@@ -667,11 +669,23 @@ public class Main {
                 "afe4fdb4dcc64484a436c7456c034885",
                 6));
         profiles.put(CLAUDE_MODEL, new ModelProfile(CLAUDE_MODEL, ModelProvider.CLAUDE, null, null, null, null));
+        profiles.put(CLAUDE_SONNET_55_MODEL,
+                new ModelProfile(CLAUDE_SONNET_55_MODEL, ModelProvider.CLAUDE, null, null, null, null));
+        profiles.put(CLAUDE_HAIKU_55_MODEL,
+                new ModelProfile(CLAUDE_HAIKU_55_MODEL, ModelProvider.CLAUDE, null, null, null, null));
         profiles.put(CHATGPT_MODEL, new ModelProfile(CHATGPT_MODEL, ModelProvider.CHATGPT, null, null, null, null));
         profiles.put(DEEPSEEK_MODEL, new ModelProfile(DEEPSEEK_MODEL, ModelProvider.DEEPSEEK, null, null, null, null));
         profiles.put(DEEPSEEK_REASONER_MODEL, new ModelProfile(DEEPSEEK_REASONER_MODEL, ModelProvider.DEEPSEEK, null, null, null, null));
         profiles.put(DOUBAO_MODEL, new ModelProfile(DOUBAO_MODEL, ModelProvider.DOUBAO, null, null, null, null));
         return java.util.Collections.unmodifiableMap(profiles);
+    }
+
+    private static String claudeUpstreamModel(String model) {
+        return switch (model) {
+            case CLAUDE_SONNET_55_MODEL -> "claude-sonnet-5-5";
+            case CLAUDE_HAIKU_55_MODEL -> "claude-haiku-5-5";
+            default -> model;
+        };
     }
 
     private static ModelProfile modelProfile(String model) {

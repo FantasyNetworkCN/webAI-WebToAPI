@@ -223,6 +223,13 @@ OPENAI_HOST_PORT=16000 NOVNC_PORT=16082 VNC_PORT=15910 \
   docker compose up -d --build
 ```
 
+### Claude 网页端模型
+
+打开首页的“Claude Cookie”页，粘贴 Claude completion curl，服务端只会提取并保存
+Cookie。可用模型为 `claude-sonnet-4-6`、`sonnet-5-5` 和 `haiku-5-5`；请求时把对应
+名称填入 OpenAI 兼容接口的 `model` 字段即可。服务端会在可用 Cookie 中随机选择，
+遇到 429 时按恢复时间临时禁用对应 Cookie。
+
 ### DeepSeek 网页端模型
 
 项目也实现了 chat.deepseek.com 网页端链路。打开首页的“DeepSeek Curl”页，粘贴
