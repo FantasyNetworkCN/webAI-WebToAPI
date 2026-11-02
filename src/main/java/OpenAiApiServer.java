@@ -2226,6 +2226,17 @@ final class OpenAiApiServer {
         if (requested == null || requested.isBlank()) {
             requested = defaultModel;
         }
+        String resolved = findModel(requested);
+        if (resolved == null && !requested.startsWith("claude-")) {
+            resolved = findModel("claude-" + requested);
+        }
+        if (resolved != null) {
+            return resolved;
+        }
+        throw new IllegalArgumentException("未知模型：" + requested + "。可用模型：" + String.join(", ", models));
+    }
+
+    private String findModel(String requested) {
         for (String model : models) {
             if (model.equals(requested)) {
                 return model;
@@ -2236,7 +2247,7 @@ final class OpenAiApiServer {
                 return model;
             }
         }
-        throw new IllegalArgumentException("未知模型：" + requested + "。可用模型：" + String.join(", ", models));
+        return null;
     }
 
     interface DeltaSink {
