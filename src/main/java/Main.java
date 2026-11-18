@@ -3171,8 +3171,7 @@ public class Main {
                 String text = "";
                 StringBuilder all = new StringBuilder();
                 String conversationId = conversation.conversationId;
-                boolean sawEvent = false;
-                boolean terminalSeen = false;
+                ChatGptAnswerStream answer = new ChatGptAnswerStream();
                 ChatGptDeltaDecoder decoder = new ChatGptDeltaDecoder();
                 while (true) {
                     String line = response.body().source().readUtf8Line();
@@ -3183,7 +3182,7 @@ public class Main {
                     String data = sseLine.substring(5).trim();
                     if (data.isBlank()) continue;
                     if ("[DONE]".equals(data)) {
-                        terminalSeen = true;
+                        answer.terminal = true;
                         continue;
                     }
                     Object event;
@@ -3196,14 +3195,10 @@ public class Main {
                     }
                     if (!(event instanceof Map<?, ?> frame)) continue;
                     Map<?, ?> map = decoder.decode(frame);
-                    sawEvent = true;
-                    if (isChatGptStreamComplete(map)) terminalSeen = true;
                     String cid = stringValue(map.get("conversation_id"));
                     if (cid.isBlank()) cid = nestedString(map, "conversation_id");
                     if (!cid.isBlank()) conversationId = cid;
-                    String messageId = assistantMessageId(map);
-                    String next = extractChatGptText(map, text);
-                    String merged = mergeChatGptSnapshot(text, next);
+                    String merged = answer.read(map, text);
                     if (merged.length() > text.length()) {
                         String delta = merged.startsWith(text) ? merged.substring(text.length()) : merged;
                         // Whitespace-only chunks (blank Markdown lines, code indentation)
@@ -3214,17 +3209,16 @@ public class Main {
                         // Never let it replace a longer response with a shorter one.
                         text = merged;
                     }
-                    if (!messageId.isBlank() && messageId.length() > 20) conversation.parentMessageId = messageId;
                 }
                 dumpRawResponseIfRequested(all.toString());
                 if (text.isBlank()) throw new IOException("ChatGPT SSE 未返回文本");
-                if (sawEvent && !terminalSeen && chatGptRequireTerminal()) {
+                if (!answer.terminal && ChatGptAnswerStream.requireTerminal()) {
                     throw new IOException("ChatGPT 流式响应提前结束：未收到 [DONE] / message_stream_complete 结束标记（已收到 "
                             + text.length() + " 字符）。可能是连接被中断，或该回复的后半段走了 WebSocket");
                 }
                 conversation.conversationId = conversationId;
-                conversation.parentMessageId = conversation.parentMessageId.isBlank()
-                        ? parentMessageId : conversation.parentMessageId;
+                conversation.parentMessageId = answer.answerMessageId.isBlank()
+                        ? parentMessageId : answer.answerMessageId;
                 return new GeminiResult(text, conversationId, "", conversation.parentMessageId);
             }
         }
@@ -3792,116 +3786,148 @@ public class Main {
             return "";
         }
 
-        private static String assistantMessageId(Object value) {
-            if (value instanceof List<?> list) {
-                for (Object child : list) {
-                    String found = assistantMessageId(child);
-                    if (!found.isBlank()) return found;
+        private static String jsonStringify(Object value) {
+            if (value == null) return "null";
+            if (value instanceof String s) return SimpleJson.quote(s);
+            if (value instanceof Number || value instanceof Boolean) return String.valueOf(value);
+            if (value instanceof Map<?, ?> map) {
+                StringBuilder out = new StringBuilder("{"); boolean first = true;
+                for (Map.Entry<?, ?> entry : map.entrySet()) {
+                    if (!first) out.append(','); first = false;
+                    out.append(SimpleJson.quote(String.valueOf(entry.getKey()))).append(':').append(jsonStringify(entry.getValue()));
                 }
-                return "";
+                return out.append('}').toString();
             }
-            if (!(value instanceof Map<?, ?> map)) return "";
-            Object message = map.get("message");
-            if (message instanceof Map<?, ?> messageMap) {
-                Object author = messageMap.get("author");
-                if (author instanceof Map<?, ?> authorMap && "assistant".equals(stringValue(authorMap.get("role")))) {
-                    String id = stringValue(messageMap.get("id"));
-                    if (!id.isBlank()) return id;
-                }
+            if (value instanceof Iterable<?> iterable) {
+                StringBuilder out = new StringBuilder("["); boolean first = true;
+                for (Object item : iterable) { if (!first) out.append(','); first = false; out.append(jsonStringify(item)); }
+                return out.append(']').toString();
             }
-            String direct = stringValue(map.get("message_id"));
-            if (!direct.isBlank()) return direct;
-            for (Object child : map.values()) {
-                String found = assistantMessageId(child);
-                if (!found.isBlank()) return found;
-            }
-            return "";
+            return SimpleJson.quote(String.valueOf(value));
         }
 
-        /**
-         * Upstream closes a conversation stream after {@code [DONE]} and a
-         * {@code message_stream_complete} event, usually along with
-         * {@code /message/status -> finished_successfully}. Without one of those a
-         * socket that just stops looks identical to a finished answer.
-         */
-        private static boolean isChatGptStreamComplete(Map<?, ?> map) {
-            if ("message_stream_complete".equalsIgnoreCase(stringValue(map.get("type")))) return true;
-            for (Object candidate : new Object[]{map, map.get("v")}) {
-                if (!(candidate instanceof Map<?, ?> nested)) continue;
-                Object message = nested.get("message");
-                if (message instanceof Map<?, ?> msg
-                        && "finished_successfully".equalsIgnoreCase(stringValue(msg.get("status")))) {
-                    return true;
+        private record ParsedChatGptCurl(HttpUrl url, Map<String, String> headers, String body) {
+            static ParsedChatGptCurl parse(String raw) throws IOException {
+                List<String> tokens = CurlRequest.shellTokens(raw);
+                HttpUrl url = null; String body = ""; Map<String, String> headers = new LinkedHashMap<>();
+                for (int i = 0; i < tokens.size(); i++) {
+                    String token = tokens.get(i);
+                    if (("--url".equals(token) || "-X".equals(token)) && i + 1 < tokens.size()) {
+                        String next = tokens.get(++i); if (next.startsWith("http")) url = HttpUrl.get(next); continue;
+                    }
+                    if (url == null && token.startsWith("http")) { url = HttpUrl.get(token); continue; }
+                    if (("-H".equals(token) || "--header".equals(token)) && i + 1 < tokens.size()) {
+                        String header = tokens.get(++i); int colon = header.indexOf(':');
+                        if (colon > 0) headers.put(header.substring(0, colon).trim(), header.substring(colon + 1).trim());
+                        continue;
+                    }
+                    if (("--data-raw".equals(token) || "--data".equals(token) || "--data-binary".equals(token)) && i + 1 < tokens.size()) body = tokens.get(++i);
+                    else if (token.startsWith("--data-raw=") || token.startsWith("--data=")) body = token.substring(token.indexOf('=') + 1);
+                    if (("-b".equals(token) || "--cookie".equals(token)) && i + 1 < tokens.size()) headers.put("Cookie", tokens.get(++i));
                 }
+                if (url == null || body.isBlank()) throw new IOException("ChatGPT curl 缺少 URL 或 JSON body");
+                return new ParsedChatGptCurl(url, headers, body);
             }
-            String path = stringValue(map.get("p"));
+        }
+    }
+
+    /** Keeps internal assistant/tool messages out of the public answer before emitting deltas. */
+    static final class ChatGptAnswerStream {
+        // Older streams can contain text deltas without any message envelope.
+        private boolean visible = true;
+        private String role = "assistant";
+        private String channel = "";
+        private String recipient = "";
+        private String contentType = "";
+        private String messageId = "";
+        private String answerMessageId = "";
+        private boolean terminal;
+
+        String read(Map<?, ?> frame, String current) {
+            if ("message_stream_complete".equals(frame.get("type"))) terminal = true;
+            String operation = stringValue(frame.get("o"));
+            String path = stringValue(frame.get("p"));
             if (path.startsWith("/")) path = path.substring(1);
-            if ("message/status".equals(path)) {
-                return "finished_successfully".equalsIgnoreCase(stringValue(map.get("v")));
+            Object value = frame.get("v");
+
+            if ("patch".equalsIgnoreCase(operation) && value instanceof List<?> batch) {
+                for (Object item : batch) {
+                    if (item instanceof Map<?, ?> patch) current = read(patch, current);
+                }
+                return current;
             }
-            if ("message/end_turn".equals(path)) {
-                return Boolean.TRUE.equals(map.get("v"));
+            if (frame.get("message") instanceof Map<?, ?> message && message.containsKey("author")) {
+                return readMessage(message, current);
             }
-            if ("patch".equalsIgnoreCase(stringValue(map.get("o"))) && map.get("v") instanceof List<?> list) {
-                for (Object item : list) {
-                    if (item instanceof Map<?, ?> sub && isChatGptStreamComplete(sub)) return true;
+            if (value instanceof Map<?, ?> wrapped) {
+                if (wrapped.get("message") instanceof Map<?, ?> message && message.containsKey("author")) {
+                    return readMessage(message, current);
+                }
+                if ("message".equals(path)) return readMessage(wrapped, current);
+                if (wrapped.containsKey("p") || wrapped.containsKey("o")) return read(wrapped, current);
+            }
+
+            switch (path) {
+                case "message/author/role" -> role = stringValue(value);
+                case "message/channel" -> channel = stringValue(value);
+                case "message/recipient" -> recipient = stringValue(value);
+                case "message/content/content_type" -> contentType = stringValue(value);
+                case "message/status" -> {
+                    if (visible && "finished_successfully".equals(value)) terminal = true;
+                    return current;
+                }
+                case "message/end_turn" -> {
+                    if (visible && Boolean.TRUE.equals(value)) terminal = true;
+                    return current;
+                }
+                default -> {
+                    if (!visible) return current;
+                    if (path.equals("message/content/parts/0") || path.equals("message/content/text")
+                            || path.equals("message/content/parts") || path.equals("message/content")) {
+                        String text = chatGptPatchValue(value);
+                        if ("append".equalsIgnoreCase(operation) || "add".equalsIgnoreCase(operation)) {
+                            return appendChatGptText(current, text);
+                        }
+                        if ("replace".equalsIgnoreCase(operation) || "set".equalsIgnoreCase(operation)) {
+                            return mergeChatGptSnapshot(current, text);
+                        }
+                    }
+                    if (path.isEmpty() && operation.isEmpty() && !frame.containsKey("type")
+                            && isChatGptTextIncrement(value)) {
+                        return appendChatGptText(current, stringValue(value));
+                    }
+                    return current;
                 }
             }
-            return false;
+            refreshVisibility();
+            return current;
         }
 
-        /**
-         * Set {@code -Dchatgpt.strictTermination=false} to return whatever text was
-         * received when the stream ends without a completion marker.
-         */
-        private static boolean chatGptRequireTerminal() {
+        private String readMessage(Map<?, ?> message, String current) {
+            role = message.get("author") instanceof Map<?, ?> author ? stringValue(author.get("role")) : "";
+            channel = stringValue(message.get("channel"));
+            recipient = stringValue(message.get("recipient"));
+            messageId = stringValue(message.get("id"));
+            Object content = message.get("content");
+            contentType = content instanceof Map<?, ?> map ? stringValue(map.get("content_type")) : "";
+            refreshVisibility();
+            if (!visible) return current;
+            if ("finished_successfully".equals(message.get("status")) || Boolean.TRUE.equals(message.get("end_turn"))) {
+                terminal = true;
+            }
+            return mergeChatGptSnapshot(current, chatGptContentText(content));
+        }
+
+        private void refreshVisibility() {
+            visible = "assistant".equals(role) && (channel.isEmpty() || "final".equals(channel))
+                    && (recipient.isEmpty() || "all".equals(recipient))
+                    && (contentType.isEmpty() || "text".equals(contentType) || "multimodal_text".equals(contentType));
+            if (visible && !messageId.isBlank()) answerMessageId = messageId;
+        }
+
+        private static boolean requireTerminal() {
             String value = System.getProperty("chatgpt.strictTermination");
             return value == null || value.isBlank() || Boolean.parseBoolean(value);
-        }
-
-        private static String extractChatGptText(Object value, String current) {
-            if (!(value instanceof Map<?, ?> map)) return current;
-            String result = current;
-            for (Object candidate : new Object[]{map, map.get("v")}) {
-                if (!(candidate instanceof Map<?, ?> nested)) continue;
-                if (nested != map && (nested.containsKey("p") || nested.containsKey("o"))) {
-                    result = extractChatGptText(nested, result);
-                }
-                Object message = nested.get("message");
-                if (message instanceof Map<?, ?> msg && msg.get("author") instanceof Map<?, ?> author
-                        && "assistant".equals(stringValue(author.get("role")))) {
-                    Object content = msg.get("content");
-                    String snapshot = chatGptContentText(content);
-                    result = mergeChatGptSnapshot(result, snapshot);
-                }
-            }
-            String operation = stringValue(map.get("o"));
-            if ("patch".equalsIgnoreCase(operation) && map.get("v") instanceof List<?> list) {
-                for (Object item : list) result = extractChatGptText(item, result);
-            }
-            String path = stringValue(map.get("p"));
-            if (path.startsWith("/")) path = path.substring(1);
-            if (path.startsWith("message/content/parts/") || path.startsWith("message/content/text")) {
-                String valueText = chatGptPatchValue(map.get("v"));
-                if (valueText.isEmpty()) return result;
-                if ("append".equalsIgnoreCase(operation) || "add".equalsIgnoreCase(operation)) {
-                    return appendChatGptText(result, valueText);
-                }
-                if ("replace".equalsIgnoreCase(operation) || "set".equalsIgnoreCase(operation)) {
-                    // Part 0 is the assistant answer. Other part indexes are
-                    // metadata/citations and must not replace the answer.
-                    if (path.contains("/parts/0") || path.endsWith("/text")) {
-                        result = valueText.length() >= result.length() ? valueText : result;
-                    }
-                }
-            }
-            // Text increments also arrive as a bare {"v":"..."} payload with the path
-            // omitted. Treating those as control frames silently drops real answer text.
-            if (path.isEmpty() && operation.isEmpty() && !map.containsKey("type")
-                    && isChatGptTextIncrement(map.get("v"))) {
-                return appendChatGptText(result, stringValue(map.get("v")));
-            }
-            return result;
         }
 
         private static boolean isChatGptTextIncrement(Object value) {
@@ -3959,50 +3985,6 @@ public class Main {
             }
             return "";
         }
-
-        private static String jsonStringify(Object value) {
-            if (value == null) return "null";
-            if (value instanceof String s) return SimpleJson.quote(s);
-            if (value instanceof Number || value instanceof Boolean) return String.valueOf(value);
-            if (value instanceof Map<?, ?> map) {
-                StringBuilder out = new StringBuilder("{"); boolean first = true;
-                for (Map.Entry<?, ?> entry : map.entrySet()) {
-                    if (!first) out.append(','); first = false;
-                    out.append(SimpleJson.quote(String.valueOf(entry.getKey()))).append(':').append(jsonStringify(entry.getValue()));
-                }
-                return out.append('}').toString();
-            }
-            if (value instanceof Iterable<?> iterable) {
-                StringBuilder out = new StringBuilder("["); boolean first = true;
-                for (Object item : iterable) { if (!first) out.append(','); first = false; out.append(jsonStringify(item)); }
-                return out.append(']').toString();
-            }
-            return SimpleJson.quote(String.valueOf(value));
-        }
-
-        private record ParsedChatGptCurl(HttpUrl url, Map<String, String> headers, String body) {
-            static ParsedChatGptCurl parse(String raw) throws IOException {
-                List<String> tokens = CurlRequest.shellTokens(raw);
-                HttpUrl url = null; String body = ""; Map<String, String> headers = new LinkedHashMap<>();
-                for (int i = 0; i < tokens.size(); i++) {
-                    String token = tokens.get(i);
-                    if (("--url".equals(token) || "-X".equals(token)) && i + 1 < tokens.size()) {
-                        String next = tokens.get(++i); if (next.startsWith("http")) url = HttpUrl.get(next); continue;
-                    }
-                    if (url == null && token.startsWith("http")) { url = HttpUrl.get(token); continue; }
-                    if (("-H".equals(token) || "--header".equals(token)) && i + 1 < tokens.size()) {
-                        String header = tokens.get(++i); int colon = header.indexOf(':');
-                        if (colon > 0) headers.put(header.substring(0, colon).trim(), header.substring(colon + 1).trim());
-                        continue;
-                    }
-                    if (("--data-raw".equals(token) || "--data".equals(token) || "--data-binary".equals(token)) && i + 1 < tokens.size()) body = tokens.get(++i);
-                    else if (token.startsWith("--data-raw=") || token.startsWith("--data=")) body = token.substring(token.indexOf('=') + 1);
-                    if (("-b".equals(token) || "--cookie".equals(token)) && i + 1 < tokens.size()) headers.put("Cookie", tokens.get(++i));
-                }
-                if (url == null || body.isBlank()) throw new IOException("ChatGPT curl 缺少 URL 或 JSON body");
-                return new ParsedChatGptCurl(url, headers, body);
-            }
-        }
     }
 
     /**
@@ -4011,11 +3993,11 @@ public class Main {
      * The previous path and operation belong to one stream, and batch entries
      * use their own context.
      */
-    private static final class ChatGptDeltaDecoder {
+    static final class ChatGptDeltaDecoder {
         private String path = "";
         private String operation = "";
 
-        private Map<?, ?> decode(Map<?, ?> frame) {
+        Map<?, ?> decode(Map<?, ?> frame) {
             if (!frame.containsKey("v")) return frame;
             Object value = frame.get("v");
             boolean explicit = frame.containsKey("p") || frame.containsKey("o");
@@ -5846,8 +5828,7 @@ public class Main {
                 StringBuilder all = new StringBuilder();
                 String current = "";
                 String conversationId = "";
-                boolean sawEvent = false;
-                boolean terminalSeen = false;
+                ChatGptAnswerStream answer = new ChatGptAnswerStream();
                 ChatGptDeltaDecoder decoder = new ChatGptDeltaDecoder();
                 while (true) {
                     String line = response.body().source().readUtf8Line();
@@ -5858,7 +5839,7 @@ public class Main {
                     String data = sseLine.substring(5).trim();
                     if (data.isBlank()) continue;
                     if ("[DONE]".equals(data)) {
-                        terminalSeen = true;
+                        answer.terminal = true;
                         continue;
                     }
                     Object event;
@@ -5869,12 +5850,9 @@ public class Main {
                     }
                     if (!(event instanceof Map<?, ?> frame)) continue;
                     Map<?, ?> map = decoder.decode(frame);
-                    sawEvent = true;
-                    if (isChatGptStreamComplete(map)) terminalSeen = true;
                     String cid = stringValue(map.get("conversation_id"));
                     if (!cid.isBlank()) conversationId = cid;
-                    String next = extractChatGptText(map, current);
-                    String merged = mergeChatGptSnapshot(current, next);
+                    String merged = answer.read(map, current);
                     if (merged.length() > current.length()) {
                         String delta = merged.startsWith(current) ? merged.substring(current.length()) : merged;
                         if (!delta.isEmpty() && deltaSink != null) deltaSink.accept(delta);
@@ -5883,7 +5861,7 @@ public class Main {
                 }
                 dumpRawResponseIfRequested(all.toString());
                 if (current.isBlank()) throw new IOException("ChatGPT SSE 未返回文本");
-                if (sawEvent && !terminalSeen && chatGptRequireTerminal()) {
+                if (!answer.terminal && ChatGptAnswerStream.requireTerminal()) {
                     throw new IOException("ChatGPT 流式响应提前结束：未收到 [DONE] / message_stream_complete 结束标记（已收到 "
                             + current.length() + " 字符）。可能是连接被中断，或该回复的后半段走了 WebSocket");
                 }
@@ -5973,126 +5951,6 @@ public class Main {
         private static byte[] hexBytes(String value) { return java.util.HexFormat.of().parseHex(value.replaceFirst("^0x", "")); }
         private static byte[] join(byte[] a, byte[] b) { byte[] out = java.util.Arrays.copyOf(a, a.length + b.length); System.arraycopy(b, 0, out, a.length, b.length); return out; }
         private static boolean lessOrEqual(byte[] a, byte[] b, int count) { for (int i = 0; i < count; i++) { int x = a[i] & 255, y = b[i] & 255; if (x < y) return true; if (x > y) return false; } return true; }
-
-        /** See {@code ChatGptCurlClient#isChatGptStreamComplete}. */
-        private static boolean isChatGptStreamComplete(Map<?, ?> map) {
-            if ("message_stream_complete".equalsIgnoreCase(stringValue(map.get("type")))) return true;
-            for (Object candidate : new Object[]{map, map.get("v")}) {
-                if (!(candidate instanceof Map<?, ?> nested)) continue;
-                Object message = nested.get("message");
-                if (message instanceof Map<?, ?> msg
-                        && "finished_successfully".equalsIgnoreCase(stringValue(msg.get("status")))) {
-                    return true;
-                }
-            }
-            String path = stringValue(map.get("p"));
-            if (path.startsWith("/")) path = path.substring(1);
-            if ("message/status".equals(path)) {
-                return "finished_successfully".equalsIgnoreCase(stringValue(map.get("v")));
-            }
-            if ("message/end_turn".equals(path)) {
-                return Boolean.TRUE.equals(map.get("v"));
-            }
-            if ("patch".equalsIgnoreCase(stringValue(map.get("o"))) && map.get("v") instanceof java.util.List<?> list) {
-                for (Object item : list) {
-                    if (item instanceof Map<?, ?> sub && isChatGptStreamComplete(sub)) return true;
-                }
-            }
-            return false;
-        }
-
-        /** See {@code ChatGptCurlClient#chatGptRequireTerminal}. */
-        private static boolean chatGptRequireTerminal() {
-            String value = System.getProperty("chatgpt.strictTermination");
-            return value == null || value.isBlank() || Boolean.parseBoolean(value);
-        }
-
-        private static String extractChatGptText(Object value, String current) {
-            if (!(value instanceof Map<?, ?> map)) return current;
-            String result = current;
-            for (Object candidate : new Object[]{map, map.get("v")}) {
-                if (!(candidate instanceof Map<?, ?> nested)) continue;
-                if (nested != map && (nested.containsKey("p") || nested.containsKey("o"))) {
-                    result = extractChatGptText(nested, result);
-                }
-                Object message = nested.get("message");
-                if (message instanceof Map<?, ?> msg
-                        && msg.get("author") instanceof Map<?, ?> author
-                        && "assistant".equals(stringValue(author.get("role")))) {
-                    Object content = msg.get("content");
-                    String snapshot = chatGptContentText(content);
-                    result = mergeChatGptSnapshot(result, snapshot);
-                }
-            }
-            String operation = stringValue(map.get("o"));
-            if ("patch".equalsIgnoreCase(operation) && map.get("v") instanceof java.util.List<?> list) {
-                for (Object item : list) result = extractChatGptText(item, result);
-            }
-            String path = stringValue(map.get("p"));
-            if (path.startsWith("/")) path = path.substring(1);
-            if (path.startsWith("message/content/parts/") || path.startsWith("message/content/text")) {
-                String valueText = chatGptPatchValue(map.get("v"));
-                if (valueText.isEmpty()) return result;
-                if ("append".equalsIgnoreCase(operation) || "add".equalsIgnoreCase(operation)) return appendChatGptText(result, valueText);
-                if (("replace".equalsIgnoreCase(operation) || "set".equalsIgnoreCase(operation))
-                        && (path.contains("/parts/0") || path.endsWith("/text"))
-                        && valueText.length() >= result.length()) return valueText;
-            }
-            if (path.isEmpty() && operation.isEmpty() && !map.containsKey("type")
-                    && isChatGptTextIncrement(map.get("v"))) {
-                return appendChatGptText(result, stringValue(map.get("v")));
-            }
-            return result;
-        }
-
-        private static boolean isChatGptTextIncrement(Object value) {
-            if (!(value instanceof String text) || text.isEmpty()) return false;
-            return !text.matches("v\\d+");
-        }
-
-        private static String appendChatGptText(String current, String addition) {
-            if (addition.isEmpty()) return current;
-            // See ChatGptCurlClient#appendChatGptText: "append" is an increment, and
-            // de-duplicating it silently drops repeated model output.
-            return current + addition;
-        }
-
-        private static String mergeChatGptSnapshot(String current, String snapshot) {
-            if (snapshot.isEmpty() || snapshot.equals(current)) return current;
-            if (current.isEmpty() || snapshot.startsWith(current)) return snapshot;
-            return current;
-        }
-
-        private static String chatGptContentText(Object content) {
-            if (content instanceof String text) return text;
-            if (!(content instanceof Map<?, ?> map)) return "";
-            String direct = stringValue(map.get("text"));
-            if (!direct.isEmpty()) return direct;
-            Object partsValue = map.get("parts");
-            if (!(partsValue instanceof java.util.List<?> parts)) return "";
-            StringBuilder out = new StringBuilder();
-            for (Object part : parts) {
-                if (part instanceof String text) out.append(text);
-                else if (part instanceof Map<?, ?> partMap) {
-                    String text = firstNonBlank(stringValue(partMap.get("text")), stringValue(partMap.get("value")));
-                    if (!text.isEmpty()) out.append(text);
-                }
-            }
-            return out.toString();
-        }
-
-        private static String chatGptPatchValue(Object value) {
-            if (value instanceof String text) return text;
-            if (value instanceof java.util.List<?> list) {
-                StringBuilder out = new StringBuilder();
-                for (Object item : list) out.append(chatGptPatchValue(item));
-                return out.toString();
-            }
-            if (value instanceof Map<?, ?> map) {
-                return firstNonBlank(stringValue(map.get("text")), stringValue(map.get("value")), chatGptContentText(map));
-            }
-            return "";
-        }
 
         private static String jsonStringify(Object value) {
             if (value == null) return "null";
