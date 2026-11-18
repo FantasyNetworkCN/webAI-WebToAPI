@@ -3155,6 +3155,7 @@ public class Main {
                 String conversationId = conversation.conversationId;
                 boolean sawEvent = false;
                 boolean terminalSeen = false;
+                ChatGptDeltaDecoder decoder = new ChatGptDeltaDecoder();
                 while (true) {
                     String line = response.body().source().readUtf8Line();
                     if (line == null) break;
@@ -3175,7 +3176,8 @@ public class Main {
                         // text already collected from the stream.
                         continue;
                     }
-                    if (!(event instanceof Map<?, ?> map)) continue;
+                    if (!(event instanceof Map<?, ?> frame)) continue;
+                    Map<?, ?> map = decoder.decode(frame);
                     sawEvent = true;
                     if (isChatGptStreamComplete(map)) terminalSeen = true;
                     String cid = stringValue(map.get("conversation_id"));
@@ -3736,7 +3738,8 @@ public class Main {
             }
             // Text increments also arrive as a bare {"v":"..."} payload with the path
             // omitted. Treating those as control frames silently drops real answer text.
-            if (path.isEmpty() && operation.isEmpty() && isChatGptTextIncrement(map.get("v"))) {
+            if (path.isEmpty() && operation.isEmpty() && !map.containsKey("type")
+                    && isChatGptTextIncrement(map.get("v"))) {
                 return appendChatGptText(result, stringValue(map.get("v")));
             }
             return result;
@@ -3840,6 +3843,51 @@ public class Main {
                 if (url == null || body.isBlank()) throw new IOException("ChatGPT curl 缺少 URL 或 JSON body");
                 return new ParsedChatGptCurl(url, headers, body);
             }
+        }
+    }
+
+    /**
+     * Restores keys omitted by compact ChatGPT SSE deltas. Once a frame sets
+     * {@code o=patch}, later frames can contain only the array in {@code v}.
+     * The previous path and operation belong to one stream, and batch entries
+     * use their own context.
+     */
+    private static final class ChatGptDeltaDecoder {
+        private String path = "";
+        private String operation = "";
+
+        private Map<?, ?> decode(Map<?, ?> frame) {
+            if (!frame.containsKey("v")) return frame;
+            Object value = frame.get("v");
+            boolean explicit = frame.containsKey("p") || frame.containsKey("o");
+            if (!explicit) {
+                if (value instanceof Map<?, ?> nested && (nested.containsKey("p") || nested.containsKey("o"))) {
+                    Map<Object, Object> decoded = new LinkedHashMap<>(frame);
+                    decoded.put("v", decode(nested));
+                    return decoded;
+                }
+                if (frame.containsKey("type")) return frame;
+                // An unbound string is a legacy text increment. An array can
+                // inherit the outer patch operation even when its path is empty.
+                if (value instanceof List<?>) {
+                    if (!"patch".equalsIgnoreCase(operation)) return frame;
+                } else if (!(value instanceof String) || path.isEmpty()) {
+                    return frame;
+                }
+            }
+
+            if (frame.containsKey("p")) path = stringValue(frame.get("p"));
+            if (frame.containsKey("o")) operation = stringValue(frame.get("o"));
+            Map<Object, Object> decoded = new LinkedHashMap<>(frame);
+            decoded.put("p", path);
+            decoded.put("o", operation);
+            if ("patch".equalsIgnoreCase(operation) && value instanceof List<?> list) {
+                ChatGptDeltaDecoder batch = new ChatGptDeltaDecoder();
+                decoded.put("v", list.stream()
+                        .map(item -> item instanceof Map<?, ?> patch ? batch.decode(patch) : item)
+                        .toList());
+            }
+            return decoded;
         }
     }
 
@@ -5641,6 +5689,7 @@ public class Main {
                 String conversationId = "";
                 boolean sawEvent = false;
                 boolean terminalSeen = false;
+                ChatGptDeltaDecoder decoder = new ChatGptDeltaDecoder();
                 while (true) {
                     String line = response.body().source().readUtf8Line();
                     if (line == null) break;
@@ -5659,12 +5708,13 @@ public class Main {
                     } catch (RuntimeException malformedEvent) {
                         continue;
                     }
-                    if (!(event instanceof Map<?, ?> map)) continue;
+                    if (!(event instanceof Map<?, ?> frame)) continue;
+                    Map<?, ?> map = decoder.decode(frame);
                     sawEvent = true;
                     if (isChatGptStreamComplete(map)) terminalSeen = true;
                     String cid = stringValue(map.get("conversation_id"));
                     if (!cid.isBlank()) conversationId = cid;
-                    String next = extractChatGptText(event, current);
+                    String next = extractChatGptText(map, current);
                     String merged = mergeChatGptSnapshot(current, next);
                     if (merged.length() > current.length()) {
                         String delta = merged.startsWith(current) ? merged.substring(current.length()) : merged;
@@ -5829,7 +5879,8 @@ public class Main {
                         && (path.contains("/parts/0") || path.endsWith("/text"))
                         && valueText.length() >= result.length()) return valueText;
             }
-            if (path.isEmpty() && operation.isEmpty() && isChatGptTextIncrement(map.get("v"))) {
+            if (path.isEmpty() && operation.isEmpty() && !map.containsKey("type")
+                    && isChatGptTextIncrement(map.get("v"))) {
                 return appendChatGptText(result, stringValue(map.get("v")));
             }
             return result;
