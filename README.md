@@ -186,6 +186,10 @@ requirements/PoW/Turnstile（如需要）和 conduit token；保存 curl 中旧�
 `openai-sentinel-*`、`x-conduit-token` 不会被重放。若浏览器会话本身过期或 ChatGPT
 仍返回 401/403，请在同一浏览器和网络中重新复制最新 conversation curl 后保存。
 
+网关拼接后的消息超过 32 KiB（按 UTF-8 字节计）时，`chatgpt-web` 会把完整文本作为
+`Pasted text.txt` 上传，等文件处理完成后再随会话请求发送。较短消息如果收到
+`413 message_length_exceeds_limit`，也会改用附件重试一次。附件不加入 ChatGPT 文件库。
+
 #### 文本完整性与失败判定
 
 ChatGPT 网页流按增量下发正文（`{"p":"/message/content/parts/0","o":"append","v":"..."}`

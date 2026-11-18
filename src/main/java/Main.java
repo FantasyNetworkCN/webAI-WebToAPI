@@ -3077,6 +3077,9 @@ public class Main {
     }
 
     private static final class ChatGptCurlClient {
+        private static final int INLINE_PROMPT_MAX_BYTES = 32 * 1024;
+        private static final String PASTED_TEXT_FILENAME = "Pasted text.txt";
+        private static final String PASTED_TEXT_MIME = "text/plain";
         private final ChatGptCurlStore store;
         private final OkHttpClient client;
 
@@ -3106,6 +3109,18 @@ public class Main {
 
         private GeminiResult request(ChatGptCurlStore.CurlRecord record, String prompt,
                                      Consumer<String> deltaSink, ChatGptConversation conversation) throws IOException {
+            byte[] promptBytes = prompt.getBytes(StandardCharsets.UTF_8);
+            boolean useAttachment = promptBytes.length > INLINE_PROMPT_MAX_BYTES;
+            try {
+                return request(record, prompt, useAttachment ? promptBytes : null, deltaSink, conversation);
+            } catch (ChatGptMessageTooLong e) {
+                if (useAttachment) throw e;
+                return request(record, prompt, promptBytes, deltaSink, conversation);
+            }
+        }
+
+        private GeminiResult request(ChatGptCurlStore.CurlRecord record, String prompt, byte[] attachmentBytes,
+                                     Consumer<String> deltaSink, ChatGptConversation conversation) throws IOException {
             ParsedChatGptCurl curl = ParsedChatGptCurl.parse(record.curl());
             Object parsed = SimpleJson.parse(curl.body());
             if (!(parsed instanceof Map<?, ?> rawMap)) {
@@ -3114,7 +3129,10 @@ public class Main {
             @SuppressWarnings("unchecked") Map<String, Object> body = (Map<String, Object>) rawMap;
             String parentMessageId = conversation.parentMessageId.isBlank()
                     ? "client-created-root" : conversation.parentMessageId;
-            Map<String, Object> message = chatMessage(prompt);
+            RequestContext context = new RequestContext(curl.url(), new LinkedHashMap<>(curl.headers()));
+            Map<String, Object> message = attachmentBytes == null
+                    ? chatMessage(prompt)
+                    : chatMessageWithAttachment(uploadPromptAttachment(context, body, attachmentBytes));
             body.put("messages", java.util.List.of(message));
             if (!conversation.conversationId.isBlank()) body.put("conversation_id", conversation.conversationId);
             else body.remove("conversation_id");
@@ -3123,7 +3141,6 @@ public class Main {
             if (path.isBlank()) path = "/backend-api/f/conversation";
             body.put("client_prepare_state", "success");
 
-            RequestContext context = new RequestContext(curl.url(), new LinkedHashMap<>(curl.headers()));
             Bootstrap bootstrap = bootstrap(context);
             Sentinel sentinel = sentinel(context, bootstrap, header(context.headers, "openai-sentinel-turnstile-token"));
             String freshConduit = refreshConduit(context, body, message, parentMessageId);
@@ -3144,6 +3161,7 @@ public class Main {
             try (Response response = client.newCall(builder.build()).execute()) {
                 if (!response.isSuccessful() || response.body() == null) {
                     String error = response.body() == null ? "" : response.body().string();
+                    checkChatGptMessageLength(response.code(), error);
                     if (response.code() == 401 || response.code() == 403) {
                         throw new IOException("ChatGPT curl 凭据已过期或触发设备风控（HTTP " + response.code()
                                 + "）。请在同一浏览器/网络中重新复制最新 conversation curl 后保存；不要复用旧的 conduit/sentinel token。响应=" + preview(error));
@@ -3317,6 +3335,7 @@ public class Main {
             try (Response response = client.newCall(builder.build()).execute()) {
                 if (!response.isSuccessful() || response.body() == null) {
                     String error = response.body() == null ? "" : response.body().string();
+                    checkChatGptMessageLength(response.code(), error);
                     throw new IOException("ChatGPT conversation/prepare 请求失败，HTTP 状态=" + response.code() + "，响应=" + preview(error));
                 }
                 Object parsed = SimpleJson.parse(response.body().string());
@@ -3336,6 +3355,146 @@ public class Main {
             try (Response response = client.newCall(builder.build()).execute()) {
                 if (!response.isSuccessful() || response.body() == null) throw httpError(path, response);
                 return response.body().string();
+            }
+        }
+
+        private Map<String, Object> uploadPromptAttachment(RequestContext context, Map<String, Object> conversationBody,
+                                                            byte[] bytes) throws IOException {
+            String create = jsonStringify(Map.of(
+                    "entry_surface", "chat_composer", "file_name", PASTED_TEXT_FILENAME,
+                    "file_size", bytes.length, "use_case", "my_files", "mime_type", PASTED_TEXT_MIME,
+                    "client_resolved_mime_type", PASTED_TEXT_MIME, "mime_resolution_source", "filename_extension",
+                    "reset_rate_limits", false, "store_in_library", false,
+                    "timezone_offset_min", conversationBody.getOrDefault("timezone_offset_min", -480)));
+            Object result = SimpleJson.parse(postJson(context, "/backend-api/files", create, "application/json"));
+            if (!(result instanceof Map<?, ?> file)) throw new IOException("ChatGPT 创建长文本附件返回无效数据");
+            String fileId = stringValue(file.get("file_id"));
+            String address = stringValue(file.get("upload_url"));
+            HttpUrl uploadUrl = address.isBlank() ? null : context.url.resolve(address);
+            if (fileId.isBlank() || uploadUrl == null) {
+                throw new IOException("ChatGPT 创建长文本附件失败，未返回文件 ID 或上传地址");
+            }
+            uploadPromptBytes(context, uploadUrl, file.get("upload_headers"), bytes);
+            finishPromptUpload(context, fileId, Boolean.TRUE.equals(conversationBody.get("history_and_training_disabled")));
+            return Map.of("id", fileId, "name", PASTED_TEXT_FILENAME, "size", bytes.length,
+                    "mime_type", PASTED_TEXT_MIME, "is_big_paste", true);
+        }
+
+        private void uploadPromptBytes(RequestContext context, HttpUrl url, Object requiredHeaders, byte[] bytes)
+                throws IOException {
+            RequestBody content = RequestBody.create(bytes, MediaType.get(PASTED_TEXT_MIME));
+            Request.Builder builder = new Request.Builder().url(url);
+            boolean sameOrigin = context.url.scheme().equals(url.scheme())
+                    && context.url.host().equals(url.host()) && context.url.port() == url.port();
+            if (sameOrigin && url.encodedPath().equals("/backend-api/estuary/upload_content_bytes")) {
+                String signedUrl = url.queryParameter("upload_url");
+                if (signedUrl == null || signedUrl.isBlank()) throw new IOException("ChatGPT 附件上传地址缺少签名参数");
+                applyBaseHeaders(builder, context, url.encodedPath());
+                builder.post(new MultipartBody.Builder().setType(MultipartBody.FORM)
+                        .addFormDataPart("file", PASTED_TEXT_FILENAME, content)
+                        .addFormDataPart("upload_url", signedUrl).build());
+            } else {
+                String host = url.host();
+                if (!url.isHttps() || url.port() != 443 || !url.username().isEmpty() || !url.password().isEmpty()
+                        || !(host.endsWith(".oaiusercontent.com") || host.endsWith(".blob.core.windows.net")
+                        || host.endsWith(".amazonaws.com"))) {
+                    throw new IOException("ChatGPT 返回了不受支持的附件上传地址");
+                }
+                boolean aws = url.queryParameterNames().stream().anyMatch("X-Amz-Algorithm"::equalsIgnoreCase);
+                if (!aws) {
+                    builder.header("x-ms-blob-type", "BlockBlob")
+                            .header("x-ms-version", "2020-04-08")
+                            .header("x-ms-blob-content-type", PASTED_TEXT_MIME);
+                }
+                if (requiredHeaders instanceof Map<?, ?> headers) {
+                    headers.forEach((key, value) -> {
+                        String name = stringValue(key).toLowerCase(Locale.ROOT);
+                        if (value instanceof String text && (name.startsWith("x-ms-") || name.startsWith("x-amz-"))) {
+                            builder.header(name, text);
+                        }
+                    });
+                }
+                builder.put(content);
+            }
+            // Signed storage requests are separate from the authenticated ChatGPT request.
+            OkHttpClient uploadClient = client.newBuilder().followRedirects(false).followSslRedirects(false)
+                    .cookieJar(okhttp3.CookieJar.NO_COOKIES).build();
+            try (Response response = executePromptUpload(uploadClient, builder.build())) {
+                if (!response.isSuccessful()) throw new IOException("ChatGPT 附件上传失败，HTTP " + response.code());
+            }
+        }
+
+        private Response executePromptUpload(OkHttpClient uploadClient, Request request) throws IOException {
+            try {
+                return uploadClient.newCall(request).execute();
+            } catch (IOException e) {
+                // Do not expose signed storage URLs from transport exceptions.
+                throw new IOException("ChatGPT 附件上传连接失败", e);
+            }
+        }
+
+        private void finishPromptUpload(RequestContext context, String fileId, boolean temporaryChat) throws IOException {
+            String path = "/backend-api/files/process_upload_stream";
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            metadata.put("store_in_library", false);
+            if (temporaryChat) metadata.put("is_temporary_chat", true);
+            String body = jsonStringify(Map.of(
+                    "file_id", fileId, "file_name", PASTED_TEXT_FILENAME, "mime_type", PASTED_TEXT_MIME,
+                    "use_case", "my_files", "entry_surface", "chat_composer", "index_for_retrieval", true,
+                    "metadata", metadata));
+            Request.Builder builder = new Request.Builder().url(context.url.newBuilder().encodedPath(path).build())
+                    .post(RequestBody.create(body, JSON_MEDIA_TYPE));
+            applyBaseHeaders(builder, context, path);
+            builder.header("accept", "application/x-ndjson");
+            try (Response response = client.newCall(builder.build()).execute()) {
+                if (!response.isSuccessful() || response.body() == null) {
+                    throw new IOException("ChatGPT 附件处理失败，HTTP " + response.code());
+                }
+                String line;
+                while ((line = response.body().source().readUtf8Line()) != null) {
+                    String data = line.strip();
+                    if (data.startsWith("data:")) data = data.substring(5).stripLeading();
+                    if (!data.startsWith("{")) continue;
+                    Object parsed = SimpleJson.parse(data);
+                    if (!(parsed instanceof Map<?, ?> event)) continue;
+                    String name = stringValue(event.get("event"));
+                    if ("file.processing.completed".equals(name) && fileId.equals(event.get("file_id"))) return;
+                    if (name.endsWith(".error") || name.endsWith(".failed") || name.endsWith(".cancelled")) {
+                        throw new IOException("ChatGPT 附件处理失败，事件 " + name);
+                    }
+                }
+                throw new IOException("ChatGPT 附件处理流在文件就绪前结束");
+            }
+        }
+
+        private static Map<String, Object> chatMessageWithAttachment(Map<String, Object> attachment) {
+            Map<String, Object> message = chatMessage(
+                    "请读取附件中的完整请求及对话上下文，回答最后一条 user 消息，并遵循其中的工具调用格式。");
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            metadata.put("serialization_metadata", Map.of("custom_symbol_offsets", List.of()));
+            metadata.put("submission_mode", "manual_send");
+            metadata.put("attachments", List.of(attachment));
+            message.put("metadata", metadata);
+            return message;
+        }
+
+        private static void checkChatGptMessageLength(int status, String body) throws ChatGptMessageTooLong {
+            if (status != 413 || !body.stripLeading().startsWith("{")) return;
+            Object parsed;
+            try {
+                parsed = SimpleJson.parse(body);
+            } catch (RuntimeException malformedBody) {
+                return;
+            }
+            if (parsed instanceof Map<?, ?> root && root.get("detail") instanceof Map<?, ?> detail
+                    && "message_length_exceeds_limit".equals(detail.get("code"))) {
+                throw new ChatGptMessageTooLong();
+            }
+        }
+
+        private static final class ChatGptMessageTooLong extends IOException {
+            private ChatGptMessageTooLong() {
+                super("ChatGPT 拒绝了过长的消息（HTTP 413，message_length_exceeds_limit）");
             }
         }
 
